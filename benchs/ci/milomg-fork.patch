@@ -1,14 +1,15 @@
 diff --git a/packages/core/package.json b/packages/core/package.json
-index 8e4a88e..89e37d9 100644
+index 8e4a88e..6d0001b 100644
 --- a/packages/core/package.json
 +++ b/packages/core/package.json
-@@ -20,7 +20,8 @@
+@@ -20,7 +20,9 @@
      "@reactively/core": "^0.0.8",
      "@solidjs/signals": "^0.10.2",
      "@vue/reactivity": "^3.5.28",
 -    "alien-signals": "^3.1.2",
 +    "alien-signals": "file:../../../upstream-alien-signals",
 +    "dalien-signals": "file:../../../packages/dalien-signals",
++    "cosignal": "file:../../../packages/cosignal",
      "compostate": "^0.5.1",
      "esbuild": "^0.27.3",
      "mobx": "^6.15.0",
@@ -193,6 +194,129 @@ index 0000000..827de8e
 +    currentRoot = null;
 +  },
 +};
+diff --git a/packages/core/src/frameworks/cosignal.ts b/packages/core/src/frameworks/cosignal.ts
+new file mode 100644
+index 0000000..dcd011c
+--- /dev/null
++++ b/packages/core/src/frameworks/cosignal.ts
+@@ -0,0 +1,50 @@
++import * as lib from "cosignal";
++import { ReactiveFramework } from "../util/reactiveFramework";
++
++// cosignal v1 DIRECT build, routed through the public class API (Atom /
++// Computed `.state` and `.set`) so the benchmark measures the surface
++// applications use, policy wrapper included. Graphs are built inside an
++// effectScope and disposed in cleanup(), like the other adapters.
++let scope: (() => void) | null = null;
++
++export const cosignalFramework: ReactiveFramework = {
++  name: "Cosignal",
++  signal: <T>(initial: T) => {
++    const a = new lib.Atom(initial);
++    return {
++      read: () => a.state,
++      write: (v: T) => a.set(v),
++    };
++  },
++  computed: <T>(fn: () => T) => {
++    const c = new lib.Computed(fn);
++    return {
++      read: () => c.state,
++    };
++  },
++  // Wrapped so bench callbacks' return values are never treated as cleanup
++  // functions (same shape as the alien-signals adapters).
++  effect: (fn) => {
++    lib.effect(() => {
++      fn();
++    });
++  },
++  withBatch: (fn) => {
++    lib.startBatch();
++    fn();
++    lib.endBatch();
++  },
++  withBuild: <T>(fn: () => T) => {
++    let out!: T;
++    scope = lib.effectScope(() => {
++      out = fn();
++    });
++    return out;
++  },
++  cleanup: () => {
++    if (scope !== null) {
++      scope();
++      scope = null;
++    }
++  },
++};
+diff --git a/packages/core/src/frameworks/cosignalLogged.ts b/packages/core/src/frameworks/cosignalLogged.ts
+new file mode 100644
+index 0000000..db0dc1e
+--- /dev/null
++++ b/packages/core/src/frameworks/cosignalLogged.ts
+@@ -0,0 +1,61 @@
++import * as lib from "cosignal/logged";
++import { ReactiveFramework } from "../util/reactiveFramework";
++
++// cosignal LOGGED twin entry with the React bridge ARMED but QUIET: no
++// fork events are ever fed, so this measures the overhead an application
++// pays for having the bridge installed while React is idle. Arming is
++// LAZY (first adapter use, not module load): the bundle loads every
++// adapter in every benchmark child, and arming at load would swap the
++// logged table in during other frameworks' runs.
++let armed = false;
++function arm(): void {
++  if (!armed) {
++    armed = true;
++    lib.registerReactBridge();
++  }
++}
++
++let scope: (() => void) | null = null;
++
++export const cosignalLoggedFramework: ReactiveFramework = {
++  name: "Cosignal Logged",
++  signal: <T>(initial: T) => {
++    arm();
++    const a = new lib.Atom(initial);
++    return {
++      read: () => a.state,
++      write: (v: T) => a.set(v),
++    };
++  },
++  computed: <T>(fn: () => T) => {
++    arm();
++    const c = new lib.Computed(fn);
++    return {
++      read: () => c.state,
++    };
++  },
++  effect: (fn) => {
++    lib.effect(() => {
++      fn();
++    });
++  },
++  withBatch: (fn) => {
++    lib.startBatch();
++    fn();
++    lib.endBatch();
++  },
++  withBuild: <T>(fn: () => T) => {
++    arm();
++    let out!: T;
++    scope = lib.effectScope(() => {
++      out = fn();
++    });
++    return out;
++  },
++  cleanup: () => {
++    if (scope !== null) {
++      scope();
++      scope = null;
++    }
++  },
++};
 diff --git a/packages/core/src/frameworks/dalienSignals.ts b/packages/core/src/frameworks/dalienSignals.ts
 new file mode 100644
 index 0000000..c33dc14
@@ -339,29 +463,35 @@ index 0000000..8633d72
 +  },
 +};
 diff --git a/packages/core/src/frameworksList.ts b/packages/core/src/frameworksList.ts
-index 30d3c8b..a3d199c 100644
+index 30d3c8b..4fcdb63 100644
 --- a/packages/core/src/frameworksList.ts
 +++ b/packages/core/src/frameworksList.ts
-@@ -1,5 +1,6 @@
+@@ -1,5 +1,8 @@
  import type { FrameworkInfo } from "./util/frameworkTypes";
  import { alienFramework } from "./frameworks/alienSignals";
 +import { dalienFramework } from "./frameworks/dalienSignals";
++import { cosignalFramework } from "./frameworks/cosignal";
++import { cosignalLoggedFramework } from "./frameworks/cosignalLogged";
  import { angularFramework as angularFramework2 } from "./frameworks/angularSignals2";
  import { compostateFramework } from "./frameworks/inactive/compostate";
  import { mobxFramework } from "./frameworks/inactive/mobx";
-@@ -25,6 +26,7 @@ import { xReactivityFramework } from "./frameworks/xReactivity";
+@@ -25,6 +28,9 @@ import { xReactivityFramework } from "./frameworks/xReactivity";
  
  export const frameworkInfo: FrameworkInfo[] = [
    { framework: alienFramework, testPullCounts: true },
 +  { framework: dalienFramework, testPullCounts: true },
++  { framework: cosignalFramework, testPullCounts: true },
++  { framework: cosignalLoggedFramework, testPullCounts: true },
    { framework: angularFramework2, testPullCounts: true },
    { framework: compostateFramework, testPullCounts: true },
    { framework: mobxFramework, testPullCounts: true },
-@@ -41,6 +43,7 @@ export const frameworkInfo: FrameworkInfo[] = [
+@@ -41,6 +47,9 @@ export const frameworkInfo: FrameworkInfo[] = [
  
  export const allFrameworks: FrameworkInfo[] = [
    { framework: alienFramework, testPullCounts: true },
 +  { framework: dalienFramework, testPullCounts: true },
++  { framework: cosignalFramework, testPullCounts: true },
++  { framework: cosignalLoggedFramework, testPullCounts: true },
    { framework: angularFramework2, testPullCounts: true },
    { framework: compostateFramework, testPullCounts: true },
    { framework: mobxFramework, testPullCounts: true },
@@ -616,10 +746,10 @@ index 0000000..ca417c2
 +}
 +process.exit(failures > 0 && samples.size === 0 ? 1 : 0);
 diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
-index 7a5d971..1bc57d8 100644
+index 7a5d971..576c8fe 100644
 --- a/pnpm-lock.yaml
 +++ b/pnpm-lock.yaml
-@@ -33,11 +33,14 @@ importers:
+@@ -33,11 +33,17 @@ importers:
          specifier: ^3.5.28
          version: 3.5.28
        alien-signals:
@@ -630,13 +760,16 @@ index 7a5d971..1bc57d8 100644
        compostate:
          specifier: ^0.5.1
          version: 0.5.1
++      cosignal:
++        specifier: file:../../../packages/cosignal
++        version: file:../packages/cosignal
 +      dalien-signals:
 +        specifier: file:../../../packages/dalien-signals
 +        version: file:../packages/dalien-signals
        esbuild:
          specifier: ^0.27.3
          version: 0.27.3
-@@ -850,8 +853,8 @@ packages:
+@@ -850,8 +856,8 @@ packages:
      engines: {node: '>=0.4.0'}
      hasBin: true
  
@@ -647,7 +780,13 @@ index 7a5d971..1bc57d8 100644
  
    aria-query@5.3.2:
      resolution: {integrity: sha512-COROpnaoap1E2F000S62r6A60uHZnmlvomhfyT2DlTcrY1OrBKn2UhH7qn5wTC9zMvD0AY7csdPSNwKP+7WiQw==}
-@@ -904,6 +907,9 @@ packages:
+@@ -901,9 +907,15 @@ packages:
+   convert-source-map@2.0.0:
+     resolution: {integrity: sha512-Kvp459HrV2FEJ1CAsi1Ku+MY3kasH19TFykTz2xWmMeq6bk2NU3XXvfJ+Q61m0xktWwt+1HSYf3JZsTms3aRJg==}
+ 
++  cosignal@file:../packages/cosignal:
++    resolution: {directory: ../packages/cosignal, type: directory}
++
    csstype@3.2.3:
      resolution: {integrity: sha512-z1HGKcYy2xA8AGQfwrn0PAy+PB7X/GSj3UVJW9qKyn43xWa+gl5nXmU4qqLMRzWVLFC8KusUX8T/0kCiOYpAIQ==}
  
@@ -657,7 +796,7 @@ index 7a5d971..1bc57d8 100644
    debug@4.4.3:
      resolution: {integrity: sha512-RGwwWnwQvkVfavKVt22FGLw+xYSdzARwm0ru6DhTVA3umU5hZc28V3kO4stgYryrTlLpuvgI9GiijltAjNbcqA==}
      engines: {node: '>=6.0'}
-@@ -1893,7 +1899,7 @@ snapshots:
+@@ -1893,7 +1905,7 @@ snapshots:
  
    acorn@8.15.0: {}
  
@@ -666,8 +805,12 @@ index 7a5d971..1bc57d8 100644
  
    aria-query@5.3.2: {}
  
-@@ -1931,6 +1937,8 @@ snapshots:
+@@ -1929,8 +1941,12 @@ snapshots:
  
+   convert-source-map@2.0.0: {}
+ 
++  cosignal@file:../packages/cosignal: {}
++
    csstype@3.2.3: {}
  
 +  dalien-signals@file:../packages/dalien-signals: {}

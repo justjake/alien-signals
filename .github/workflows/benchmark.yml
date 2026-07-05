@@ -88,6 +88,38 @@ jobs:
           git clone --no-checkout "$ALIEN_REPO" upstream-alien-signals
           git -C upstream-alien-signals checkout "$ALIEN_SHA"
 
+      # The shared harness patch also carries adapters for the cosignal
+      # family, which lives in a private sibling repo this workflow cannot
+      # fetch. Satisfy the module graph with a stub exporting the adapter's
+      # import surface as throwing members; cosignal is never in this
+      # workflow's FRAMEWORKS, so the stubs can only be reached by mistake —
+      # and then they fail loudly. The parent repo's benchmark workflow is
+      # where cosignal is actually measured.
+      - name: Stub cosignal packages (private to the parent repo)
+        run: |
+          mkdir -p packages/cosignal/src
+          cat > packages/cosignal/package.json <<'EOF'
+          {
+            "name": "cosignal",
+            "version": "0.0.0-stub",
+            "type": "module",
+            "exports": { ".": "./src/stub.ts", "./logged": "./src/stub.ts" }
+          }
+          EOF
+          cat > packages/cosignal/src/stub.ts <<'EOF'
+          const die = (): never => {
+            throw new Error("cosignal stub: this workflow cannot benchmark cosignal (private repo); use the parent repo's benchmark workflow");
+          };
+          export class Atom { constructor(_v?: unknown) { die(); } get state(): never { return die(); } set(_v: unknown): never { return die(); } }
+          export class Computed { constructor(_fn?: unknown) { die(); } get state(): never { return die(); } }
+          export const effect = die;
+          export const effectScope = die;
+          export const startBatch = die;
+          export const endBatch = die;
+          export const untracked = die;
+          export const registerReactBridge = (): void => {};
+          EOF
+
       - name: Build upstream alien-signals (esm/ is a local build artifact)
         working-directory: upstream-alien-signals
         run: |
