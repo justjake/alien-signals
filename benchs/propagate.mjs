@@ -12,7 +12,7 @@ boxplot(() => {
 				const prev = last;
 				last = computed(() => prev() + 1);
 			}
-			effect(() => last());
+			effect(() => { last(); });
 		}
 		yield () => src(src() + 1);
 	})

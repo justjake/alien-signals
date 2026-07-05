@@ -1,132 +1,114 @@
-import { createReactiveSystem, ReactiveFlags, type ReactiveNode } from './system.js';
+import { createReactiveSystem, HandleKind, handleKind, ReactiveFlags, type ReactiveNode } from './system.js';
 
-interface EffectScopeNode extends ReactiveNode {
-}
+const system = createReactiveSystem();
 
-interface EffectNode extends ReactiveNode {
-	fn(): (() => void) | void;
-	cleanup: (() => void) | void;
-}
-
-interface ComputedNode<T = any> extends ReactiveNode {
-	value: T | undefined;
-	getter: (previousValue?: T) => T;
-}
-
-interface SignalNode<T = any> extends ReactiveNode {
-	currentValue: T;
-	pendingValue: T;
-}
-
-// Marks a parent (effect or scope) whose deps include at least one child
-// effect. Used to gate the dispose-children-first slow path in run() so
-// leaf effects (no children, no own cleanup) avoid the extra deps walk.
-// The bit is outside ReactiveFlags' range and never touched by system.ts.
-const HasChildEffect = 64;
-
-let cycle = 0;
-let runDepth = 0;
-let batchDepth = 0;
-let notifyIndex = 0;
-let queuedLength = 0;
-let activeSub: ReactiveNode | undefined;
-
-const queued: (EffectNode | undefined)[] = [];
 const {
-	link,
-	unlink,
-	propagate,
-	checkDirty,
-	shallowPropagate,
-} = createReactiveSystem({
-	update(node: SignalNode | ComputedNode | EffectScopeNode): boolean {
-		if ('getter' in node) {
-			return updateComputed(node);
-		}
-		if ('currentValue' in node) {
-			return updateSignal(node);
-		}
-		node.flags = ReactiveFlags.Mutable;
-		return true;
-	},
-	notify(effect: EffectNode) {
-		let insertIndex = queuedLength;
-		let firstInsertedIndex = insertIndex;
+	configure: systemConfigure,
+	trigger: systemTrigger,
+	startBatch: systemStartBatch,
+	endBatch: systemEndBatch,
+	getBatchDepth: systemGetBatchDepth,
+	getActiveSub: systemGetActiveSub,
+	setActiveSub: systemSetActiveSub,
+	nodeFlags,
+	setNodeFlags,
+} = system;
 
-		do {
-			queued[insertIndex++] = effect;
-			effect.flags &= ~ReactiveFlags.Watching;
-			effect = effect.subs?.sub as EffectNode;
-			if (effect === undefined || !(effect.flags & ReactiveFlags.Watching)) {
-				break;
-			}
-		} while (true);
+// Handles are ANONYMOUS closures minted INSIDE the engine (system.ts
+// makeSignal etc.) over the fixed-capacity plane: calling one reaches the
+// graph with upstream-parity hop count, and creating one costs a symbol
+// brand (~3ns) instead of a name — named closures get defineProperty-wrapped
+// by keepNames toolchains at ~120ns per handle (see system.ts HANDLE_KIND).
+// isSignal/isComputed/isEffect/isEffectScope check the brand, so they work
+// exactly as upstream's name checks did; `fn.name` itself is now ''.
 
-		queuedLength = insertIndex;
+const NODE_ID = Symbol('dalien.nodeId');
 
-		while (firstInsertedIndex < --insertIndex) {
-			const left = queued[firstInsertedIndex];
-			queued[firstInsertedIndex++] = queued[insertIndex];
-			queued[insertIndex] = left;
-		}
-	},
-	unwatched(node: SignalNode | ComputedNode | EffectNode | EffectScopeNode) {
-		if ('getter' in node) {
-			if (node.depsTail !== undefined) {
-				node.flags = ReactiveFlags.Mutable | ReactiveFlags.Dirty;
-				disposeAllDepsInReverse(node);
-			}
-		}
-		else if ('currentValue' in node) {
-			// Nothing to do for signals, they are always mutable and never dirty until pendingValue changes
-		}
-		else if ('fn' in node) {
-			effectOper.call(node);
-		}
-		else {
-			effectScopeOper.call(node);
-		}
-	},
-});
-
-export function getActiveSub(): ReactiveNode | undefined {
-	return activeSub;
-}
-
-export function setActiveSub(sub?: ReactiveNode) {
-	const prevSub = activeSub;
-	activeSub = sub;
-	return prevSub;
-}
-
-export function getBatchDepth(): number {
-	return batchDepth;
-}
-
-export function startBatch() {
-	++batchDepth;
-}
-
-export function endBatch() {
-	if (!--batchDepth) {
-		flush();
+/**
+ * Live view over a node record: `.flags` reads/writes the semantic flag bits
+ * in the record plane (the documented upstream pattern
+ * `getActiveSub()!.flags &= ~ReactiveFlags.RecursedCheck` keeps working).
+ */
+class NodeView implements ReactiveNode {
+	[NODE_ID]: number;
+	constructor(id: number) {
+		this[NODE_ID] = id;
+	}
+	get flags(): ReactiveFlags {
+		return nodeFlags(this[NODE_ID]) & 127;
+	}
+	set flags(value: ReactiveFlags) {
+		setNodeFlags(this[NODE_ID], value);
 	}
 }
 
+let activeSubView: NodeView | undefined;
+
+export function getActiveSub(): ReactiveNode | undefined {
+	const id = systemGetActiveSub();
+	if (!id) {
+		return undefined;
+	}
+	if (activeSubView === undefined || activeSubView[NODE_ID] !== id) {
+		activeSubView = new NodeView(id);
+	}
+	return activeSubView;
+}
+
+export function setActiveSub(sub?: ReactiveNode): ReactiveNode | undefined {
+	let id = 0;
+	if (sub !== undefined) {
+		id = (sub as NodeView)[NODE_ID];
+		if (typeof id !== 'number') {
+			throw new TypeError('dalien-signals: setActiveSub expects a value returned by getActiveSub()');
+		}
+	}
+	const prevId = systemSetActiveSub(id);
+	if (!prevId) {
+		return undefined;
+	}
+	return new NodeView(prevId);
+}
+
+/**
+ * Size and eagerly allocate the default system's record plane. Buffers are
+ * otherwise allocated lazily on first primitive creation, so call this
+ * before any signal/computed/effect/effectScope exists — afterwards it
+ * throws. `initialRecords` is the plane CAPACITY in 32-byte records
+ * (default 2^23 ≈ 256 MB of lazily-mapped virtual pages — physical memory
+ * tracks records actually touched). The plane does not grow; exhausting it
+ * throws an actionable error naming this function.
+ */
+export function configure(options?: { initialRecords?: number }): void {
+	systemConfigure(options);
+}
+
+export function getBatchDepth(): number {
+	return systemGetBatchDepth();
+}
+
+export function startBatch() {
+	systemStartBatch();
+}
+
+export function endBatch() {
+	systemEndBatch();
+}
+
 export function isSignal(fn: () => void): boolean {
-	return fn.name === 'bound ' + signalOper.name;
+	return handleKind(fn) === HandleKind.Signal;
 }
 
 export function isComputed(fn: () => void): boolean {
-	return fn.name === 'bound ' + computedOper.name;
+	return handleKind(fn) === HandleKind.Computed;
 }
 
 export function isEffect(fn: () => void): boolean {
-	return fn.name === 'bound ' + effectOper.name;
+	return handleKind(fn) === HandleKind.Effect;
 }
 
 export function isEffectScope(fn: () => void): boolean {
-	return fn.name === 'bound ' + effectScopeOper.name;
+	return handleKind(fn) === HandleKind.EffectScope;
 }
 
 export function signal<T>(): {
@@ -141,301 +123,24 @@ export function signal<T>(initialValue?: T): {
 	(): T | undefined;
 	(value: T | undefined): void;
 } {
-	return signalOper.bind({
-		currentValue: initialValue,
-		pendingValue: initialValue,
-		subs: undefined,
-		subsTail: undefined,
-		flags: ReactiveFlags.Mutable,
-	}) as () => T | undefined;
+	return system.e.makeSignal(initialValue) as {
+		(): T | undefined;
+		(value: T | undefined): void;
+	};
 }
 
 export function computed<T>(getter: (previousValue?: T) => T): () => T {
-	return computedOper.bind({
-		value: undefined,
-		subs: undefined,
-		subsTail: undefined,
-		deps: undefined,
-		depsTail: undefined,
-		flags: ReactiveFlags.None,
-		getter: getter as (previousValue?: unknown) => unknown,
-	}) as () => T;
+	return system.e.makeComputed(getter as (previousValue?: unknown) => unknown) as () => T;
 }
 
 export function effect(fn: () => void | (() => void)): () => void {
-	const e: EffectNode = {
-		fn,
-		cleanup: undefined,
-		subs: undefined,
-		subsTail: undefined,
-		deps: undefined,
-		depsTail: undefined,
-		flags: ReactiveFlags.Watching | ReactiveFlags.RecursedCheck,
-	};
-	const prevSub = setActiveSub(e);
-	if (prevSub !== undefined) {
-		link(e, prevSub, 0);
-		prevSub.flags |= HasChildEffect;
-	}
-	try {
-		++runDepth;
-		e.cleanup = e.fn();
-	} finally {
-		--runDepth;
-		activeSub = prevSub;
-		e.flags &= ~ReactiveFlags.RecursedCheck;
-	}
-	return effectOper.bind(e);
+	return system.e.makeEffect(fn);
 }
 
 export function effectScope(fn: () => void): () => void {
-	const e: EffectScopeNode = {
-		deps: undefined,
-		depsTail: undefined,
-		subs: undefined,
-		subsTail: undefined,
-		flags: ReactiveFlags.Mutable,
-	};
-	const prevSub = setActiveSub(e);
-	if (prevSub !== undefined) {
-		link(e, prevSub, 0);
-		prevSub.flags |= HasChildEffect;
-	}
-	try {
-		fn();
-	} finally {
-		activeSub = prevSub;
-	}
-	return effectScopeOper.bind(e);
+	return system.e.makeScope(fn);
 }
 
 export function trigger(fn: () => void) {
-	const sub: ReactiveNode = {
-		deps: undefined,
-		depsTail: undefined,
-		flags: ReactiveFlags.Watching | ReactiveFlags.RecursedCheck,
-	};
-	const prevSub = setActiveSub(sub);
-	++batchDepth;
-	try {
-		fn();
-	} finally {
-		activeSub = prevSub;
-		sub.flags = ReactiveFlags.None;
-		let link = sub.deps;
-		while (link !== undefined) {
-			const dep = link.dep;
-			link = unlink(link, sub);
-			const subs = dep.subs;
-			if (subs !== undefined) {
-				propagate(subs, !!runDepth);
-				shallowPropagate(subs);
-			}
-		}
-		if (!--batchDepth) {
-			flush();
-		}
-	}
-}
-
-function updateComputed(c: ComputedNode): boolean {
-	if (c.flags & HasChildEffect) {
-		let link = c.depsTail;
-		while (link !== undefined) {
-			const prev = link.prevDep;
-			const dep = link.dep;
-			if (!('getter' in dep) && !('currentValue' in dep)) {
-				unlink(link, c);
-			}
-			link = prev;
-		}
-	}
-	c.depsTail = undefined;
-	c.flags = ReactiveFlags.Mutable | ReactiveFlags.RecursedCheck;
-	const prevSub = setActiveSub(c);
-	try {
-		++cycle;
-		const oldValue = c.value;
-		return oldValue !== (c.value = c.getter(oldValue));
-	} finally {
-		activeSub = prevSub;
-		c.flags &= ~ReactiveFlags.RecursedCheck;
-		purgeDeps(c);
-	}
-}
-
-function updateSignal(s: SignalNode): boolean {
-	s.flags = ReactiveFlags.Mutable;
-	return s.currentValue !== (s.currentValue = s.pendingValue);
-}
-
-function run(e: EffectNode): void {
-	const flags = e.flags;
-	if (
-		flags & ReactiveFlags.Dirty
-		|| (
-			flags & ReactiveFlags.Pending
-			&& checkDirty(e.deps!, e)
-		)
-	) {
-		if (flags & HasChildEffect) {
-			let link = e.depsTail;
-			while (link !== undefined) {
-				const prev = link.prevDep;
-				const dep = link.dep;
-				if (!('getter' in dep) && !('currentValue' in dep)) {
-					unlink(link, e);
-				}
-				link = prev;
-			}
-		}
-		if (e.cleanup) {
-			runCleanup(e);
-			if (!e.flags) {
-				return;
-			}
-		}
-		e.depsTail = undefined;
-		e.flags = ReactiveFlags.Watching | ReactiveFlags.RecursedCheck;
-		const prevSub = setActiveSub(e);
-		try {
-			++cycle;
-			++runDepth;
-			e.cleanup = e.fn();
-		} finally {
-			--runDepth;
-			activeSub = prevSub;
-			e.flags &= ~ReactiveFlags.RecursedCheck;
-			purgeDeps(e);
-		}
-	} else if (e.deps !== undefined) {
-		e.flags = ReactiveFlags.Watching | (flags & HasChildEffect);
-	}
-}
-
-function flush(): void {
-	try {
-		while (notifyIndex < queuedLength) {
-			const effect = queued[notifyIndex]!;
-			queued[notifyIndex++] = undefined;
-			run(effect);
-		}
-	} finally {
-		while (notifyIndex < queuedLength) {
-			const effect = queued[notifyIndex]!;
-			queued[notifyIndex++] = undefined;
-			effect.flags |= ReactiveFlags.Watching | ReactiveFlags.Recursed;
-		}
-		notifyIndex = 0;
-		queuedLength = 0;
-	}
-}
-
-function computedOper<T>(this: ComputedNode<T>): T {
-	const flags = this.flags;
-	if (
-		flags & ReactiveFlags.Dirty
-		|| (
-			flags & ReactiveFlags.Pending
-			&& (
-				checkDirty(this.deps!, this)
-				|| (this.flags = flags & ~ReactiveFlags.Pending, false)
-			)
-		)
-	) {
-		if (updateComputed(this)) {
-			const subs = this.subs;
-			if (subs !== undefined) {
-				shallowPropagate(subs);
-			}
-		}
-	} else if (!flags) {
-		this.flags = ReactiveFlags.Mutable | ReactiveFlags.RecursedCheck;
-		const prevSub = setActiveSub(this);
-		try {
-			this.value = this.getter();
-		} finally {
-			activeSub = prevSub;
-			this.flags &= ~ReactiveFlags.RecursedCheck;
-		}
-	}
-	const sub = activeSub;
-	if (sub !== undefined) {
-		link(this, sub, cycle);
-	}
-	return this.value!;
-}
-
-function signalOper<T>(this: SignalNode<T>, ...value: [T]): T | void {
-	if (value.length) {
-		if (this.pendingValue !== (this.pendingValue = value[0])) {
-			this.flags = ReactiveFlags.Mutable | ReactiveFlags.Dirty;
-			const subs = this.subs;
-			if (subs !== undefined) {
-				propagate(subs, !!runDepth);
-				if (!batchDepth) {
-					flush();
-				}
-			}
-		}
-	} else {
-		if (this.flags & ReactiveFlags.Dirty) {
-			if (updateSignal(this)) {
-				const subs = this.subs;
-				if (subs !== undefined) {
-					shallowPropagate(subs);
-				}
-			}
-		}
-		const sub = activeSub;
-		if (sub !== undefined) {
-			link(this, sub, cycle);
-		}
-		return this.currentValue;
-	}
-}
-
-function runCleanup(e: EffectNode): void {
-	const cleanup = e.cleanup!;
-	e.cleanup = undefined;
-	const prevSub = activeSub;
-	activeSub = undefined;
-	try {
-		cleanup();
-	} finally {
-		activeSub = prevSub;
-	}
-}
-
-function effectOper(this: EffectNode): void {
-	effectScopeOper.call(this);
-	if (this.cleanup) {
-		runCleanup(this);
-	}
-}
-
-function effectScopeOper(this: EffectScopeNode): void {
-	this.flags = ReactiveFlags.None;
-	disposeAllDepsInReverse(this);
-	const sub = this.subs;
-	if (sub !== undefined) {
-		unlink(sub);
-	}
-}
-
-function disposeAllDepsInReverse(sub: ReactiveNode): void {
-	let link = sub.depsTail;
-	while (link !== undefined) {
-		const prev = link.prevDep;
-		unlink(link, sub);
-		link = prev;
-	}
-}
-
-function purgeDeps(sub: ReactiveNode) {
-	const depsTail = sub.depsTail;
-	let dep = depsTail !== undefined ? depsTail.nextDep : sub.deps;
-	while (dep !== undefined) {
-		dep = unlink(dep, sub);
-	}
+	systemTrigger(fn);
 }

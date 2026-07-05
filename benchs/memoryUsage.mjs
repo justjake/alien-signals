@@ -21,7 +21,7 @@ console.log(`computed: ${((end - start) / 1024).toFixed(2)} KB`);
 
 start = end;
 
-Array.from({ length: 10000 }, (_, i) => effect(() => computeds[i]()));
+Array.from({ length: 10000 }, (_, i) => effect(() => { computeds[i](); }));
 
 globalThis.gc();
 end = process.memoryUsage().heapUsed;
@@ -39,7 +39,7 @@ for (let i = 0; i < w; i++) {
 	for (let j = 0; j < h; j++) {
 		const prev = last;
 		last = computed(() => prev() + 1);
-		effect(() => last());
+		effect(() => { last(); });
 	}
 }
 
@@ -49,3 +49,10 @@ globalThis.gc();
 end = process.memoryUsage().heapUsed;
 
 console.log(`tree: ${((end - start) / 1024).toFixed(2)} KB`);
+
+// The record plane is an ArrayBuffer, which heapUsed does NOT count (it is
+// external memory; large typed arrays are lazily-mapped zero pages, so
+// physical use tracks records actually touched). Report it for honest
+// accounting alongside the heap numbers above.
+const { arrayBuffers } = process.memoryUsage();
+console.log(`arrayBuffers (virtual, incl. record plane): ${(arrayBuffers / 1024).toFixed(2)} KB`);
