@@ -1,0 +1,677 @@
+diff --git a/packages/core/package.json b/packages/core/package.json
+index 8e4a88e..89e37d9 100644
+--- a/packages/core/package.json
++++ b/packages/core/package.json
+@@ -20,7 +20,8 @@
+     "@reactively/core": "^0.0.8",
+     "@solidjs/signals": "^0.10.2",
+     "@vue/reactivity": "^3.5.28",
+-    "alien-signals": "^3.1.2",
++    "alien-signals": "file:../../../upstream-alien-signals",
++    "dalien-signals": "file:../../../packages/dalien-signals",
+     "compostate": "^0.5.1",
+     "esbuild": "^0.27.3",
+     "mobx": "^6.15.0",
+diff --git a/packages/core/src/benches/kairoBench.ts b/packages/core/src/benches/kairoBench.ts
+index 313b370..8458a10 100644
+--- a/packages/core/src/benches/kairoBench.ts
++++ b/packages/core/src/benches/kairoBench.ts
+@@ -7,7 +7,7 @@ import { repeatedObservers } from "./kairo/repeated";
+ import { triangle } from "./kairo/triangle";
+ import { unstable } from "./kairo/unstable";
+ import { nextTick } from "../util/asyncUtil";
+-import { fastestTest } from "../util/benchRepeat";
++import { medianTest } from "../util/benchRepeat";
+ import { PerfResultCallback } from "../util/perfLogging";
+ import { FrameworkInfo } from "../util/frameworkTypes";
+ import { mol } from "./kairo/molBench";
+@@ -61,7 +61,7 @@ export async function kairoBench(
+       iter();
+       await nextTick();
+ 
+-      const { time } = await fastestTest(10, () => {
++      const { time } = await medianTest(10, () => {
+         for (let i = 0; i < 500; i++) {
+           iter();
+         }
+diff --git a/packages/core/src/benches/reactively/dynamicBench.ts b/packages/core/src/benches/reactively/dynamicBench.ts
+index 12220a3..cc72299 100644
+--- a/packages/core/src/benches/reactively/dynamicBench.ts
++++ b/packages/core/src/benches/reactively/dynamicBench.ts
+@@ -2,7 +2,7 @@ import { makeGraph, runGraph } from "./dependencyGraph";
+ import { verifyBenchResult } from "../../util/perfTests";
+ import { FrameworkInfo, TestConfig } from "../../util/frameworkTypes";
+ import { perfTests } from "../../config";
+-import { fastestTest } from "../../util/benchRepeat";
++import { medianTest } from "../../util/benchRepeat";
+ import { PerfResultCallback } from "../../util/perfLogging";
+ import { nextTick } from "../../util/asyncUtil";
+ 
+@@ -18,7 +18,7 @@ export function makeTitle(config: TestConfig): string {
+ }
+ 
+ /** benchmark a single test under single framework.
+- * The test is run multiple times and the fastest result is logged to the console.
++ * The test is run multiple times and the median result is logged to the console.
+  */
+ export async function dynamicBench(
+   frameworkInfo: FrameworkInfo[],
+@@ -43,7 +43,7 @@ export async function dynamicBench(
+       await nextTick();
+       runOnce();
+ 
+-      const timedResult = await fastestTest(testRepeats, () => {
++      const timedResult = await medianTest(testRepeats, () => {
+         counter.count = 0;
+         const sum = runOnce();
+         return { sum, count: counter.count };
+diff --git a/packages/core/src/benches/sBench.ts b/packages/core/src/benches/sBench.ts
+index dd2b039..35c9a19 100644
+--- a/packages/core/src/benches/sBench.ts
++++ b/packages/core/src/benches/sBench.ts
+@@ -1,7 +1,7 @@
+ // Inspired by https://github.com/solidjs/solid/blob/main/packages/solid/bench/bench.cjs
+ 
+ import { nextTick } from "../util/asyncUtil";
+-import { fastestTest } from "../util/benchRepeat";
++import { medianOf } from "../util/medianOf";
+ import { PerfResultCallback } from "../util/perfLogging";
+ import { Computed, ReactiveFramework, Signal } from "../util/reactiveFramework";
+ 
+@@ -74,7 +74,7 @@ export async function sbench(
+     if (globalThis.gc) (gc!(), gc!());
+     await nextTick();
+ 
+-    let fastestTime = Infinity;
++    const runTimes: number[] = [];
+     for (let i = 0; i < 10; i++) {
+       let start = 0;
+       let end = 0;
+@@ -100,12 +100,9 @@ export async function sbench(
+       // end GC clean
+       if (globalThis.gc) (gc!(), gc!());
+ 
+-      let time = end - start;
+-      if (time < fastestTime) {
+-        fastestTime = time;
+-      }
++      runTimes.push(end - start);
+     }
+-    return fastestTime;
++    return medianOf(runTimes);
+   }
+ 
+   function createSignals(n: number, sources: Computed<number>[]) {
+diff --git a/packages/core/src/frameworks/alienSignals.ts b/packages/core/src/frameworks/alienSignals.ts
+index 8d250bf..6872fbf 100644
+--- a/packages/core/src/frameworks/alienSignals.ts
++++ b/packages/core/src/frameworks/alienSignals.ts
+@@ -25,7 +25,13 @@ export const alienFramework: ReactiveFramework = {
+       read: () => c(),
+     };
+   },
+-  effect: (fn) => effect(fn),
++  // alien-signals >= 3.2 treats a non-undefined return value from the effect
++  // callback as a cleanup function; the bench contract ignores returns.
++  effect: (fn) => {
++    effect(() => {
++      fn();
++    });
++  },
+   withBatch: (fn) => {
+     startBatch();
+     fn();
+diff --git a/packages/core/src/frameworks/anod.ts b/packages/core/src/frameworks/anod.ts
+new file mode 100644
+index 0000000..827de8e
+--- /dev/null
++++ b/packages/core/src/frameworks/anod.ts
+@@ -0,0 +1,66 @@
++import { ReactiveFramework } from "../util/reactiveFramework";
++import {
++  c,
++  OPT_DEFER,
++  root,
++  signal,
++  batch,
++  Reader,
++  Root,
++  RootContext,
++} from "anod";
++
++// anod has no automatic dependency tracking: reads subscribe by calling
++// c.val() on the context passed to each compute/effect callback. Track the
++// innermost context here so wrapped signals can read through it.
++let currentReader: Reader | null = null;
++let currentRoot: RootContext | null = null;
++let rootHandle: Root | null = null;
++
++function tracked<T>(fn: () => T): (c: Reader) => T {
++  return (c) => {
++    const prev = currentReader;
++    currentReader = c;
++    try {
++      return fn();
++    } finally {
++      currentReader = prev;
++    }
++  };
++}
++
++export const anodFramework: ReactiveFramework = {
++  name: "anod",
++  signal: (initialValue) => {
++    const s = signal(initialValue);
++    return {
++      write: (v) => s.set(v),
++      read: () => (currentReader ? currentReader.val(s) : s.get()),
++    };
++  },
++  computed: <T>(fn: () => T) => {
++    const node = (currentRoot ?? c).compute(
++      tracked(fn),
++      undefined as unknown as T,
++      OPT_DEFER,
++    );
++    return {
++      read: () => (currentReader ? currentReader.val(node) : node.get()),
++    };
++  },
++  effect: (fn) => (currentRoot ?? c).effect(tracked(fn)),
++  withBatch: (fn) => batch(fn),
++  withBuild: <T>(fn: () => T) => {
++    let out!: T;
++    rootHandle = root((c) => {
++      currentRoot = c;
++      out = fn();
++    });
++    return out;
++  },
++  cleanup: () => {
++    rootHandle?.dispose();
++    rootHandle = null;
++    currentRoot = null;
++  },
++};
+diff --git a/packages/core/src/frameworks/dalienSignals.ts b/packages/core/src/frameworks/dalienSignals.ts
+new file mode 100644
+index 0000000..c33dc14
+--- /dev/null
++++ b/packages/core/src/frameworks/dalienSignals.ts
+@@ -0,0 +1,60 @@
++import { createReactiveSystem } from "dalien-signals/system";
++import { ReactiveFramework } from "../util/reactiveFramework";
++
++// cleanup() calls the library's reset(): bulk arena teardown that rewinds
++// the record plane and drops the whole FinalizationRegistry, so a test's
++// abandoned nodes are reclaimed by the GC as a few large objects instead
++// of one weak cell per handle processed in later tests' timed regions.
++// This is the published generation-scoped lifecycle of the
++// dalien-signals/system interface, and it mirrors what fully GC-managed
++// graphs (alien-signals and friends) get automatically when a dead graph
++// becomes unreachable. 2^21 records = 64 MB of lazily-mapped virtual
++// address space, several times the largest suite test.
++const sys = createReactiveSystem({ initialRecords: 1 << 21 });
++let scope: (() => void) | null = null;
++
++export const dalienFramework: ReactiveFramework = {
++  name: "Dalien Signals",
++  signal: <T>(initial: T) => {
++    const data = sys.makeSignal(initial) as {
++      (): T;
++      (value: T): void;
++    };
++    return {
++      read: () => data(),
++      write: (v: T) => data(v),
++    };
++  },
++  computed: <T>(fn: () => T) => {
++    const c = sys.makeComputed(fn as (previousValue?: unknown) => unknown) as () => T;
++    return {
++      read: () => c(),
++    };
++  },
++  // alien-signals >= 3.2 treats a non-undefined return value from the effect
++  // callback as a cleanup function; the bench contract ignores returns.
++  effect: (fn) => {
++    sys.makeEffect(() => {
++      fn();
++    });
++  },
++  withBatch: (fn) => {
++    sys.startBatch();
++    fn();
++    sys.endBatch();
++  },
++  withBuild: <T>(fn: () => T) => {
++    let out!: T;
++    scope = sys.makeScope(() => {
++      out = fn();
++    });
++    return out;
++  },
++  cleanup: () => {
++    if (scope !== null) {
++      scope();
++      scope = null;
++    }
++    sys.reset();
++  },
++};
+diff --git a/packages/core/src/frameworks/solid2.ts b/packages/core/src/frameworks/solid2.ts
+new file mode 100644
+index 0000000..c3b89bc
+--- /dev/null
++++ b/packages/core/src/frameworks/solid2.ts
+@@ -0,0 +1,38 @@
++import { ReactiveFramework } from "../util/reactiveFramework";
++// The package's `node` export condition resolves to a server build with
++// inert reactivity, so load the browser build directly.
++import {
++  flush,
++  createEffect,
++  createMemo,
++  createRoot,
++  createSignal,
++} from "../../node_modules/solid-js-2/dist/solid.js";
++
++export const solid2Framework: ReactiveFramework = {
++  name: "SolidJS 2.0",
++  signal: (initialValue) => {
++    const [getter, setter] = createSignal(initialValue as any);
++    return {
++      write: (v) => setter(v as any),
++      read: () => getter(),
++    };
++  },
++  computed: (fn) => {
++    const memo = createMemo(fn);
++    return {
++      read: () => memo(),
++    };
++  },
++  effect: (fn) => createEffect(fn, () => {}),
++  withBatch: (fn) => {
++    fn();
++    flush();
++  },
++  withBuild: (fn) =>
++    createRoot((dispose) => {
++      solid2Framework.cleanup = dispose;
++      return fn();
++    }),
++  cleanup: () => {},
++};
+diff --git a/packages/core/src/frameworks/tldrawState.ts b/packages/core/src/frameworks/tldrawState.ts
+new file mode 100644
+index 0000000..8633d72
+--- /dev/null
++++ b/packages/core/src/frameworks/tldrawState.ts
+@@ -0,0 +1,29 @@
++import { ReactiveFramework } from "../util/reactiveFramework";
++import { atom, computed, react, transact } from "@tldraw/state";
++
++let toCleanup: (() => void)[] = [];
++export const tldrawStateFramework: ReactiveFramework = {
++  name: "@tldraw/state",
++  signal: (initialValue) => {
++    const a = atom("s", initialValue);
++    return {
++      write: (v) => a.set(v),
++      read: () => a.get(),
++    };
++  },
++  computed: (fn) => {
++    const c = computed("c", fn);
++    return {
++      read: () => c.get(),
++    };
++  },
++  effect: (fn) => toCleanup.push(react("e", fn)),
++  withBatch: (fn) => transact(fn),
++  withBuild: (fn) => fn(),
++  cleanup: () => {
++    for (const cleanup of toCleanup) {
++      cleanup();
++    }
++    toCleanup = [];
++  },
++};
+diff --git a/packages/core/src/frameworksList.ts b/packages/core/src/frameworksList.ts
+index 30d3c8b..a3d199c 100644
+--- a/packages/core/src/frameworksList.ts
++++ b/packages/core/src/frameworksList.ts
+@@ -1,5 +1,6 @@
+ import type { FrameworkInfo } from "./util/frameworkTypes";
+ import { alienFramework } from "./frameworks/alienSignals";
++import { dalienFramework } from "./frameworks/dalienSignals";
+ import { angularFramework as angularFramework2 } from "./frameworks/angularSignals2";
+ import { compostateFramework } from "./frameworks/inactive/compostate";
+ import { mobxFramework } from "./frameworks/inactive/mobx";
+@@ -25,6 +26,7 @@ import { xReactivityFramework } from "./frameworks/xReactivity";
+ 
+ export const frameworkInfo: FrameworkInfo[] = [
+   { framework: alienFramework, testPullCounts: true },
++  { framework: dalienFramework, testPullCounts: true },
+   { framework: angularFramework2, testPullCounts: true },
+   { framework: compostateFramework, testPullCounts: true },
+   { framework: mobxFramework, testPullCounts: true },
+@@ -41,6 +43,7 @@ export const frameworkInfo: FrameworkInfo[] = [
+ 
+ export const allFrameworks: FrameworkInfo[] = [
+   { framework: alienFramework, testPullCounts: true },
++  { framework: dalienFramework, testPullCounts: true },
+   { framework: angularFramework2, testPullCounts: true },
+   { framework: compostateFramework, testPullCounts: true },
+   { framework: mobxFramework, testPullCounts: true },
+diff --git a/packages/core/src/index.ts b/packages/core/src/index.ts
+index 706b754..cf4e975 100644
+--- a/packages/core/src/index.ts
++++ b/packages/core/src/index.ts
+@@ -21,18 +21,30 @@ export async function runTests(
+   frameworkInfo: FrameworkInfo[],
+   logPerfResult: PerfResultCallback,
+ ) {
++  // Optional suite filter for debugging/bisection, e.g. SUITES=kairo,dynamic.
++  // Applies identically to every framework; timing methodology is unchanged.
++  const suites = process.env.SUITES?.split(",");
++  const want = (name: string) => !suites || suites.includes(name);
+   await promiseDelay(0);
+ 
+-  for (const { framework } of frameworkInfo) {
+-    await sbench(framework, logPerfResult);
+-    await promiseDelay(1000);
++  if (want("sbench")) {
++    for (const { framework } of frameworkInfo) {
++      await sbench(framework, logPerfResult);
++      await promiseDelay(1000);
++    }
+   }
+ 
+-  await kairoBench(frameworkInfo, logPerfResult);
++  if (want("kairo")) {
++    await kairoBench(frameworkInfo, logPerfResult);
++  }
+ 
+-  await cellxbench(frameworkInfo, logPerfResult);
+-  await promiseDelay(1000);
++  if (want("cellx")) {
++    await cellxbench(frameworkInfo, logPerfResult);
++    await promiseDelay(1000);
++  }
+ 
+-  await dynamicBench(frameworkInfo, logPerfResult);
+-  await promiseDelay(1000);
++  if (want("dynamic")) {
++    await dynamicBench(frameworkInfo, logPerfResult);
++    await promiseDelay(1000);
++  }
+ }
+diff --git a/packages/core/src/util/benchRepeat.ts b/packages/core/src/util/benchRepeat.ts
+index fc7b78a..85661f2 100644
+--- a/packages/core/src/util/benchRepeat.ts
++++ b/packages/core/src/util/benchRepeat.ts
+@@ -1,6 +1,40 @@
+ import { nextTick } from "./asyncUtil";
+ import { TimingResult } from "./perfTests";
+ 
++/**
++ * Benchmark a function n times and summarize with the MEDIAN run.
++ *
++ * This fork reports medians instead of upstream's fastest-of-n: the minimum
++ * selects each framework's single luckiest lap, which systematically hides
++ * costs that are amortized across runs (GC of the graph the run created,
++ * deoptimization recovery, finalizer processing) and rewards best-case
++ * latency. The median of independent runs is the standard robust summary
++ * used by benchmark harnesses such as hyperfine, JMH steady-state runs, and
++ * Criterion, and it is what we chart.
++ *
++ * Returns the run whose time is the median (odd n), or the faster of the two
++ * middle runs with the interpolated median time (even n), so callers can
++ * still verify that run's result values.
++ */
++export async function medianTest<T>(
++  times: number,
++  fn: () => T,
++): Promise<TimingResult<T>> {
++  const results: TimingResult<T>[] = [];
++  for (let i = 0; i < times; i++) {
++    await nextTick();
++    const run = runTimed(fn);
++    results.push(run);
++  }
++  const sorted = [...results].sort((a, b) => a.time - b.time);
++  const mid = Math.floor(sorted.length / 2);
++  if (sorted.length % 2 === 1) {
++    return sorted[mid];
++  }
++  const lower = sorted[mid - 1];
++  return { result: lower.result, time: (lower.time + sorted[mid].time) / 2 };
++}
++
+ /** benchmark a function n times, returning the fastest result and associated timing */
+ export async function fastestTest<T>(
+   times: number,
+diff --git a/packages/core/src/util/medianOf.ts b/packages/core/src/util/medianOf.ts
+new file mode 100644
+index 0000000..8e51663
+--- /dev/null
++++ b/packages/core/src/util/medianOf.ts
+@@ -0,0 +1,12 @@
++/**
++ * Median of a list of timings (interpolated for even counts). See
++ * benchRepeat.ts for why this fork summarizes with medians rather than
++ * upstream's fastest-of-n.
++ */
++export function medianOf(times: number[]): number {
++  const sorted = [...times].sort((a, b) => a - b);
++  const mid = Math.floor(sorted.length / 2);
++  return sorted.length % 2 === 1
++    ? sorted[mid]
++    : (sorted[mid - 1] + sorted[mid]) / 2;
++}
+diff --git a/packages/node/src/index.ts b/packages/node/src/index.ts
+index a0a2c47..93204e0 100644
+--- a/packages/node/src/index.ts
++++ b/packages/node/src/index.ts
+@@ -21,8 +21,13 @@ function logPerfResult(result: PerfResult): void {
+ }
+ 
+ async function main() {
++  const requested = process.argv.slice(2);
++  const selected =
++    requested.length > 0
++      ? frameworkInfo.filter((f) => requested.includes(f.framework.name))
++      : frameworkInfo;
+   logLine(formatPerfResult(perfResultHeaders()));
+-  await runTests(frameworkInfo, logPerfResult);
++  await runTests(selected, logPerfResult);
+ }
+ 
+ main();
+diff --git a/packages/node/src/isolated.ts b/packages/node/src/isolated.ts
+new file mode 100644
+index 0000000..ca417c2
+--- /dev/null
++++ b/packages/node/src/isolated.ts
+@@ -0,0 +1,119 @@
++/**
++ * Runs the benchmark suite with each framework in its own node process, so
++ * that one framework's JIT warmup, GC pressure, and polymorphic call sites
++ * can't affect another framework's numbers.
++ *
++ * Frameworks are run in ROUNDS, round-robin (A B C, A B C, ...), and each
++ * test's final time is the MEDIAN of its per-round times. Interleaving
++ * decorrelates slow machine drift (thermals, background load) from any one
++ * framework, and the median discards lucky/unlucky rounds; a single
++ * sequential pass can move a framework's totals by ~10% on a laptop, which
++ * is larger than many of the gaps being measured.
++ *
++ * Usage: node dist/isolated.js [--rounds N] [frameworkName...]
++ */
++import {
++  frameworkInfo,
++  formatPerfResult,
++  perfResultHeaders,
++} from "js-reactivity-benchmark/src/index";
++import { spawnSync } from "node:child_process";
++import { fileURLToPath } from "node:url";
++import path from "node:path";
++
++const indexJs = path.join(
++  path.dirname(fileURLToPath(import.meta.url)),
++  "index.js",
++);
++
++const argv = process.argv.slice(2);
++let rounds = 3;
++const roundsAt = argv.indexOf("--rounds");
++if (roundsAt !== -1) {
++  rounds = Number(argv[roundsAt + 1]);
++  if (!Number.isInteger(rounds) || rounds < 1) {
++    console.error(`--rounds expects a positive integer`);
++    process.exit(1);
++  }
++  argv.splice(roundsAt, 2);
++}
++
++const requested = argv;
++const names = frameworkInfo.map((f) => f.framework.name);
++const unknown = requested.filter((name) => !names.includes(name));
++if (unknown.length > 0) {
++  console.error(
++    `unknown frameworks: ${unknown.join(", ")}; available: ${names.join(", ")}`,
++  );
++  process.exit(1);
++}
++const selected = requested.length > 0 ? requested : names;
++
++function medianOf(times: number[]): number {
++  const sorted = [...times].sort((a, b) => a - b);
++  const mid = Math.floor(sorted.length / 2);
++  return sorted.length % 2 === 1
++    ? sorted[mid]
++    : (sorted[mid - 1] + sorted[mid]) / 2;
++}
++
++// (framework, test) -> per-round times; test order preserved per framework.
++const samples = new Map<string, Map<string, number[]>>();
++for (const name of selected) samples.set(name, new Map());
++let failures = 0;
++
++for (let round = 0; round < rounds; round++) {
++  for (const name of selected) {
++    console.error(`round ${round + 1}/${rounds}: ${name}`);
++    // No --expose-gc, matching upstream's node runner: forced double-majors
++    // between tests are untimed but evict every framework's working set, so
++    // the following timed regions start cache-cold — measured to distort
++    // comparisons more than the cross-suite GC billing it removes.
++    const result = spawnSync(process.execPath, [indexJs, name], {
++      stdio: ["ignore", "pipe", "inherit"],
++      encoding: "utf8",
++      maxBuffer: 64 * 1024 * 1024,
++    });
++    if (result.status !== 0) {
++      failures++;
++      console.error(
++        `⚠ ${name} round ${round + 1} exited with ${
++          result.status !== null ? `code ${result.status}` : result.signal
++        } (keeping rows from its other rounds)`,
++      );
++    }
++    const perTest = samples.get(name)!;
++    for (const line of (result.stdout ?? "").split("\n")) {
++      const parts = line.split(",").map((p) => p.trim());
++      if (parts.length < 3 || parts[0] !== name) continue;
++      const time = Number(parts[2]);
++      if (!Number.isFinite(time)) continue;
++      let arr = perTest.get(parts[1]);
++      if (arr === undefined) {
++        arr = [];
++        perTest.set(parts[1], arr);
++      }
++      arr.push(time);
++    }
++  }
++}
++
++console.log(formatPerfResult(perfResultHeaders()));
++for (const name of selected) {
++  const perTest = samples.get(name)!;
++  for (const [test, times] of perTest) {
++    if (times.length < rounds) {
++      console.error(
++        `⚠ ${name} / ${test}: only ${times.length}/${rounds} rounds completed`,
++      );
++    }
++    console.log(
++      formatPerfResult({
++        framework: name,
++        test,
++        time: medianOf(times).toFixed(2),
++      }),
++    );
++  }
++}
++process.exit(failures > 0 && samples.size === 0 ? 1 : 0);
+diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
+index 7a5d971..1bc57d8 100644
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -33,11 +33,14 @@ importers:
+         specifier: ^3.5.28
+         version: 3.5.28
+       alien-signals:
+-        specifier: ^3.1.2
+-        version: 3.1.2
++        specifier: file:../../../upstream-alien-signals
++        version: file:../upstream-alien-signals
+       compostate:
+         specifier: ^0.5.1
+         version: 0.5.1
++      dalien-signals:
++        specifier: file:../../../packages/dalien-signals
++        version: file:../packages/dalien-signals
+       esbuild:
+         specifier: ^0.27.3
+         version: 0.27.3
+@@ -850,8 +853,8 @@ packages:
+     engines: {node: '>=0.4.0'}
+     hasBin: true
+ 
+-  alien-signals@3.1.2:
+-    resolution: {integrity: sha512-d9dYqZTS90WLiU0I5c6DHj/HcKkF8ZyGN3G5x8wSbslulz70KOxaqCT0hQCo9KOyhVqzqGojvNdJXoTumZOtcw==}
++  alien-signals@file:../upstream-alien-signals:
++    resolution: {directory: ../upstream-alien-signals, type: directory}
+ 
+   aria-query@5.3.2:
+     resolution: {integrity: sha512-COROpnaoap1E2F000S62r6A60uHZnmlvomhfyT2DlTcrY1OrBKn2UhH7qn5wTC9zMvD0AY7csdPSNwKP+7WiQw==}
+@@ -904,6 +907,9 @@ packages:
+   csstype@3.2.3:
+     resolution: {integrity: sha512-z1HGKcYy2xA8AGQfwrn0PAy+PB7X/GSj3UVJW9qKyn43xWa+gl5nXmU4qqLMRzWVLFC8KusUX8T/0kCiOYpAIQ==}
+ 
++  dalien-signals@file:../packages/dalien-signals:
++    resolution: {directory: ../packages/dalien-signals, type: directory}
++
+   debug@4.4.3:
+     resolution: {integrity: sha512-RGwwWnwQvkVfavKVt22FGLw+xYSdzARwm0ru6DhTVA3umU5hZc28V3kO4stgYryrTlLpuvgI9GiijltAjNbcqA==}
+     engines: {node: '>=6.0'}
+@@ -1893,7 +1899,7 @@ snapshots:
+ 
+   acorn@8.15.0: {}
+ 
+-  alien-signals@3.1.2: {}
++  alien-signals@file:../upstream-alien-signals: {}
+ 
+   aria-query@5.3.2: {}
+ 
+@@ -1931,6 +1937,8 @@ snapshots:
+ 
+   csstype@3.2.3: {}
+ 
++  dalien-signals@file:../packages/dalien-signals: {}
++
+   debug@4.4.3:
+     dependencies:
+       ms: 2.1.3
