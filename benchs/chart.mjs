@@ -4,6 +4,7 @@
 // 4px rounded data-end (square baseline), 2px surface gaps between segments,
 // hairline solid gridlines, values at bar tips in text ink, legend on top.
 import { readFileSync, writeFileSync } from 'node:fs';
+import { COLOR, GRID, INK, INK2, SURFACE, SUITES, escXml, parseResults, summarize } from './lib.mjs';
 
 // Pipeline: run `node dist/isolated.js` in milomg-reactivity-benchmark/packages/node
 // (one process per framework), save its stdout under benchs/results/, then
@@ -15,45 +16,8 @@ const OUT = process.argv[3] ?? '/tmp/benchmark.svg';
 const TITLE = process.argv[4] ?? 'Total benchmark time by framework';
 const SUBTITLE = process.argv[5] ?? 'js-reactivity-benchmark (milomg), all four suites, one process per framework, fastest-of-N per test - lower is better';
 
-const KAIRO = new Set(['avoidablePropagation', 'broadPropagation', 'deepPropagation', 'diamond', 'mux', 'repeatedObservers', 'triangle', 'unstable', 'molBench']);
-// sbench test names differ between the milomg and transitive-bullshit forks
-// (createSignals vs createDataSignals/createComputations0to1/...), but all
-// share the create*/update* prefixes.
-const suiteOf = (test) => (test.startsWith('create') || test.startsWith('update')) ? 'sbench'
-	: KAIRO.has(test) ? 'kairo'
-	: test.startsWith('cellx') ? 'cellx'
-	: 'dynamic';
-
-const SUITES = ['sbench', 'kairo', 'cellx', 'dynamic'];
-
-// Validated categorical palette (light), slots 1-4 in fixed order.
-const COLOR = { sbench: '#2a78d6', kairo: '#1baf7a', cellx: '#eda100', dynamic: '#008300' };
-const SURFACE = '#ffffff';
-const INK = '#0b0b0b';
-const INK2 = '#52514e';
-const GRID = '#e8e8e6';
-
-const rows = readFileSync(SRC, 'utf8').split('\n')
-	.map((l) => l.split(',').map((p) => p.trim()))
-	.filter((p) => p.length === 3 && p[0] !== 'framework' && Number.isFinite(Number(p[2])));
-
-const byFw = new Map();
-for (const [fw, test, time] of rows) {
-	if (!byFw.has(fw)) byFw.set(fw, { tests: 0, sums: { sbench: 0, kairo: 0, cellx: 0, dynamic: 0 } });
-	const e = byFw.get(fw);
-	e.tests++;
-	e.sums[suiteOf(test)] += Number(time);
-}
-
-// A framework that crashed mid-suite has fewer rows than the fullest one.
-const expectedTests = Math.max(...[...byFw.values()].map((e) => e.tests));
-const frameworks = [];
-const partial = [];
-for (const [fw, e] of byFw) {
-	if (e.tests < expectedTests) { partial.push(`${fw} (${e.tests}/${expectedTests} tests)`); continue; }
-	frameworks.push({ fw, ...e.sums, total: SUITES.reduce((t, s) => t + e.sums[s], 0) });
-}
-frameworks.sort((a, b) => a.total - b.total);
+const rows = parseResults(readFileSync(SRC, 'utf8'));
+const { frameworks, partial } = summarize(rows);
 if (partial.length) console.error('excluded (crashed mid-suite): ' + partial.join('; '));
 
 // ---- layout ----
@@ -68,7 +32,7 @@ const step = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((s) => maxTotal / s <= 
 const axisMax = Math.ceil(maxTotal / step) * step;
 const x = (v) => LABEL_W + (v / axisMax) * plotW;
 
-const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+const esc = escXml;
 let svg = [];
 svg.push(`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">`);
 svg.push(`<rect width="${W}" height="${H}" fill="${SURFACE}"/>`);

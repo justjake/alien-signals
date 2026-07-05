@@ -43,3 +43,26 @@ To update the patch after changing the harness fork locally:
   those produce separate charts.
 - The default framework set is the contested cluster. Dispatch the workflow
   manually with `frameworks: ALL` for the full 14-framework chart (hours).
+
+## Pulling CI results into the repo
+
+`pull-run.mjs` syncs a green CI run into the repo — data, charts, and README:
+
+```sh
+node benchs/ci/pull-run.mjs --run <run-id> [--repo justjake/alien-signals] [--dry]
+```
+
+It downloads the run's `benchmark-<runtime>` artifacts, copies each results
+CSV to `benchs/results/<date>-ci-run<id>-<runtime>.txt`, regenerates the
+totals chart (`benchs/chart.mjs`) and the per-test small-multiples chart
+(`benchs/chartDetails.mjs`) with run metadata in the subtitle, rasterizes
+them into `assets/`, and rewrites the README regions between
+`<!-- benchmark:<runtime>:begin -->` and `<!-- benchmark:<runtime>:end -->`
+(image, alt text, suite-totals table, per-test chart). Everything between
+those markers is generated — hand edits there are overwritten; prose lives
+outside them. `--dry` writes to a temp directory for inspection instead of
+the repo; runs whose conclusion is not success are refused. Requires an
+authenticated `gh` and a Chrome/Chromium binary (override with `$CHROME`).
+
+The chart scripts share their parsing, suite mapping, and palette through
+`benchs/lib.mjs`, so the three of them cannot drift apart.
