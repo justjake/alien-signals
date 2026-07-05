@@ -9,7 +9,7 @@
  *
  * - Nodes and links are integer ids into ONE flat Int32Array plane (M),
  *   stride 8; ids are pre-multiplied record offsets (id = recordIndex * 8) so
- *   field access is `M[id + FIELD]`. Nodes and links interleave in the same
+ *   field access is `(M[id + FIELD] | 0)`. Nodes and links interleave in the same
  *   plane: single base register, single bump pointer, two free lists (plane
  *   merge measured -2% deep / -8% diamond vs split planes). Record 0 is
  *   burned as NULL, so every `x !== undefined` upstream becomes `x !== 0`.
@@ -105,7 +105,11 @@ const enum C {
 	SUBS = 3,
 	SUBS_TAIL = 4,
 	GEN = 5, // bumped on free; disposers capture it to defuse stale ids
-	// fields 6-7 spare (pad to one cache line per record)
+	// Quiet-read verification stamp, split across two i32 slots (53-bit
+	// epoch: never wraps). Same cache line as FLAGS, so the fast-path check
+	// costs no extra memory traffic. Node records are now fully packed.
+	VSTAMP_HI = 6,
+	VSTAMP_LO = 7,
 
 	// Link fields (M plane, stride 8; link records share the plane with nodes).
 	VERSION = 0,
@@ -313,7 +317,7 @@ export interface ReactiveSystem {
 	/** Overwrite the PUBLIC (semantic) flag bits of a node; kind bits keep. */
 	setNodeFlags(id: number, flags: number): void;
 	/** The live record plane (debugging/tooling only). */
-	buffer(): Int32Array;
+	buffer(): Int32Array | number[];
 	/** Allocation accounting (debugging/tests): walks the free lists, O(free). */
 	stats(): {
 		capacityRecords: number;
@@ -336,11 +340,20 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 	// exactly where the old one stopped; only the buffer binding lives in the
 	// engine closure.
 	let recNext = 8; // bump pointer, shared by nodes and links (record 0 burned)
-	let nodeFreeHead = 0; // free list threaded through M[id + C.DEPS]
-	let linkFreeHead = 0; // free list threaded through M[id + C.NEXT_DEP]
+	let nodeFreeHead = 0; // free list threaded through (M[id + C.DEPS] | 0)
+	let linkFreeHead = 0; // free list threaded through (M[id + C.NEXT_DEP] | 0)
 	let boundaryPending = false; // pendingFree nonempty (one hot-path load)
 
 	let cycle = 0;
+	// Global write epoch (quiet-read fast path): bumped by every committed
+	// signal write and every trigger(). A computed whose verification stamp
+	// equals the current epoch is provably current — nothing anywhere has
+	// been written since it was last verified — so reads skip the flags
+	// ladder entirely. Preact/Vue 3.6/Svelte ship the same idea; upstream
+	// alien-signals does not. Split lo/hi (manual carry at 2^30) so stamps
+	// fit two i32 record slots and the whole scheme never wraps.
+	let epochLo = 1;
+	let epochHi = 1;
 	let runDepth = 0;
 	let batchDepth = 0;
 	let notifyIndex = 0;
@@ -388,7 +401,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 	}
 
 	interface Engine extends ReactiveEngine {
-		buffer(): Int32Array;
+		buffer(): Int32Array | number[];
 		newSignal(value: unknown): number;
 		newComputed(getter: (previousValue?: unknown) => unknown): number;
 		newEffect(fn: () => (() => void) | void): number;
@@ -398,6 +411,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		makeEffect(fn: () => (() => void) | void): () => void;
 		makeScope(fn: () => void): () => void;
 		orphan(id: number): void;
+		clearStamp(id: number): void;
 		run(e: number): void;
 		requeueAbort(e: number): void;
 		trigger(fn: () => void): void;
@@ -447,6 +461,65 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			computedSrc = String(engine.makeComputed(noop));
 			effectSrc = String(engine.makeEffect(noop));
 			scopeSrc = String(engine.makeScope(noop));
+		}
+		// Seed the engine's user-callback call sites (cold eval, recompute,
+		// effect run) past V8's megamorphic threshold (>4 shapes) before any
+		// real work. When such a site has seen four or fewer shapes, V8
+		// speculates on the exact call targets and compiles them inline; the
+		// first workload that pushes the site past the threshold then
+		// deoptimizes the engine's hot functions and pays reoptimization
+		// cycles mid-run (measured at 20-35% on pull-heavy graphs when
+		// several distinct workloads share one process). Generic-from-birth
+		// call sites cost a hair per call but keep performance flat as an
+		// application's callback shapes diversify. The handles are dropped
+		// immediately and self-reclaim through the registry. Skipped on tiny
+		// configured planes (tests, embedded uses), where the ~30 transient
+		// records would be a real bite out of capacity and a single-workload
+		// process is the norm anyway.
+		if (configuredRecords >= 4096) {
+			const s0 = engine.makeSignal(0);
+			const read = s0 as () => number;
+			const c1 = engine.makeComputed(() => read() + 1);
+			const c2 = engine.makeComputed((p) => (p === undefined ? 0 : (p as number)) + read());
+			const c3 = engine.makeComputed(() => {
+				const v = read();
+				return v * 2;
+			});
+			const c4 = engine.makeComputed(() => read() - 1);
+			const c5 = engine.makeComputed(() => (read() & 1) + read());
+			const cs = [c1, c2, c3, c4, c5];
+			const e1 = engine.makeEffect(() => {
+				c1();
+			});
+			const e2 = engine.makeEffect(() => {
+				c2();
+				c3();
+			});
+			const e3 = engine.makeEffect(() => {
+				c4();
+			});
+			const e4 = engine.makeEffect(() => {
+				void c5();
+			});
+			const e5 = engine.makeEffect(() => {
+				for (const c of cs) {
+					c();
+				}
+			});
+			const write = s0 as (v: number) => void;
+			for (let round = 1; round <= 3; round++) {
+				write(round);
+				c1();
+				c2();
+				c3();
+				c4();
+				c5();
+			}
+			e1();
+			e2();
+			e3();
+			e4();
+			e5();
 		}
 		return engine;
 	}
@@ -529,7 +602,16 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 	// ---- the engine (rebuilt on growth; M is closure-const) -------------------
 
 	function createEngine(records: number): Engine {
-		const M = new Int32Array(records * 8);
+		// EXPERIMENT(jsarray-plane): the plane is a plain JS array kept in
+		// PACKED_SMI_ELEMENTS mode (created dense via push, grown via push,
+		// never written past length, never stores a non-int32). Unlike the
+		// Int32Array it can grow IN PLACE: the binding M never changes, so
+		// zero-hop handles stay valid across growth.
+		const planeLimit = records * 8;
+		const M: number[] = [];
+		for (let i = planeLimit < 65536 ? planeLimit : 65536; i > 0; i--) {
+			M.push(0);
+		}
 		// Function-scope aliases for the factory-level side arrays: esbuild
 		// bundling demotes module/factory-scope `const` to mutable `var` only at
 		// module scope; these locals fold via the same one-closure-cell context
@@ -549,6 +631,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			makeEffect,
 			makeScope,
 			orphan,
+			clearStamp,
 			read,
 			write,
 			computedRead,
@@ -594,15 +677,19 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		function makeComputed(getter: (previousValue?: unknown) => unknown): () => unknown {
 			maybeBoundary();
 			const id = allocNode(C.K_COMPUTED);
-			const oper = anon(() => computedReadWith(id, getter));
-			registry.register(oper, id);
-			return oper;
+			// Registration is deferred to the first evaluation (see
+			// coldEvalWith): an unevaluated computed has no value and no
+			// engine-side closure anchor (getters are handle-owned), so there
+			// is nothing GC-visible to reclaim — and create-heavy workloads
+			// skip the registry entirely for computeds they never use. A
+			// dropped never-read computed leaks only its 32-byte plane record.
+			return anon(() => computedReadWith(id, getter));
 		}
 
 		function makeEffect(fn: () => (() => void) | void): () => void {
 			maybeBoundary();
 			const id = newEffect(fn);
-			const gen = M[id + C.GEN];
+			const gen = (M[id + C.GEN] | 0);
 			return () => {
 				dispose(id, gen);
 			};
@@ -611,7 +698,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		function makeScope(fn: () => void): () => void {
 			maybeBoundary();
 			const id = newScope(fn);
-			const gen = M[id + C.GEN];
+			const gen = (M[id + C.GEN] | 0);
 			// disposeScope wraps dispose: the distinct callee NAME keeps this
 			// literal's source text different from makeEffect's under every
 			// transform (their kinds are told apart by source, not by brand).
@@ -622,16 +709,31 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 
 		// ---- allocation --------------------------------------------------------
 
+		function growPlane(need: number): void {
+			if (need >= planeLimit) {
+				throw new Error('dalien-signals: record plane capacity exhausted; configure({ initialRecords }) with a larger capacity before first use');
+			}
+			let n = M.length * 2;
+			if (n > planeLimit) {
+				n = planeLimit;
+			}
+			// push keeps the plane packed; a store past length would go HOLEY
+			// permanently and every element access would pay the hole check.
+			while (M.length < n) {
+				M.push(0);
+			}
+		}
+
 		function allocNode(flags: number): number {
 			let id: number;
 			if (nodeFreeHead !== 0) {
 				id = nodeFreeHead;
-				nodeFreeHead = M[id + C.DEPS];
+				nodeFreeHead = (M[id + C.DEPS] | 0);
 				M[id + C.DEPS] = 0;
 			} else {
 				id = recNext;
 				if (id >= M.length) {
-					throw new Error('dalien-signals: record plane capacity exhausted; configure({ initialRecords }) with a larger capacity before first use');
+					growPlane(id);
 				}
 				recNext = id + 8;
 				// Size the side columns for a fresh record only (recycled ids
@@ -650,6 +752,8 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		}
 
 		function freeNode(id: number): void {
+			M[id + C.VSTAMP_LO] = 0;
+			M[id + C.VSTAMP_HI] = 0;
 			M[id + C.FLAGS] = 0;
 			M[id + C.DEPS_TAIL] = 0;
 			M[id + C.SUBS] = 0;
@@ -677,10 +781,10 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		function sweepFnClears(): void {
 			for (let i = 0; i < pendingFnClear.length; ++i) {
 				const id = pendingFnClear[i];
-				const flags = M[id + C.FLAGS];
+				const flags = (M[id + C.FLAGS] | 0);
 				if (
 					(flags & (C.K_COMPUTED | C.FN_INSTALLED)) === (C.K_COMPUTED | C.FN_INSTALLED)
-					&& !M[id + C.SUBS]
+					&& !(M[id + C.SUBS] | 0)
 				) {
 					fnTab[id >> 3] = undefined;
 					M[id + C.FLAGS] = flags & ~C.FN_INSTALLED;
@@ -693,11 +797,11 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			let id: number;
 			if (linkFreeHead !== 0) {
 				id = linkFreeHead;
-				linkFreeHead = M[id + C.FREE_NEXT];
+				linkFreeHead = (M[id + C.FREE_NEXT] | 0);
 			} else {
 				id = recNext;
 				if (id >= M.length) {
-					throw new Error('dalien-signals: record plane capacity exhausted; configure({ initialRecords }) with a larger capacity before first use');
+					growPlane(id);
 				}
 				recNext = id + 8;
 			}
@@ -712,12 +816,12 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		// ---- graph kernel (upstream system.ts, transliterated) ----------------
 
 		function link(dep: number, sub: number, version: number): void {
-			const prevDep = M[sub + C.DEPS_TAIL];
-			if (prevDep !== 0 && M[prevDep + C.DEP] === dep) {
+			const prevDep = (M[sub + C.DEPS_TAIL] | 0);
+			if (prevDep !== 0 && (M[prevDep + C.DEP] | 0) === dep) {
 				return;
 			}
-			const nextDep = prevDep !== 0 ? M[prevDep + C.NEXT_DEP] : M[sub + C.DEPS];
-			if (nextDep !== 0 && M[nextDep + C.DEP] === dep) {
+			const nextDep = prevDep !== 0 ? (M[prevDep + C.NEXT_DEP] | 0) : (M[sub + C.DEPS] | 0);
+			if (nextDep !== 0 && (M[nextDep + C.DEP] | 0) === dep) {
 				M[nextDep + C.VERSION] = version;
 				M[sub + C.DEPS_TAIL] = nextDep;
 				return;
@@ -728,8 +832,8 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		// Insertion tail of link(): kept out of line so the steady-state
 		// re-track fast path above stays under V8's inlining bytecode budget.
 		function linkInsert(dep: number, sub: number, version: number, prevDep: number, nextDep: number): void {
-			const prevSub = M[dep + C.SUBS_TAIL];
-			if (prevSub !== 0 && M[prevSub + C.VERSION] === version && M[prevSub + C.SUB] === sub) {
+			const prevSub = (M[dep + C.SUBS_TAIL] | 0);
+			if (prevSub !== 0 && (M[prevSub + C.VERSION] | 0) === version && (M[prevSub + C.SUB] | 0) === sub) {
 				return;
 			}
 			const newLink = allocLink();
@@ -757,12 +861,12 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			}
 		}
 
-		function unlink(id: number, sub = M[id + C.SUB]): number {
-			const dep = M[id + C.DEP];
-			const prevDep = M[id + C.PREV_DEP];
-			const nextDep = M[id + C.NEXT_DEP];
-			const nextSub = M[id + C.NEXT_SUB];
-			const prevSub = M[id + C.PREV_SUB];
+		function unlink(id: number, sub = (M[id + C.SUB] | 0)): number {
+			const dep = (M[id + C.DEP] | 0);
+			const prevDep = (M[id + C.PREV_DEP] | 0);
+			const nextDep = (M[id + C.NEXT_DEP] | 0);
+			const nextSub = (M[id + C.NEXT_SUB] | 0);
+			const prevSub = (M[id + C.PREV_SUB] | 0);
 			if (nextDep !== 0) {
 				M[nextDep + C.PREV_DEP] = prevDep;
 			} else {
@@ -792,13 +896,13 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			// queues), so it cannot throw and always drains the stack back to
 			// its base.
 			let cur = startLink;
-			let next = M[cur + C.NEXT_SUB];
+			let next = (M[cur + C.NEXT_SUB] | 0);
 			const markBits = innerWrite ? C.PENDING | C.RECURSED : C.PENDING;
 			const stackBase = propSp;
 
 			top: do {
-				const sub = M[cur + C.SUB];
-				let flags = M[sub + C.FLAGS];
+				const sub = (M[cur + C.SUB] | 0);
+				let flags = (M[sub + C.FLAGS] | 0);
 
 				if (!(flags & (C.RECURSED_CHECK | C.RECURSED | C.DIRTY | C.PENDING))) {
 					M[sub + C.FLAGS] = flags | markBits;
@@ -818,10 +922,10 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 				}
 
 				if (flags & C.MUTABLE) {
-					const subSubs = M[sub + C.SUBS];
+					const subSubs = (M[sub + C.SUBS] | 0);
 					if (subSubs !== 0) {
 						cur = subSubs;
-						const nextSub = M[cur + C.NEXT_SUB];
+						const nextSub = (M[cur + C.NEXT_SUB] | 0);
 						if (nextSub !== 0) {
 							if (propSp === propStack.length) {
 								growPropStack();
@@ -834,14 +938,14 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 				}
 
 				if ((cur = next) !== 0) {
-					next = M[cur + C.NEXT_SUB];
+					next = (M[cur + C.NEXT_SUB] | 0);
 					continue;
 				}
 
 				while (propSp > stackBase) {
 					cur = propStack[--propSp];
 					if (cur !== 0) {
-						next = M[cur + C.NEXT_SUB];
+						next = (M[cur + C.NEXT_SUB] | 0);
 						continue top;
 					}
 				}
@@ -869,7 +973,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		// (the re-track may rebuild the list), exactly as upstream.
 		function updateAndShallow(node: number, subs: number): boolean {
 			if (update(node)) {
-				if (M[subs + C.NEXT_SUB] !== 0) {
+				if ((M[subs + C.NEXT_SUB] | 0) !== 0) {
 					shallowPropagate(subs);
 				}
 				return true;
@@ -882,13 +986,13 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			let dirty = false;
 
 			top: do {
-				const dep = M[cur + C.DEP];
-				const depFlags = M[dep + C.FLAGS];
+				const dep = (M[cur + C.DEP] | 0);
+				const depFlags = (M[dep + C.FLAGS] | 0);
 
-				if (M[sub + C.FLAGS] & C.DIRTY) {
+				if ((M[sub + C.FLAGS] | 0) & C.DIRTY) {
 					dirty = true;
 				} else if ((depFlags & (C.MUTABLE | C.DIRTY)) === (C.MUTABLE | C.DIRTY)) {
-					if (updateAndShallow(dep, M[dep + C.SUBS])) {
+					if (updateAndShallow(dep, (M[dep + C.SUBS] | 0))) {
 						dirty = true;
 					}
 				} else if ((depFlags & (C.MUTABLE | C.PENDING)) === (C.MUTABLE | C.PENDING)) {
@@ -896,14 +1000,14 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 						growCheckStack();
 					}
 					checkStack[checkSp++] = cur;
-					cur = M[dep + C.DEPS];
+					cur = (M[dep + C.DEPS] | 0);
 					sub = dep;
 					++checkDepth;
 					continue;
 				}
 
 				if (!dirty) {
-					const nextDep = M[cur + C.NEXT_DEP];
+					const nextDep = (M[cur + C.NEXT_DEP] | 0);
 					if (nextDep !== 0) {
 						cur = nextDep;
 						continue;
@@ -913,16 +1017,16 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 				while (checkDepth--) {
 					cur = checkStack[--checkSp];
 					if (dirty) {
-						if (updateAndShallow(sub, M[sub + C.SUBS])) {
-							sub = M[cur + C.SUB];
+						if (updateAndShallow(sub, (M[sub + C.SUBS] | 0))) {
+							sub = (M[cur + C.SUB] | 0);
 							continue;
 						}
 						dirty = false;
 					} else {
 						M[sub + C.FLAGS] &= ~C.PENDING;
 					}
-					sub = M[cur + C.SUB];
-					const nextDep = M[cur + C.NEXT_DEP];
+					sub = (M[cur + C.SUB] | 0);
+					const nextDep = (M[cur + C.NEXT_DEP] | 0);
 					if (nextDep !== 0) {
 						cur = nextDep;
 						continue top;
@@ -932,31 +1036,31 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 				// Upstream: `dirty && !!sub.flags` — a live node always has
 				// its kind bits set; flags reads 0 only if sub was disposed
 				// (record zeroed) by re-entrant user code during update().
-				return dirty && M[sub + C.FLAGS] !== 0;
+				return dirty && (M[sub + C.FLAGS] | 0) !== 0;
 			} while (true);
 		}
 
 		function shallowPropagate(startLink: number): void {
 			let cur = startLink;
 			do {
-				const sub = M[cur + C.SUB];
-				const flags = M[sub + C.FLAGS];
+				const sub = (M[cur + C.SUB] | 0);
+				const flags = (M[sub + C.FLAGS] | 0);
 				if ((flags & (C.PENDING | C.DIRTY)) === C.PENDING) {
 					M[sub + C.FLAGS] = flags | C.DIRTY;
 					if ((flags & (C.WATCHING | C.RECURSED_CHECK)) === C.WATCHING) {
 						notify(sub);
 					}
 				}
-			} while ((cur = M[cur + C.NEXT_SUB]) !== 0);
+			} while ((cur = (M[cur + C.NEXT_SUB] | 0)) !== 0);
 		}
 
 		function isValidLink(checkLink: number, sub: number): boolean {
-			let cur = M[sub + C.DEPS_TAIL];
+			let cur = (M[sub + C.DEPS_TAIL] | 0);
 			while (cur !== 0) {
 				if (cur === checkLink) {
 					return true;
 				}
-				cur = M[cur + C.PREV_DEP];
+				cur = (M[cur + C.PREV_DEP] | 0);
 			}
 			return false;
 		}
@@ -964,7 +1068,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		// ---- node behaviors (upstream index.ts, transliterated) ---------------
 
 		function update(node: number): boolean {
-			const flags = M[node + C.FLAGS];
+			const flags = (M[node + C.FLAGS] | 0);
 			if (flags & C.K_COMPUTED) {
 				return updateComputed(node);
 			}
@@ -982,9 +1086,9 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			do {
 				queue[insertIndex++] = e;
 				M[e + C.FLAGS] &= ~C.WATCHING;
-				const subs = M[e + C.SUBS];
-				e = subs !== 0 ? M[subs + C.SUB] : 0;
-				if (!e || !(M[e + C.FLAGS] & C.WATCHING)) {
+				const subs = (M[e + C.SUBS] | 0);
+				e = subs !== 0 ? (M[subs + C.SUB] | 0) : 0;
+				if (!e || !((M[e + C.FLAGS] | 0) & C.WATCHING)) {
 					break;
 				}
 			} while (true);
@@ -1002,8 +1106,13 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		}
 
 		function unwatched(node: number): void {
-			const flags = M[node + C.FLAGS];
+			const flags = (M[node + C.FLAGS] | 0);
 			if (flags & C.K_COMPUTED) {
+				// Alien recomputes an unwatched computed on its next read (it
+				// is marked Dirty without any write); drop the stamp so the
+				// fast path cannot skip that recompute.
+				M[node + C.VSTAMP_LO] = 0;
+				M[node + C.VSTAMP_HI] = 0;
 				if (flags & C.ORPHANED) {
 					reclaimOrphan(node); // handle already collected; nothing can re-subscribe
 				} else {
@@ -1014,7 +1123,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 						boundaryPending = true;
 						scheduleMaintenance();
 					}
-					if (M[node + C.DEPS_TAIL] !== 0) {
+					if ((M[node + C.DEPS_TAIL] | 0) !== 0) {
 						M[node + C.FLAGS] = C.K_COMPUTED | C.MUTABLE | C.DIRTY | (flags & C.FN_INSTALLED);
 						disposeAllDepsInReverse(node);
 					}
@@ -1032,11 +1141,11 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		// every dep that is not a signal/computed (child effects/scopes), in
 		// reverse, so their disposal (and cleanups) runs LIFO.
 		function unlinkChildEffects(sub: number): void {
-			let cur = M[sub + C.DEPS_TAIL];
+			let cur = (M[sub + C.DEPS_TAIL] | 0);
 			while (cur !== 0) {
-				const prev = M[cur + C.PREV_DEP];
-				const dep = M[cur + C.DEP];
-				if (!(M[dep + C.FLAGS] & (C.K_COMPUTED | C.K_SIGNAL))) {
+				const prev = (M[cur + C.PREV_DEP] | 0);
+				const dep = (M[cur + C.DEP] | 0);
+				if (!((M[dep + C.FLAGS] | 0) & (C.K_COMPUTED | C.K_SIGNAL))) {
 					unlink(cur, sub);
 				}
 				cur = prev;
@@ -1044,7 +1153,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		}
 
 		function updateComputed(c: number, getter?: (previousValue?: unknown) => unknown): boolean {
-			const entryFlags = M[c + C.FLAGS];
+			const entryFlags = (M[c + C.FLAGS] | 0);
 			if (entryFlags & C.HAS_CHILD_EFFECT) {
 				unlinkChildEffects(c);
 			}
@@ -1083,10 +1192,10 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		}
 
 		function run(e: number): void {
-			const flags = M[e + C.FLAGS];
+			const flags = (M[e + C.FLAGS] | 0);
 			if (
 				flags & C.DIRTY
-				|| (flags & C.PENDING && checkDirty(M[e + C.DEPS], e))
+				|| (flags & C.PENDING && checkDirty((M[e + C.DEPS] | 0), e))
 			) {
 				if (flags & C.HAS_CHILD_EFFECT) {
 					unlinkChildEffects(e);
@@ -1094,7 +1203,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 				const cv = (e >> 2) + 1;
 				if (vals[cv]) {
 					runCleanup(e);
-					if (!M[e + C.FLAGS]) {
+					if (!(M[e + C.FLAGS] | 0)) {
 						return; // disposed by its own cleanup
 					}
 				}
@@ -1114,14 +1223,14 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 					M[e + C.FLAGS] &= ~C.RECURSED_CHECK;
 					purgeDeps(e);
 				}
-			} else if (M[e + C.DEPS] !== 0) {
+			} else if ((M[e + C.DEPS] | 0) !== 0) {
 				M[e + C.FLAGS] = C.K_EFFECT | C.WATCHING | (flags & C.HAS_CHILD_EFFECT);
 			}
 		}
 
 		// flush() abort path: re-arm effects still queued after a throw.
 		function requeueAbort(e: number): void {
-			if (M[e + C.FLAGS] & C.KIND_MASK) {
+			if ((M[e + C.FLAGS] | 0) & C.KIND_MASK) {
 				M[e + C.FLAGS] |= C.WATCHING | C.RECURSED;
 			}
 		}
@@ -1145,13 +1254,13 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		// scope. Children (linked as deps) dispose first via the reverse deps
 		// walk -> unwatched cascade, giving depth-first LIFO cleanup order.
 		function disposeInner(e: number): void {
-			const flags = M[e + C.FLAGS];
+			const flags = (M[e + C.FLAGS] | 0);
 			if (!(flags & C.KIND_MASK)) {
 				return; // already disposed
 			}
 			M[e + C.FLAGS] = 0;
 			disposeAllDepsInReverse(e);
-			const sub = M[e + C.SUBS];
+			const sub = (M[e + C.SUBS] | 0);
 			if (sub !== 0) {
 				unlink(sub);
 			}
@@ -1174,7 +1283,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		}
 
 		function dispose(e: number, gen: number): void {
-			if (M[e + C.GEN] !== gen) {
+			if ((M[e + C.GEN] | 0) !== gen) {
 				return; // record already reclaimed (and possibly reused)
 			}
 			disposeInner(e);
@@ -1188,17 +1297,24 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			dispose(e, gen);
 		}
 
+		// Invalidate the quiet-read stamp (public flag surgery via
+		// setNodeFlags may mark Dirty/Pending without a write).
+		function clearStamp(id: number): void {
+			M[id + C.VSTAMP_LO] = 0;
+			M[id + C.VSTAMP_HI] = 0;
+		}
+
 		// FinalizationRegistry target: the handle for this signal/computed was
 		// garbage collected. Reclaim the record now if the graph no longer
 		// needs it; otherwise mark it and reclaim when the last subscriber
 		// unlinks (unwatched). Only make* handles register, and only this path
 		// frees signal/computed records, so the id cannot be stale here.
 		function orphan(id: number): void {
-			const flags = M[id + C.FLAGS];
+			const flags = (M[id + C.FLAGS] | 0);
 			if (!(flags & (C.K_SIGNAL | C.K_COMPUTED))) {
 				return; // already reclaimed
 			}
-			if (M[id + C.SUBS] !== 0) {
+			if ((M[id + C.SUBS] | 0) !== 0) {
 				M[id + C.FLAGS] = flags | C.ORPHANED;
 			} else {
 				reclaimOrphan(id);
@@ -1217,17 +1333,17 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		}
 
 		function disposeAllDepsInReverse(sub: number): void {
-			let cur = M[sub + C.DEPS_TAIL];
+			let cur = (M[sub + C.DEPS_TAIL] | 0);
 			while (cur !== 0) {
-				const prev = M[cur + C.PREV_DEP];
+				const prev = (M[cur + C.PREV_DEP] | 0);
 				unlink(cur, sub);
 				cur = prev;
 			}
 		}
 
 		function purgeDeps(sub: number): void {
-			const depsTail = M[sub + C.DEPS_TAIL];
-			let dep = depsTail !== 0 ? M[depsTail + C.NEXT_DEP] : M[sub + C.DEPS];
+			const depsTail = (M[sub + C.DEPS_TAIL] | 0);
+			let dep = depsTail !== 0 ? (M[depsTail + C.NEXT_DEP] | 0) : (M[sub + C.DEPS] | 0);
 			while (dep !== 0) {
 				dep = unlink(dep, sub);
 			}
@@ -1291,9 +1407,9 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 
 		// signalOper read path.
 		function read(s: number): unknown {
-			if (M[s + C.FLAGS] & C.DIRTY) {
+			if ((M[s + C.FLAGS] | 0) & C.DIRTY) {
 				if (updateSignal(s)) {
-					const subs = M[s + C.SUBS];
+					const subs = (M[s + C.SUBS] | 0);
 					if (subs !== 0) {
 						shallowPropagate(subs);
 					}
@@ -1311,8 +1427,15 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			const p = (s >> 2) + 1;
 			if (vals[p] !== (vals[p] = value)) {
 				M[s + C.FLAGS] = C.K_SIGNAL | C.MUTABLE | C.DIRTY;
-				const subs = M[s + C.SUBS];
+				const subs = (M[s + C.SUBS] | 0);
 				if (subs !== 0) {
+					// Stamps only exist on subscribed-or-once-subscribed
+					// computeds, which hold links; an unobserved write can
+					// invalidate no stamp, so the epoch only moves here.
+					if (++epochLo === 0x40000000) {
+						epochLo = 0;
+						++epochHi;
+					}
 					propagate(subs, runDepth !== 0);
 					if (!batchDepth) {
 						flush();
@@ -1324,19 +1447,31 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		// computedOper for id-level callers: their getter is installed
 		// permanently by newComputed, so no evaluator ever needs carrying.
 		function computedRead(c: number): unknown {
-			const flags = M[c + C.FLAGS];
+			if ((M[c + C.VSTAMP_LO] | 0) === epochLo && (M[c + C.VSTAMP_HI] | 0) === epochHi) {
+				const fastSub = activeSub;
+				if (fastSub !== 0) {
+					link(c, fastSub, cycle);
+				}
+				return vals[c >> 2];
+			}
+			// Stamp with the epoch captured BEFORE the body: if user code run
+			// during verification writes a signal (bumping the epoch), the
+			// stamp is already stale and the next read re-verifies.
+			const lo = epochLo;
+			const hi = epochHi;
+			const flags = (M[c + C.FLAGS] | 0);
 			if (
 				flags & C.DIRTY
 				|| (
 					flags & C.PENDING
 					&& (
-						checkDirty(M[c + C.DEPS], c)
+						checkDirty((M[c + C.DEPS] | 0), c)
 						|| (M[c + C.FLAGS] = flags & ~C.PENDING, false)
 					)
 				)
 			) {
 				if (updateComputed(c)) {
-					const subs = M[c + C.SUBS];
+					const subs = (M[c + C.SUBS] | 0);
 					if (subs !== 0) {
 						shallowPropagate(subs);
 					}
@@ -1348,7 +1483,45 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			if (sub !== 0) {
 				link(c, sub, cycle);
 			}
+			// Stamp tracked reads too: during a flush the epoch is stable
+			// (the triggering write already bumped it), so every node the
+			// flush verifies or recomputes becomes a same-epoch fast hit for
+			// the rest of the flush (diamond re-reads) and for any reads
+			// before the next write. The entry-captured epoch keeps this
+			// safe: a write from user code during verification moved the
+			// epoch past `lo/hi`, so the stamp can only miss, never lie.
+			M[c + C.VSTAMP_LO] = lo;
+			M[c + C.VSTAMP_HI] = hi;
 			return vals[c >> 2];
+		}
+
+		// First evaluation with the handle-owned getter. Out of line: cold,
+		// and it keeps computedReadWith under the inline budget.
+		//
+		// This is also where the computed joins the FinalizationRegistry.
+		// It runs exactly once per node (`flags === K_COMPUTED` is only true
+		// before the first evaluation; every later flag write sets MUTABLE),
+		// so the hot read path carries no registration check, and computeds
+		// that are created but never read cost no registry cell at all. The
+		// weak target is the getter rather than the handle — the handle owns
+		// the only lasting strong ref to it — so the record is reclaimed once
+		// the getter is unreachable. A caller who keeps the getter alive after
+		// dropping the handle keeps the record (and its cached value) alive
+		// with it; that memory is still reachable from the caller's own
+		// closure, not leaked.
+		function coldEvalWith(c: number, getter: (previousValue?: unknown) => unknown): void {
+			registry.register(getter, c);
+			M[c + C.FLAGS] = C.K_COMPUTED | C.MUTABLE | C.RECURSED_CHECK;
+			const prevSub = activeSub;
+			activeSub = c;
+			++enterDepth;
+			try {
+				vals[c >> 2] = getter();
+			} finally {
+				--enterDepth;
+				activeSub = prevSub;
+				M[c + C.FLAGS] &= ~C.RECURSED_CHECK;
+			}
 		}
 
 		// First evaluation of a computed whose getter is installed (id-level
@@ -1371,35 +1544,34 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		// Slow twin of computedRead for the sentinel paths: carries the
 		// handle-owned evaluator and installs it on subscription.
 		function computedReadWith(c: number, getter: (previousValue?: unknown) => unknown): unknown {
-			const flags = M[c + C.FLAGS];
+			if ((M[c + C.VSTAMP_LO] | 0) === epochLo && (M[c + C.VSTAMP_HI] | 0) === epochHi) {
+				const fastSub = activeSub;
+				if (fastSub !== 0) {
+					link(c, fastSub, cycle);
+				}
+				return vals[c >> 2];
+			}
+			const lo = epochLo;
+			const hi = epochHi;
+			const flags = (M[c + C.FLAGS] | 0);
 			if (
 				flags & C.DIRTY
 				|| (
 					flags & C.PENDING
 					&& (
-						checkDirty(M[c + C.DEPS], c)
+						checkDirty((M[c + C.DEPS] | 0), c)
 						|| (M[c + C.FLAGS] = flags & ~C.PENDING, false)
 					)
 				)
 			) {
 				if (updateComputed(c, getter)) {
-					const subs = M[c + C.SUBS];
+					const subs = (M[c + C.SUBS] | 0);
 					if (subs !== 0) {
 						shallowPropagate(subs);
 					}
 				}
 			} else if (flags === C.K_COMPUTED) { // upstream `!flags`: never evaluated
-				M[c + C.FLAGS] = C.K_COMPUTED | C.MUTABLE | C.RECURSED_CHECK;
-				const prevSub = activeSub;
-				activeSub = c;
-				++enterDepth;
-				try {
-					vals[c >> 2] = getter();
-				} finally {
-					--enterDepth;
-					activeSub = prevSub;
-					M[c + C.FLAGS] &= ~C.RECURSED_CHECK;
-				}
+				coldEvalWith(c, getter);
 			}
 			const sub = activeSub;
 			if (sub !== 0) {
@@ -1408,11 +1580,15 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 				// column so graph walks (checkDirty -> update) can evaluate
 				// this node without the handle on the stack. Dropped again at
 				// unwatched. Subscribed implies installed.
-				if (!(M[c + C.FLAGS] & C.FN_INSTALLED)) {
+				if (!((M[c + C.FLAGS] | 0) & C.FN_INSTALLED)) {
 					fnTab[c >> 3] = getter;
 					M[c + C.FLAGS] |= C.FN_INSTALLED;
 				}
 			}
+			// Stamp tracked reads too — see computedRead for the epoch
+			// argument; the write->flush->read pattern consumes these stamps.
+			M[c + C.VSTAMP_LO] = lo;
+			M[c + C.VSTAMP_HI] = hi;
 			return vals[c >> 2];
 		}
 
@@ -1431,12 +1607,16 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 				fn();
 			} finally {
 				activeSub = prevSub;
+				if (++epochLo === 0x40000000) {
+					epochLo = 0;
+					++epochHi;
+				}
 				M[sub + C.FLAGS] = 0;
-				let cur = M[sub + C.DEPS];
+				let cur = (M[sub + C.DEPS] | 0);
 				while (cur !== 0) {
-					const dep = M[cur + C.DEP];
+					const dep = (M[cur + C.DEP] | 0);
 					cur = unlink(cur, sub);
-					const subs = M[dep + C.SUBS];
+					const subs = (M[dep + C.SUBS] | 0);
 					if (subs !== 0) {
 						propagate(subs, runDepth !== 0);
 						shallowPropagate(subs);
@@ -1563,20 +1743,22 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			return ensureEngine().buffer()[id + C.FLAGS];
 		},
 		setNodeFlags(id: number, flags: number): void {
-			const M = ensureEngine().buffer();
-			M[id + C.FLAGS] = (M[id + C.FLAGS] & ~C.PUBLIC_MASK) | (flags & C.PUBLIC_MASK);
+			const engine = ensureEngine();
+			const M = engine.buffer();
+			M[id + C.FLAGS] = ((M[id + C.FLAGS] | 0) & ~C.PUBLIC_MASK) | (flags & C.PUBLIC_MASK);
+			engine.clearStamp(id);
 		},
-		buffer(): Int32Array {
+		buffer(): Int32Array | number[] {
 			return ensureEngine().buffer();
 		},
 		stats() {
 			const M = ensureEngine().buffer();
 			let freeNodeRecords = 0;
-			for (let id = nodeFreeHead; id !== 0; id = M[id + C.DEPS]) {
+			for (let id = nodeFreeHead; id !== 0; id = (M[id + C.DEPS] | 0)) {
 				++freeNodeRecords;
 			}
 			let freeLinkRecords = 0;
-			for (let id = linkFreeHead; id !== 0; id = M[id + C.FREE_NEXT]) {
+			for (let id = linkFreeHead; id !== 0; id = (M[id + C.FREE_NEXT] | 0)) {
 				++freeLinkRecords;
 			}
 			return {
