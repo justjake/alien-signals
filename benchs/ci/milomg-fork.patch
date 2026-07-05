@@ -250,73 +250,6 @@ index 0000000..dcd011c
 +    }
 +  },
 +};
-diff --git a/packages/core/src/frameworks/cosignalLogged.ts b/packages/core/src/frameworks/cosignalLogged.ts
-new file mode 100644
-index 0000000..db0dc1e
---- /dev/null
-+++ b/packages/core/src/frameworks/cosignalLogged.ts
-@@ -0,0 +1,61 @@
-+import * as lib from "cosignal/logged";
-+import { ReactiveFramework } from "../util/reactiveFramework";
-+
-+// cosignal LOGGED twin entry with the React bridge ARMED but QUIET: no
-+// fork events are ever fed, so this measures the overhead an application
-+// pays for having the bridge installed while React is idle. Arming is
-+// LAZY (first adapter use, not module load): the bundle loads every
-+// adapter in every benchmark child, and arming at load would swap the
-+// logged table in during other frameworks' runs.
-+let armed = false;
-+function arm(): void {
-+  if (!armed) {
-+    armed = true;
-+    lib.registerReactBridge();
-+  }
-+}
-+
-+let scope: (() => void) | null = null;
-+
-+export const cosignalLoggedFramework: ReactiveFramework = {
-+  name: "Cosignal Logged",
-+  signal: <T>(initial: T) => {
-+    arm();
-+    const a = new lib.Atom(initial);
-+    return {
-+      read: () => a.state,
-+      write: (v: T) => a.set(v),
-+    };
-+  },
-+  computed: <T>(fn: () => T) => {
-+    arm();
-+    const c = new lib.Computed(fn);
-+    return {
-+      read: () => c.state,
-+    };
-+  },
-+  effect: (fn) => {
-+    lib.effect(() => {
-+      fn();
-+    });
-+  },
-+  withBatch: (fn) => {
-+    lib.startBatch();
-+    fn();
-+    lib.endBatch();
-+  },
-+  withBuild: <T>(fn: () => T) => {
-+    arm();
-+    let out!: T;
-+    scope = lib.effectScope(() => {
-+      out = fn();
-+    });
-+    return out;
-+  },
-+  cleanup: () => {
-+    if (scope !== null) {
-+      scope();
-+      scope = null;
-+    }
-+  },
-+};
 diff --git a/packages/core/src/frameworks/dalienSignals.ts b/packages/core/src/frameworks/dalienSignals.ts
 new file mode 100644
 index 0000000..c33dc14
@@ -463,35 +396,32 @@ index 0000000..8633d72
 +  },
 +};
 diff --git a/packages/core/src/frameworksList.ts b/packages/core/src/frameworksList.ts
-index 30d3c8b..4fcdb63 100644
+index 30d3c8b..47d5e4d 100644
 --- a/packages/core/src/frameworksList.ts
 +++ b/packages/core/src/frameworksList.ts
-@@ -1,5 +1,8 @@
+@@ -1,5 +1,7 @@
  import type { FrameworkInfo } from "./util/frameworkTypes";
  import { alienFramework } from "./frameworks/alienSignals";
 +import { dalienFramework } from "./frameworks/dalienSignals";
 +import { cosignalFramework } from "./frameworks/cosignal";
-+import { cosignalLoggedFramework } from "./frameworks/cosignalLogged";
  import { angularFramework as angularFramework2 } from "./frameworks/angularSignals2";
  import { compostateFramework } from "./frameworks/inactive/compostate";
  import { mobxFramework } from "./frameworks/inactive/mobx";
-@@ -25,6 +28,9 @@ import { xReactivityFramework } from "./frameworks/xReactivity";
+@@ -25,6 +27,8 @@ import { xReactivityFramework } from "./frameworks/xReactivity";
  
  export const frameworkInfo: FrameworkInfo[] = [
    { framework: alienFramework, testPullCounts: true },
 +  { framework: dalienFramework, testPullCounts: true },
 +  { framework: cosignalFramework, testPullCounts: true },
-+  { framework: cosignalLoggedFramework, testPullCounts: true },
    { framework: angularFramework2, testPullCounts: true },
    { framework: compostateFramework, testPullCounts: true },
    { framework: mobxFramework, testPullCounts: true },
-@@ -41,6 +47,9 @@ export const frameworkInfo: FrameworkInfo[] = [
+@@ -41,6 +45,8 @@ export const frameworkInfo: FrameworkInfo[] = [
  
  export const allFrameworks: FrameworkInfo[] = [
    { framework: alienFramework, testPullCounts: true },
 +  { framework: dalienFramework, testPullCounts: true },
 +  { framework: cosignalFramework, testPullCounts: true },
-+  { framework: cosignalLoggedFramework, testPullCounts: true },
    { framework: angularFramework2, testPullCounts: true },
    { framework: compostateFramework, testPullCounts: true },
    { framework: mobxFramework, testPullCounts: true },
