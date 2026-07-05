@@ -118,6 +118,23 @@ jobs:
           echo "$ARGS" | xargs "$RUNNER" dist/isolated.js --rounds "$ROUNDS" > "$GITHUB_WORKSPACE/results-${{ matrix.runtime }}.csv"
           cat "$GITHUB_WORKSPACE/results-${{ matrix.runtime }}.csv"
 
+      # The runner tolerates crashed children (medians over surviving
+      # rounds), which is right for flaky third parties but must not let a
+      # framework vanish from the chart silently — a missing framework means
+      # its child crashed every round (e.g. library/adapter version skew).
+      - name: Verify every requested framework produced results
+        run: |
+          if [ "$FRAMEWORKS" = "ALL" ]; then exit 0; fi
+          missing=0
+          eval "set -- $FRAMEWORKS"
+          for fw in "$@"; do
+            if ! grep -q "^$fw *," "results-${{ matrix.runtime }}.csv"; then
+              echo "::error::$fw produced no benchmark rows (its child crashed in every round)"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
       - name: Render chart PNG
         run: |
           RUNTIME_VERSION=$(node --version)
