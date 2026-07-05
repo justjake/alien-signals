@@ -56,24 +56,3 @@ test('orphaned-but-subscribed computeds survive until unwatched', async () => {
 	sys.makeSignal(0); // boundary sweep; reclaim after last unlink must not throw
 });
 
-// reclaimHandles: false — the arena-parity configuration: no registry, no
-// registration cost, dropped handles leak their record (but never their
-// closures: getters are stored permanently at creation in this mode).
-test('reclaimHandles: false disables record reclamation', async () => {
-	expect(typeof gc).toBe('function');
-	const sys = createReactiveSystem({ initialRecords: 4096, reclaimHandles: false });
-	const before = () => sys.stats().allocatedRecords - sys.stats().freeNodeRecords;
-	(() => {
-		for (let i = 0; i < 200; i++) {
-			const s = sys.makeSignal(i);
-			const c = sys.makeComputed(() => (s() as number) + 1);
-			c();
-		}
-	})();
-	const after = before();
-	await drainFinalizers();
-	sys.makeSignal(0); // boundary
-	// Nothing was reclaimed: live-record count only grew (by the boundary poke).
-	expect(before()).toBeGreaterThanOrEqual(after);
-	expect(sys.stats().freeNodeRecords).toBe(0);
-});

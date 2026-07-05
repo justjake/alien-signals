@@ -328,17 +328,6 @@ export interface ReactiveSystem {
 export interface ReactiveSystemOptions {
 	/** Plane CAPACITY in 32-byte records (fixed; default 2^23). */
 	initialRecords?: number;
-	/**
-	 * Reclaim the records of signal/computed handles collected by the GC
-	 * (via FinalizationRegistry). Default true — matches upstream, where the
-	 * graph is GC-visible and dropped handles free their nodes automatically.
-	 * Turning it off removes the ~15ns registration per created handle and
-	 * the registry's GC bookkeeping; dropped handles then leak their 32-byte
-	 * record and last value, though never their closures — getters are
-	 * handle-owned in every mode, borrowed by the engine only while the
-	 * computed is subscribed.
-	 */
-	reclaimHandles?: boolean;
 }
 
 export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveSystem {
@@ -422,14 +411,13 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 	let configuredRecords = options?.initialRecords !== undefined
 		? normalizeRecords(options.initialRecords)
 		: DEFAULT_RECORDS;
-	let reclaimHandles = options?.reclaimHandles !== false;
 	let inner: Engine | undefined;
 	// Reclaims signal/computed records whose handles were garbage collected
 	// (upstream reclaims them implicitly: its whole graph is GC-visible).
 	// Callbacks run between tasks, so reclamation needs the event loop to
-	// turn — exactly when real applications yield. Absent in exotic hosts ->
-	// those leak dropped-handle records, as this fork always did before.
-	let registry: FinalizationRegistry<number> | undefined;
+	// turn — exactly when real applications yield. REQUIRED: this library
+	// does not ship a leaking configuration.
+	let registry: FinalizationRegistry<number>;
 	// Registration is IMMEDIATE (FinalizationRegistry.register, ~15ns): every
 	// batching scheme measured worse — a pending queue strongly retains each
 	// handle until it drains, which carries the whole batch through the
@@ -443,9 +431,10 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 	function materialize(): Engine {
 		propStack = new Int32Array(4096);
 		checkStack = new Int32Array(4096);
-		if (reclaimHandles && typeof FinalizationRegistry === 'function') {
-			registry = new FinalizationRegistry((id) => inner!.orphan(id));
+		if (typeof FinalizationRegistry !== 'function') {
+			throw new Error('dalien-signals requires FinalizationRegistry (ES2021): dropped signal/computed handles reclaim their records through it');
 		}
+		registry = new FinalizationRegistry((id) => inner!.orphan(id));
 		const engine = createEngine(configuredRecords);
 		inner = engine;
 		facade.e = engine;
@@ -606,9 +595,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			maybeBoundary();
 			const id = allocNode(C.K_COMPUTED);
 			const oper = anon(() => computedReadWith(id, getter));
-			if (registry !== undefined) {
-				registry.register(oper, id);
-			}
+			registry.register(oper, id);
 			return oper;
 		}
 
@@ -1334,8 +1321,8 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			}
 		}
 
-		// computedOper for id-level callers and reclaim-off handles: the getter
-		// is always present in the fns column.
+		// computedOper for id-level callers: their getter is installed
+		// permanently by newComputed, so no evaluator ever needs carrying.
 		function computedRead(c: number): unknown {
 			const flags = M[c + C.FLAGS];
 			if (
@@ -1355,23 +1342,30 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 					}
 				}
 			} else if (flags === C.K_COMPUTED) { // upstream `!flags`: never evaluated
-				M[c + C.FLAGS] = C.K_COMPUTED | C.MUTABLE | C.RECURSED_CHECK;
-				const prevSub = activeSub;
-				activeSub = c;
-				++enterDepth;
-				try {
-					vals[c >> 2] = (fnTab[c >> 3] as () => unknown)();
-				} finally {
-					--enterDepth;
-					activeSub = prevSub;
-					M[c + C.FLAGS] &= ~C.RECURSED_CHECK;
-				}
+				coldEvalInstalled(c);
 			}
 			const sub = activeSub;
 			if (sub !== 0) {
 				link(c, sub, cycle);
 			}
 			return vals[c >> 2];
+		}
+
+		// First evaluation of a computed whose getter is installed (id-level
+		// computeds). Out of line: cold, and it keeps computedRead under the
+		// inline budget.
+		function coldEvalInstalled(c: number): void {
+			M[c + C.FLAGS] = C.K_COMPUTED | C.MUTABLE | C.RECURSED_CHECK;
+			const prevSub = activeSub;
+			activeSub = c;
+			++enterDepth;
+			try {
+				vals[c >> 2] = (fnTab[c >> 3] as () => unknown)();
+			} finally {
+				--enterDepth;
+				activeSub = prevSub;
+				M[c + C.FLAGS] &= ~C.RECURSED_CHECK;
+			}
 		}
 
 		// Slow twin of computedRead for the sentinel paths: carries the
@@ -1500,9 +1494,6 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			}
 			if (configureOptions?.initialRecords !== undefined) {
 				configuredRecords = normalizeRecords(configureOptions.initialRecords);
-			}
-			if (configureOptions?.reclaimHandles !== undefined) {
-				reclaimHandles = configureOptions.reclaimHandles;
 			}
 			materialize();
 		},

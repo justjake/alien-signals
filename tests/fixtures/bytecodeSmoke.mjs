@@ -59,7 +59,7 @@ scope();
 d1();
 d2();
 // Exercise the id-level computedRead path (permanently-installed getter).
-const sys = createReactiveSystem({ initialRecords: 4096, reclaimHandles: false });
+const sys = createReactiveSystem({ initialRecords: 4096 });
 const nsId = sys.signal(1);
 const ncId = sys.computed(() => sys.signalRead(nsId) + 1);
 sys.computedRead(ncId);

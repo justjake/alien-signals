@@ -30,8 +30,8 @@ test('is* identify handles of every kind, at zero creation cost', () => {
 	sc();
 });
 
-test('is* work across systems and reclaim modes', () => {
-	const sys = createReactiveSystem({ initialRecords: 4096, reclaimHandles: false });
+test('is* work across systems', () => {
+	const sys = createReactiveSystem({ initialRecords: 4096 });
 	expect(isSignal(sys.makeSignal(1) as () => void)).toBe(true);
 	expect(isComputed(sys.makeComputed(() => 1) as () => void)).toBe(true);
 	expect(isEffect(sys.makeEffect(() => {}))).toBe(true);
