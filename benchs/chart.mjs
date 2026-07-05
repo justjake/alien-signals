@@ -33,6 +33,12 @@ const axisMax = Math.ceil(maxTotal / step) * step;
 const x = (v) => LABEL_W + (v / axisMax) * plotW;
 
 const esc = escXml;
+// Percent-vs-best annotation: the fastest row is the reference (no suffix).
+const best = frameworks[0]?.total;
+const pctVsBest = (v) => {
+	const p = (v / best - 1) * 100;
+	return p < 9.95 ? `+${p.toFixed(1)}%` : `+${Math.round(p)}%`;
+};
 let svg = [];
 svg.push(`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">`);
 svg.push(`<rect width="${W}" height="${H}" fill="${SURFACE}"/>`);
@@ -79,7 +85,8 @@ frameworks.forEach((f, i) => {
 		}
 		cx += w;
 	});
-	svg.push(`<text x="${cx + 8}" y="${y + BAR / 2 + 4}" font-size="12" fill="${INK2}">${Math.round(f.total).toLocaleString('en-US')} ms</text>`);
+	const pct = i === 0 ? '' : `<tspan fill="#8a8984" font-size="11"> ${pctVsBest(f.total)}</tspan>`;
+	svg.push(`<text x="${cx + 8}" y="${y + BAR / 2 + 4}" font-size="12" fill="${INK2}">${Math.round(f.total).toLocaleString('en-US')} ms${pct}</text>`);
 });
 
 svg.push('</svg>');

@@ -37,7 +37,7 @@ const GUTTER = 18;
 const W = 1080;
 const PANEL_W = Math.floor((W - 2 * MARGIN - (COLS - 1) * GUTTER) / COLS);
 const LABEL_W = 132;
-const VALUE_W = 44;
+const VALUE_W = 62;
 const PLOT_W = PANEL_W - LABEL_W - VALUE_W;
 const ROW_H = 15;
 const BAR_H = 11;
@@ -90,7 +90,10 @@ panels.forEach((test, pi) => {
 		}
 		const w = Math.max((v / max) * PLOT_W, 1.5);
 		svg.push(`<path d="M ${px + LABEL_W} ${y} h ${Math.max(w - 3, 0)} a 3 3 0 0 1 3 3 v ${BAR_H - 6} a 3 3 0 0 1 -3 3 h ${-Math.max(w - 3, 0)} z" fill="${COLOR[suite]}"/>`);
-		svg.push(`<text x="${px + LABEL_W + w + 4}" y="${y + BAR_H - 2}" font-size="9" fill="${INK2}">${fmt(v)}</text>`);
+		const best = Math.min(...data.values());
+		const p = (v / best - 1) * 100;
+		const pct = v === best ? '' : `<tspan fill="${INK3}" font-size="8"> +${p < 9.95 ? p.toFixed(1) : Math.round(p)}%</tspan>`;
+		svg.push(`<text x="${px + LABEL_W + w + 4}" y="${y + BAR_H - 2}" font-size="9" fill="${INK2}">${fmt(v)}${pct}</text>`);
 	});
 });
 
