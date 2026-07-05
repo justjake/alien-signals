@@ -105,7 +105,11 @@ const enum C {
 	SUBS = 3,
 	SUBS_TAIL = 4,
 	GEN = 5, // bumped on free; disposers capture it to defuse stale ids
-	// fields 6-7 spare (pad to one cache line per record)
+	// Quiet-read verification stamp, split across two i32 slots (53-bit
+	// epoch: never wraps). Same cache line as FLAGS, so the fast-path check
+	// costs no extra memory traffic. Node records are now fully packed.
+	VSTAMP_HI = 6,
+	VSTAMP_LO = 7,
 
 	// Link fields (M plane, stride 8; link records share the plane with nodes).
 	VERSION = 0,
@@ -276,6 +280,18 @@ export interface ReactiveSystem {
 	 * lazily-mapped zero pages).
 	 */
 	configure(options?: ReactiveSystemOptions): void;
+	/**
+	 * Bulk arena teardown for generation-scoped lifecycles (per-request
+	 * graphs, worker pools, benchmark harness cleanup): rewinds the record
+	 * plane, truncates the value/callback tables, and replaces the
+	 * FinalizationRegistry, so an entire dead generation is reclaimed by the
+	 * GC as a few large objects instead of one weak cell per handle. Every
+	 * handle created before the reset is invalid afterwards — calling one is
+	 * undefined behavior. Throws if called during an active operation
+	 * (inside an effect, computed getter, batch, or trigger). The engine
+	 * itself (and its warmed-up JIT state) is reused across resets.
+	 */
+	reset(): void;
 	/** Create a signal and return its callable handle (zero-indirection closure). */
 	makeSignal(initialValue?: unknown): SignalHandle;
 	/** Create a computed and return its read handle. */
@@ -341,6 +357,15 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 	let boundaryPending = false; // pendingFree nonempty (one hot-path load)
 
 	let cycle = 0;
+	// Global write epoch (quiet-read fast path): bumped by every committed
+	// signal write and every trigger(). A computed whose verification stamp
+	// equals the current epoch is provably current — nothing anywhere has
+	// been written since it was last verified — so reads skip the flags
+	// ladder entirely. Preact/Vue 3.6/Svelte ship the same idea; upstream
+	// alien-signals does not. Split lo/hi (manual carry at 2^30) so stamps
+	// fit two i32 record slots and the whole scheme never wraps.
+	let epochLo = 1;
+	let epochHi = 1;
 	let runDepth = 0;
 	let batchDepth = 0;
 	let notifyIndex = 0;
@@ -398,6 +423,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		makeEffect(fn: () => (() => void) | void): () => void;
 		makeScope(fn: () => void): () => void;
 		orphan(id: number): void;
+		clearStamp(id: number): void;
 		run(e: number): void;
 		requeueAbort(e: number): void;
 		trigger(fn: () => void): void;
@@ -428,13 +454,27 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		return inner !== undefined ? inner : materialize();
 	}
 
+	// Each registry's callback disarms itself once the registry is no longer
+	// current: reset() replaces the registry, but cleanups already enqueued
+	// for the old one keep it alive until they drain, and their record ids
+	// refer to the pre-reset arena — running them would reclaim whatever new
+	// node now occupies that id.
+	function mintRegistry(): FinalizationRegistry<number> {
+		const minted: FinalizationRegistry<number> = new FinalizationRegistry((id) => {
+			if (registry === minted) {
+				inner!.orphan(id);
+			}
+		});
+		return minted;
+	}
+
 	function materialize(): Engine {
 		propStack = new Int32Array(4096);
 		checkStack = new Int32Array(4096);
 		if (typeof FinalizationRegistry !== 'function') {
 			throw new Error('dalien-signals requires FinalizationRegistry (ES2021): dropped signal/computed handles reclaim their records through it');
 		}
-		registry = new FinalizationRegistry((id) => inner!.orphan(id));
+		registry = mintRegistry();
 		const engine = createEngine(configuredRecords);
 		inner = engine;
 		facade.e = engine;
@@ -447,6 +487,65 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			computedSrc = String(engine.makeComputed(noop));
 			effectSrc = String(engine.makeEffect(noop));
 			scopeSrc = String(engine.makeScope(noop));
+		}
+		// Seed the engine's user-callback call sites (cold eval, recompute,
+		// effect run) past V8's megamorphic threshold (>4 shapes) before any
+		// real work. When such a site has seen four or fewer shapes, V8
+		// speculates on the exact call targets and compiles them inline; the
+		// first workload that pushes the site past the threshold then
+		// deoptimizes the engine's hot functions and pays reoptimization
+		// cycles mid-run (measured at 20-35% on pull-heavy graphs when
+		// several distinct workloads share one process). Generic-from-birth
+		// call sites cost a hair per call but keep performance flat as an
+		// application's callback shapes diversify. The handles are dropped
+		// immediately and self-reclaim through the registry. Skipped on tiny
+		// configured planes (tests, embedded uses), where the ~30 transient
+		// records would be a real bite out of capacity and a single-workload
+		// process is the norm anyway.
+		if (configuredRecords >= 4096) {
+			const s0 = engine.makeSignal(0);
+			const read = s0 as () => number;
+			const c1 = engine.makeComputed(() => read() + 1);
+			const c2 = engine.makeComputed((p) => (p === undefined ? 0 : (p as number)) + read());
+			const c3 = engine.makeComputed(() => {
+				const v = read();
+				return v * 2;
+			});
+			const c4 = engine.makeComputed(() => read() - 1);
+			const c5 = engine.makeComputed(() => (read() & 1) + read());
+			const cs = [c1, c2, c3, c4, c5];
+			const e1 = engine.makeEffect(() => {
+				c1();
+			});
+			const e2 = engine.makeEffect(() => {
+				c2();
+				c3();
+			});
+			const e3 = engine.makeEffect(() => {
+				c4();
+			});
+			const e4 = engine.makeEffect(() => {
+				void c5();
+			});
+			const e5 = engine.makeEffect(() => {
+				for (const c of cs) {
+					c();
+				}
+			});
+			const write = s0 as (v: number) => void;
+			for (let round = 1; round <= 3; round++) {
+				write(round);
+				c1();
+				c2();
+				c3();
+				c4();
+				c5();
+			}
+			e1();
+			e2();
+			e3();
+			e4();
+			e5();
 		}
 		return engine;
 	}
@@ -549,6 +648,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			makeEffect,
 			makeScope,
 			orphan,
+			clearStamp,
 			read,
 			write,
 			computedRead,
@@ -594,9 +694,13 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		function makeComputed(getter: (previousValue?: unknown) => unknown): () => unknown {
 			maybeBoundary();
 			const id = allocNode(C.K_COMPUTED);
-			const oper = anon(() => computedReadWith(id, getter));
-			registry.register(oper, id);
-			return oper;
+			// Registration is deferred to the first evaluation (see
+			// coldEvalWith): an unevaluated computed has no value and no
+			// engine-side closure anchor (getters are handle-owned), so there
+			// is nothing GC-visible to reclaim — and create-heavy workloads
+			// skip the registry entirely for computeds they never use. A
+			// dropped never-read computed leaks only its 32-byte plane record.
+			return anon(() => computedReadWith(id, getter));
 		}
 
 		function makeEffect(fn: () => (() => void) | void): () => void {
@@ -650,6 +754,8 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		}
 
 		function freeNode(id: number): void {
+			M[id + C.VSTAMP_LO] = 0;
+			M[id + C.VSTAMP_HI] = 0;
 			M[id + C.FLAGS] = 0;
 			M[id + C.DEPS_TAIL] = 0;
 			M[id + C.SUBS] = 0;
@@ -1004,6 +1110,11 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		function unwatched(node: number): void {
 			const flags = M[node + C.FLAGS];
 			if (flags & C.K_COMPUTED) {
+				// Alien recomputes an unwatched computed on its next read (it
+				// is marked Dirty without any write); drop the stamp so the
+				// fast path cannot skip that recompute.
+				M[node + C.VSTAMP_LO] = 0;
+				M[node + C.VSTAMP_HI] = 0;
 				if (flags & C.ORPHANED) {
 					reclaimOrphan(node); // handle already collected; nothing can re-subscribe
 				} else {
@@ -1188,6 +1299,13 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			dispose(e, gen);
 		}
 
+		// Invalidate the quiet-read stamp (public flag surgery via
+		// setNodeFlags may mark Dirty/Pending without a write).
+		function clearStamp(id: number): void {
+			M[id + C.VSTAMP_LO] = 0;
+			M[id + C.VSTAMP_HI] = 0;
+		}
+
 		// FinalizationRegistry target: the handle for this signal/computed was
 		// garbage collected. Reclaim the record now if the graph no longer
 		// needs it; otherwise mark it and reclaim when the last subscriber
@@ -1313,6 +1431,13 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 				M[s + C.FLAGS] = C.K_SIGNAL | C.MUTABLE | C.DIRTY;
 				const subs = M[s + C.SUBS];
 				if (subs !== 0) {
+					// Stamps only exist on subscribed-or-once-subscribed
+					// computeds, which hold links; an unobserved write can
+					// invalidate no stamp, so the epoch only moves here.
+					if (++epochLo === 0x40000000) {
+						epochLo = 0;
+						++epochHi;
+					}
 					propagate(subs, runDepth !== 0);
 					if (!batchDepth) {
 						flush();
@@ -1324,6 +1449,18 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		// computedOper for id-level callers: their getter is installed
 		// permanently by newComputed, so no evaluator ever needs carrying.
 		function computedRead(c: number): unknown {
+			if (M[c + C.VSTAMP_LO] === epochLo && M[c + C.VSTAMP_HI] === epochHi) {
+				const fastSub = activeSub;
+				if (fastSub !== 0) {
+					link(c, fastSub, cycle);
+				}
+				return vals[c >> 2];
+			}
+			// Stamp with the epoch captured BEFORE the body: if user code run
+			// during verification writes a signal (bumping the epoch), the
+			// stamp is already stale and the next read re-verifies.
+			const lo = epochLo;
+			const hi = epochHi;
 			const flags = M[c + C.FLAGS];
 			if (
 				flags & C.DIRTY
@@ -1348,7 +1485,45 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			if (sub !== 0) {
 				link(c, sub, cycle);
 			}
+			// Stamp tracked reads too: during a flush the epoch is stable
+			// (the triggering write already bumped it), so every node the
+			// flush verifies or recomputes becomes a same-epoch fast hit for
+			// the rest of the flush (diamond re-reads) and for any reads
+			// before the next write. The entry-captured epoch keeps this
+			// safe: a write from user code during verification moved the
+			// epoch past `lo/hi`, so the stamp can only miss, never lie.
+			M[c + C.VSTAMP_LO] = lo;
+			M[c + C.VSTAMP_HI] = hi;
 			return vals[c >> 2];
+		}
+
+		// First evaluation with the handle-owned getter. Out of line: cold,
+		// and it keeps computedReadWith under the inline budget.
+		//
+		// This is also where the computed joins the FinalizationRegistry.
+		// It runs exactly once per node (`flags === K_COMPUTED` is only true
+		// before the first evaluation; every later flag write sets MUTABLE),
+		// so the hot read path carries no registration check, and computeds
+		// that are created but never read cost no registry cell at all. The
+		// weak target is the getter rather than the handle — the handle owns
+		// the only lasting strong ref to it — so the record is reclaimed once
+		// the getter is unreachable. A caller who keeps the getter alive after
+		// dropping the handle keeps the record (and its cached value) alive
+		// with it; that memory is still reachable from the caller's own
+		// closure, not leaked.
+		function coldEvalWith(c: number, getter: (previousValue?: unknown) => unknown): void {
+			registry.register(getter, c);
+			M[c + C.FLAGS] = C.K_COMPUTED | C.MUTABLE | C.RECURSED_CHECK;
+			const prevSub = activeSub;
+			activeSub = c;
+			++enterDepth;
+			try {
+				vals[c >> 2] = getter();
+			} finally {
+				--enterDepth;
+				activeSub = prevSub;
+				M[c + C.FLAGS] &= ~C.RECURSED_CHECK;
+			}
 		}
 
 		// First evaluation of a computed whose getter is installed (id-level
@@ -1371,6 +1546,15 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		// Slow twin of computedRead for the sentinel paths: carries the
 		// handle-owned evaluator and installs it on subscription.
 		function computedReadWith(c: number, getter: (previousValue?: unknown) => unknown): unknown {
+			if (M[c + C.VSTAMP_LO] === epochLo && M[c + C.VSTAMP_HI] === epochHi) {
+				const fastSub = activeSub;
+				if (fastSub !== 0) {
+					link(c, fastSub, cycle);
+				}
+				return vals[c >> 2];
+			}
+			const lo = epochLo;
+			const hi = epochHi;
 			const flags = M[c + C.FLAGS];
 			if (
 				flags & C.DIRTY
@@ -1389,17 +1573,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 					}
 				}
 			} else if (flags === C.K_COMPUTED) { // upstream `!flags`: never evaluated
-				M[c + C.FLAGS] = C.K_COMPUTED | C.MUTABLE | C.RECURSED_CHECK;
-				const prevSub = activeSub;
-				activeSub = c;
-				++enterDepth;
-				try {
-					vals[c >> 2] = getter();
-				} finally {
-					--enterDepth;
-					activeSub = prevSub;
-					M[c + C.FLAGS] &= ~C.RECURSED_CHECK;
-				}
+				coldEvalWith(c, getter);
 			}
 			const sub = activeSub;
 			if (sub !== 0) {
@@ -1413,6 +1587,10 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 					M[c + C.FLAGS] |= C.FN_INSTALLED;
 				}
 			}
+			// Stamp tracked reads too — see computedRead for the epoch
+			// argument; the write->flush->read pattern consumes these stamps.
+			M[c + C.VSTAMP_LO] = lo;
+			M[c + C.VSTAMP_HI] = hi;
 			return vals[c >> 2];
 		}
 
@@ -1431,6 +1609,10 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 				fn();
 			} finally {
 				activeSub = prevSub;
+				if (++epochLo === 0x40000000) {
+					epochLo = 0;
+					++epochHi;
+				}
 				M[sub + C.FLAGS] = 0;
 				let cur = M[sub + C.DEPS];
 				while (cur !== 0) {
@@ -1496,6 +1678,39 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 				configuredRecords = normalizeRecords(configureOptions.initialRecords);
 			}
 			materialize();
+		},
+		reset(): void {
+			if (inner === undefined) {
+				return; // nothing materialized, nothing to reset
+			}
+			if (enterDepth !== 0 || activeSub !== 0 || batchDepth !== 0 || runDepth !== 0) {
+				throw new Error('dalien-signals: reset() called during an active operation (inside an effect, computed, batch, or trigger)');
+			}
+			// Bulk arena teardown: rewind the record plane and drop the whole
+			// FinalizationRegistry, so a dead generation is reclaimed by the
+			// GC as a few large objects instead of one weak cell per handle.
+			// Every handle minted before the reset is INVALID afterwards —
+			// calling one is undefined behavior (it reads whatever new node
+			// occupies its record). The engine closures (and their warmed-up
+			// JIT state) are reused; only the arena contents restart.
+			inner.buffer().fill(0, 0, recNext);
+			recNext = 8;
+			nodeFreeHead = 0;
+			linkFreeHead = 0;
+			boundaryPending = false;
+			notifyIndex = 0;
+			queuedLength = 0;
+			queued.length = 0;
+			pendingFree.length = 0;
+			pendingFnClear.length = 0;
+			values.length = 2;
+			values[0] = undefined;
+			values[1] = undefined;
+			fns.length = 1;
+			fns[0] = undefined;
+			// Epoch and link-cycle counters keep counting: fresh records hold
+			// zeroed stamps/versions, which can never equal a live counter.
+			registry = mintRegistry();
 		},
 		signal(initialValue?: unknown): number {
 			const engine = ensureEngine();
@@ -1563,8 +1778,10 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			return ensureEngine().buffer()[id + C.FLAGS];
 		},
 		setNodeFlags(id: number, flags: number): void {
-			const M = ensureEngine().buffer();
+			const engine = ensureEngine();
+			const M = engine.buffer();
 			M[id + C.FLAGS] = (M[id + C.FLAGS] & ~C.PUBLIC_MASK) | (flags & C.PUBLIC_MASK);
+			engine.clearStamp(id);
 		},
 		buffer(): Int32Array {
 			return ensureEngine().buffer();

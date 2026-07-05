@@ -12,16 +12,19 @@ import { readFileSync, writeFileSync } from 'node:fs';
 // assets/benchmark.png.
 const SRC = process.argv[2] ?? 'benchs/results/2026-07-04-isolated.txt';
 const OUT = process.argv[3] ?? '/tmp/benchmark.svg';
+const TITLE = process.argv[4] ?? 'Total benchmark time by framework';
+const SUBTITLE = process.argv[5] ?? 'js-reactivity-benchmark (milomg), all four suites, one process per framework, fastest-of-N per test - lower is better';
 
 const KAIRO = new Set(['avoidablePropagation', 'broadPropagation', 'deepPropagation', 'diamond', 'mux', 'repeatedObservers', 'triangle', 'unstable', 'molBench']);
-const SBENCH = new Set(['createSignals', 'createComputations', 'updateSignals']);
-const suiteOf = (test) => SBENCH.has(test) ? 'sbench'
+// sbench test names differ between the milomg and transitive-bullshit forks
+// (createSignals vs createDataSignals/createComputations0to1/...), but all
+// share the create*/update* prefixes.
+const suiteOf = (test) => (test.startsWith('create') || test.startsWith('update')) ? 'sbench'
 	: KAIRO.has(test) ? 'kairo'
 	: test.startsWith('cellx') ? 'cellx'
 	: 'dynamic';
 
 const SUITES = ['sbench', 'kairo', 'cellx', 'dynamic'];
-const EXPECTED_TESTS = 20; // 3 sbench + 9 kairo + 2 cellx + 6 dynamic
 
 // Validated categorical palette (light), slots 1-4 in fixed order.
 const COLOR = { sbench: '#2a78d6', kairo: '#1baf7a', cellx: '#eda100', dynamic: '#008300' };
@@ -42,10 +45,12 @@ for (const [fw, test, time] of rows) {
 	e.sums[suiteOf(test)] += Number(time);
 }
 
+// A framework that crashed mid-suite has fewer rows than the fullest one.
+const expectedTests = Math.max(...[...byFw.values()].map((e) => e.tests));
 const frameworks = [];
 const partial = [];
 for (const [fw, e] of byFw) {
-	if (e.tests < EXPECTED_TESTS) { partial.push(`${fw} (${e.tests}/${EXPECTED_TESTS} tests)`); continue; }
+	if (e.tests < expectedTests) { partial.push(`${fw} (${e.tests}/${expectedTests} tests)`); continue; }
 	frameworks.push({ fw, ...e.sums, total: SUITES.reduce((t, s) => t + e.sums[s], 0) });
 }
 frameworks.sort((a, b) => a.total - b.total);
@@ -67,12 +72,13 @@ const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;');
 let svg = [];
 svg.push(`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">`);
 svg.push(`<rect width="${W}" height="${H}" fill="${SURFACE}"/>`);
-svg.push(`<text x="24" y="34" font-size="17" font-weight="600" fill="${INK}">Total benchmark time by framework</text>`);
-svg.push(`<text x="24" y="54" font-size="12" fill="${INK2}">js-reactivity-benchmark (milomg), all four suites, one process per framework, fastest-of-N per test - lower is better</text>`);
+svg.push(`<text x="24" y="34" font-size="17" font-weight="600" fill="${INK}">${esc(TITLE)}</text>`);
+svg.push(`<text x="24" y="54" font-size="12" fill="${INK2}">${esc(SUBTITLE)}</text>`);
 
-// legend (top right)
+// legend (top right) — only suites that actually have data in this run
+const usedSuites = SUITES.filter((s) => frameworks.some((f) => f[s] > 0));
 let lx = W - 24;
-for (const s of [...SUITES].reverse()) {
+for (const s of [...usedSuites].reverse()) {
 	const label = s;
 	const tw = label.length * 7 + 22;
 	lx -= tw;
@@ -91,8 +97,8 @@ svg.push(`<text x="${x(axisMax / 2)}" y="${H - 10}" font-size="11" fill="${INK2}
 // bars
 frameworks.forEach((f, i) => {
 	const y = TOP + i * ROW + (ROW - BAR) / 2;
-	const isOurs = f.fw === 'Dalien Signals';
-	const isUpstream = f.fw === 'Alien Signals';
+	const isOurs = f.fw === 'Dalien Signals' || f.fw === 'dalien-signals';
+	const isUpstream = f.fw.startsWith('Alien Signals') || f.fw.startsWith('alien-signals');
 	svg.push(`<text x="${LABEL_W - 8}" y="${y + BAR / 2 + 4}" font-size="12" text-anchor="end" fill="${INK}"${isOurs ? ' font-weight="700"' : isUpstream ? ' font-weight="600"' : ''}>${esc(f.fw)}</text>`);
 	let cx = LABEL_W;
 	SUITES.forEach((s, si) => {
