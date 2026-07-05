@@ -1550,6 +1550,16 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 				const fastSub = activeSub;
 				if (fastSub !== 0) {
 					link(c, fastSub, cycle);
+					// A first subscription can arrive THROUGH this fast path
+					// (the node was evaluated by an untracked read, stamped,
+					// and nothing has been written since). The engine must
+					// borrow the getter here exactly as the slow tail does,
+					// or the node is subscribed with no evaluator installed
+					// and later propagation walks cannot update it.
+					if (!(M[c + C.FLAGS] & C.FN_INSTALLED)) {
+						fnTab[c >> 3] = getter;
+						M[c + C.FLAGS] |= C.FN_INSTALLED;
+					}
 				}
 				return vals[c >> 2];
 			}
