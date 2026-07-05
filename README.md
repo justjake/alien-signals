@@ -9,38 +9,99 @@
 
 # dalien-signals
 
-dalien-signals is a fork of [alien-signals](https://github.com/stackblitz/alien-signals) with a data-oriented memory layout. It runs the same push-pull algorithm and passes the same test suite, but the dependency graph lives in a single `Int32Array` instead of linked objects: nodes and edges are fixed-size integer records, values and callbacks sit in plain side arrays, and propagation walks preallocated stacks instead of allocating cons cells. Tracking, propagation, and dependency cleanup allocate no GC objects.
+dalien-signals is a fork of [alien-signals](https://github.com/stackblitz/alien-signals) with a data-oriented core: the dependency graph lives in one `Int32Array` — nodes and edges are 32-byte integer records, values and callbacks sit in side arrays — traversal uses preallocated stacks, and graph maintenance allocates no GC objects. The algorithm and the package-root API are upstream's; all 179 conformance cases pass.
 
-The layout trades update latency for throughput and memory. The crossover follows the size of each update's recompute set — not the size of the graph: a 120,000-node graph written eleven nodes at a time performs within ~3% of upstream, because every write-path cost (index arithmetic, upstream's traversal allocations, cache footprint) scales with what the update touches.
+What changes in practice:
 
-- Writes that recompute a handful of nodes run ~20% slower than upstream; from tens to a few hundred nodes per update the gap is 4–8%. Typed-array index arithmetic costs more per access than object field loads, and small updates give the allocation-free design little to win back.
-- From roughly a thousand nodes per update dalien-signals pulls 30–50% ahead, and at ten thousand it is 2.2× faster; the sustained-write geomean across the whole shape matrix is 14% faster: upstream allocates traversal cells on every update (a GC tax that grows with recompute depth) and its object graph outgrows cache long before the packed records do (`benchs/propagateSustained.mjs`).
-- 10,000 live effects retain ~47% less heap and a 100×100 computed/effect grid ~16% less; creating 10,000 signal→computed→effect rows is at parity. Signal and computed handles carry a `FinalizationRegistry` cell for reclamation, which costs them retained-heap parity with upstream (`benchs/memoryUsage.mjs`).
+- **Throughput over micro-latency.** Write cost scales with what an update touches: recomputing a handful of nodes is ~15–25% slower than upstream and tens-to-hundreds are within 5–10%, while updates recomputing thousands of nodes run 1.3–2× faster; sustained write streams average ~10% faster across the whole shape matrix (`benchs/propagateSustained.mjs`).
+- **Quiet reads are ~33% faster.** A global write epoch lets reads of clean computeds skip verification entirely — one compare against a stamp in the node's own record. Upstream has no equivalent fast path.
+- **Leak-free by construction.** Dropped signal/computed handles reclaim their records through a required `FinalizationRegistry` (ES2021), and getters are owned by their handles — the engine borrows them only while the computed is subscribed, so no internal table can pin user closures. 10,000 live effects retain ~47% less heap than upstream; signals pay about one registry cell each, and computeds join the registry only once first evaluated, so computeds that are created but never read cost nothing.
+- **Fixed-capacity store, allocated on first use.** `configure({ initialRecords })` sizes it before first use (default 2^23 records ≈ 256 MB of lazily-mapped virtual pages; physical memory tracks records actually touched). The plane never grows or moves — that is what lets handles reach the graph with zero indirection.
+- **Generation lifecycle.** `system.reset()` tears down an entire generation in one sweep: it rewinds the record plane and replaces the finalization registry, so a dead generation costs the garbage collector a few large objects instead of one weak cell per handle. Request-scoped graphs, worker pools, and benchmark harnesses want exactly this; every handle minted before a reset is invalid afterwards.
+- **`dalien-signals/system` is a new, incompatible interface** (a self-contained engine over integer handles). The package root is drop-in, except `getActiveSub()` returns a flags view object and handle functions are anonymous (`isSignal` and friends still work).
 
-The record store is allocated on first use, so importing the package costs nothing. It has a fixed capacity — the default reservation is 2^23 records (256 MB of lazily-mapped virtual pages; physical memory tracks records actually touched), sized with `configure({ initialRecords })` — because a plane that never moves is what lets every handle capture the buffer directly instead of paying an indirection per operation. Records of garbage-collected signal/computed handles are reclaimed through a `FinalizationRegistry` (required, ES2021), like upstream's GC-visible graph reclaims its nodes — there is no leaking configuration. The `dalien-signals/system` entry point is a different, incompatible interface in this fork: rather than `createReactiveSystem(callbacks)` over user-provided node objects, it returns a self-contained engine over integer handles. The package root exports are unchanged, except that `getActiveSub()` returns a view object rather than the raw node (its `flags` stay readable and writable) and handle function names lose their `bound ` prefix (`isSignal` and friends still work).
+Below is the [js-reactivity-benchmark](https://github.com/milomg/js-reactivity-benchmark) suite (sbench, kairo, cellx, dynamic) under both JavaScript engines. Methodology: each framework runs in its own process; each test reports the median of its runs (upstream reports the fastest run, which hides amortized costs — collection of what a run allocated, deoptimization recovery, finalizer processing); frameworks run interleaved round-robin for three rounds and each test's final time is the median across rounds, which cancels machine drift. The dalien adapter uses `reset()` between tests — the arena equivalent of the wholesale collection a dead GC-managed graph gets automatically. Apple M4 Max, 2026-07-05; raw data in `benchs/results/`; the same harness runs in CI on every push (`benchs/ci/`).
 
-Below is the [js-reactivity-benchmark](https://github.com/milomg/js-reactivity-benchmark) suite (sbench, kairo, cellx, dynamic), each framework in its own Node process, fastest-of-N per test. This estimator rewards small-update latency — the regime upstream is best at — and the fork still lands within 11% of upstream overall, tied with Preact Signals and ahead of the rest; the throughput and memory wins above are not visible in it. Reactively is omitted (stack overflow in its recursive update on deep graphs). Node 24, Apple M4 Max, 2026-07-05; raw data in `benchs/results/`.
+**Node 24 (V8)** — dalien-signals finishes first overall, 16% ahead of upstream:
 
-<img width="1080" alt="Total benchmark time by framework: Alien Signals 1,999 ms; Dalien Signals 2,219 ms; Preact Signals 2,222 ms; s-js 2,971 ms; Vue 3,058 ms; Svelte v5 3,299 ms; tansu 3,712 ms; Pota 3,761 ms; Angular Signals 4,138 ms; SolidJS 4,519 ms; x-reactivity 5,556 ms; MobX 8,084 ms; Compostate 10,143 ms" src="assets/benchmark.png" />
+<img width="1080" alt="Total benchmark time by framework, Node 24: Dalien Signals 3,199 ms; Vue 3,388 ms; Reactively 3,406 ms; Svelte v5 3,479 ms; Alien Signals 3,831 ms; Pota 3,941 ms; s-js 3,949 ms; Preact Signals 3,957 ms; tansu 4,126 ms; x-reactivity 5,956 ms; Angular Signals 6,505 ms; SolidJS 7,565 ms; MobX 10,847 ms; Compostate 15,445 ms" src="assets/benchmark.png" />
+
+<details>
+<summary>Node suite totals (ms, lower is better)</summary>
+
+| framework | sbench | kairo | cellx | dynamic | total |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Dalien Signals | 354 | 481 | 21 | 2342 | 3199 |
+| Vue | 475 | 708 | 57 | 2149 | 3388 |
+| Reactively | 336 | 1066 | 107 | 1896 | 3406 |
+| Svelte v5 | 640 | 907 | 27 | 1905 | 3479 |
+| Alien Signals | 340 | 877 | 35 | 2579 | 3831 |
+| Pota | 796 | 973 | 68 | 2105 | 3941 |
+| s-js | 384 | 1156 | 46 | 2364 | 3949 |
+| Preact Signals | 293 | 668 | 59 | 2937 | 3957 |
+| amadeus-it-group/tansu | 1320 | 884 | 102 | 1821 | 4126 |
+| x-reactivity | 1358 | 1318 | 52 | 3228 | 5956 |
+| Angular Signals | 1453 | 1476 | 68 | 3508 | 6505 |
+| SolidJS | 1368 | 1342 | 62 | 4794 | 7565 |
+| MobX | 1744 | 1871 | 227 | 7005 | 10847 |
+| Compostate | 2341 | 2415 | 110 | 10579 | 15445 |
+
+Reactively crashed one of its three rounds mid-suite (a known flake), so its dynamic-suite entries are medians of two rounds.
+
+</details>
+
+**Bun 1.3 (JavaScriptCore)** — the lead widens to 24% over upstream:
+
+<img width="1080" alt="Total benchmark time by framework, Bun 1.3: Dalien Signals 1,557 ms; Reactively 1,690 ms; Alien Signals 1,935 ms; Preact Signals 2,208 ms; s-js 2,218 ms; Vue 2,499 ms; Angular Signals 3,140 ms; Svelte v5 3,272 ms; Pota 3,766 ms; tansu 4,059 ms; SolidJS 4,555 ms; x-reactivity 4,683 ms; MobX 5,869 ms; Compostate 12,498 ms" src="assets/benchmark-bun.png" />
+
+<details>
+<summary>Bun suite totals (ms, lower is better)</summary>
+
+| framework | sbench | kairo | cellx | dynamic | total |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Dalien Signals | 253 | 302 | 15 | 986 | 1557 |
+| Reactively | 227 | 555 | 30 | 879 | 1690 |
+| Alien Signals | 347 | 362 | 19 | 1207 | 1935 |
+| Preact Signals | 327 | 335 | 17 | 1531 | 2208 |
+| s-js | 273 | 451 | 22 | 1472 | 2218 |
+| Vue | 385 | 453 | 41 | 1620 | 2499 |
+| Angular Signals | 725 | 591 | 67 | 1757 | 3140 |
+| Svelte v5 | 501 | 695 | 19 | 2056 | 3272 |
+| Pota | 460 | 944 | 56 | 2306 | 3766 |
+| amadeus-it-group/tansu | 1205 | 801 | 91 | 1962 | 4059 |
+| SolidJS | 556 | 847 | 49 | 3102 | 4555 |
+| x-reactivity | 1039 | 989 | 41 | 2614 | 4683 |
+| MobX | 1001 | 1331 | 99 | 3438 | 5869 |
+| Compostate | 924 | 1442 | 91 | 10040 | 12498 |
+
+</details>
+
+The [transitive-bullshit fork](https://github.com/transitive-bullshit/js-reactivity-benchmark) of the same suite runs every framework in one shared Node process — the methodology behind the upstream alien-signals chart further down. `alien-signals` here is the 1.0.0-alpha.1 that repo pins; `alien-signals-v3` is the v3.2.1 this fork tracks. Read it with two caveats: shared-process totals are order-sensitive (each framework inherits the JIT and heap state of whatever ran before it — in our testing, reordering frameworks changed relative results materially), and its creation tests end their timed region with a forced full GC over ~100k just-abandoned nodes, which bills dalien-signals' `FinalizationRegistry` cells inside the timing while upstream's dead nodes are ordinary garbage. That one suite accounts for most of the gap to upstream below. Node 24, Apple M4 Max, 2026-07-05; raw data in `benchs/results/`.
+
+<img width="1080" alt="Total benchmark time by framework, shared process: alien-signals 1,729 ms; alien-signals-v3 1,937 ms; dalien-signals 2,653 ms; @reactively 2,978 ms; Svelte v5 3,246 ms; s-js 3,750 ms; tansu 3,911 ms; Oby 4,049 ms; $mol_wire 4,224 ms; Preact Signals 4,885 ms; uSignal 5,013 ms; SolidJS 5,598 ms; MobX 7,123 ms; Signia 7,579 ms; @vue/reactivity 8,609 ms; TC39 Signals Polyfill 17,165 ms; @angular/signals 20,360 ms" src="assets/benchmark-tb.png" />
 
 <details>
 <summary>Suite totals (ms, lower is better)</summary>
 
-| framework | sbench | kairo | cellx | dynamic | total |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Alien Signals | 333 | 430 | 16 | 1220 | 1999 |
-| Dalien Signals | 353 | 531 | 16 | 1319 | 2219 |
-| Preact Signals | 237 | 461 | 15 | 1510 | 2222 |
-| s-js | 362 | 672 | 24 | 1913 | 2971 |
-| Vue | 453 | 706 | 51 | 1848 | 3058 |
-| Svelte v5 | 594 | 863 | 23 | 1819 | 3299 |
-| amadeus-it-group/tansu | 1080 | 857 | 80 | 1695 | 3712 |
-| Pota | 628 | 916 | 80 | 2137 | 3761 |
-| Angular Signals | 702 | 817 | 69 | 2549 | 4138 |
-| SolidJS | 604 | 970 | 46 | 2899 | 4519 |
-| x-reactivity | 1151 | 1246 | 48 | 3111 | 5556 |
-| MobX | 1797 | 1873 | 107 | 4307 | 8084 |
-| Compostate | 1118 | 1683 | 96 | 7246 | 10143 |
+| framework | sbench | kairo | dynamic | total |
+| --- | ---: | ---: | ---: | ---: |
+| alien-signals 1.0.0-alpha.1 | 37 | 920 | 771 | 1729 |
+| alien-signals v3.2.1 | 54 | 996 | 887 | 1937 |
+| dalien-signals | 556 | 1124 | 973 | 2653 |
+| @reactively | 664 | 1326 | 987 | 2978 |
+| Svelte v5 | 640 | 1498 | 1109 | 3246 |
+| s-js | 774 | 1517 | 1459 | 3750 |
+| @amadeus-it-group/tansu | 697 | 1802 | 1412 | 3911 |
+| Oby | 836 | 1813 | 1401 | 4049 |
+| $mol_wire | 677 | 2126 | 1422 | 4224 |
+| Preact Signals | 656 | 1122 | 3108 | 4885 |
+| uSignal | 670 | 2408 | 1935 | 5013 |
+| SolidJS | 855 | 2159 | 2584 | 5598 |
+| MobX | 725 | 3597 | 2801 | 7123 |
+| Signia | 714 | 1846 | 5019 | 7579 |
+| @vue/reactivity | 691 | 1866 | 6051 | 8609 |
+| TC39 Signals Polyfill | 761 | 3281 | 13123 | 17165 |
+| @angular/signals | 694 | 2462 | 17204 | 20360 |
 
 </details>
 
