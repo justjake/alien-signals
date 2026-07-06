@@ -32,6 +32,10 @@ on:
         description: 'Framework names (quoted, space-separated), or ALL'
         required: false
         default: '"Dalien Signals" "Alien Signals" "Reactively" "Preact Signals"'
+      shards:
+        description: 'Round shards as a JSON array; more shards = tighter medians at the same wall-clock (each is a full same-machine pass)'
+        required: false
+        default: '[1, 2, 3]'
 
 concurrency:
   group: benchmark-${{ github.ref }}
@@ -52,7 +56,7 @@ jobs:
       fail-fast: false
       matrix:
         runtime: [node, bun]
-        round: [1, 2, 3]
+        round: ${{ fromJSON(inputs.shards || '[1, 2, 3]') }}
     name: round-${{ matrix.runtime }}-${{ matrix.round }}
     runs-on: ubuntu-latest
     timeout-minutes: 150
@@ -204,7 +208,7 @@ jobs:
             "results-${{ matrix.runtime }}.csv" \
             "benchmark-${{ matrix.runtime }}.svg" \
             "Total benchmark time by framework" \
-            "js-reactivity-benchmark (median of 3 interleaved isolated rounds), $RUNTIME_VERSION, GitHub Actions $(uname -m) - lower is better"
+            "js-reactivity-benchmark (median of interleaved isolated rounds (one runner per round)), $RUNTIME_VERSION, GitHub Actions $(uname -m) - lower is better"
           HEIGHT=$(grep -o 'height="[0-9]*"' "benchmark-${{ matrix.runtime }}.svg" | head -1 | grep -o '[0-9]*')
           google-chrome --headless=new --no-sandbox --disable-gpu \
             --screenshot="benchmark-${{ matrix.runtime }}.png" \
@@ -215,7 +219,7 @@ jobs:
       - name: Job summary
         run: |
           {
-            echo "### Benchmark totals (${{ matrix.runtime }}, median of 3 rounds)"
+            echo "### Benchmark totals (${{ matrix.runtime }}, median across round shards)"
             echo ""
             echo '| framework | total (ms) |'
             echo '| --- | ---: |'
