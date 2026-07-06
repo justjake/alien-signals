@@ -59,6 +59,14 @@ const enum Host {
 declare const ValueOf: unique symbol;
 export type Signal<T> = SignalId & { [ValueOf]?: (value: T) => T };
 
+/** Property key carrying a stamped owner's node id (see signalOwner). */
+export const SignalIdKey: unique symbol = Symbol('dalien-signals.id');
+/** Property key carrying a stamped owner's mint generation. */
+export const SignalGenKey: unique symbol = Symbol('dalien-signals.gen');
+
+/** An owner object stamped with the node it keeps alive. */
+export type SignalOwner<T, R> = R & { [SignalIdKey]: Signal<T>; [SignalGenKey]: SignalGen };
+
 // ---- node state ----------------------------------------------------------------
 // Structure-of-arrays side columns, indexed by record number: the record
 // holds the graph, these hold the JavaScript. currentVals is a signal's
@@ -139,17 +147,11 @@ const system = createReactiveSystem({
 		checkDirty = arena.checkDirty;
 		shallowPropagate = arena.shallowPropagate;
 		freeNode = arena.freeNode;
-		// Presize the side columns to the arena's record capacity: a
-		// mint-heavy burst then never pays incremental backing-store
-		// doubling (and the copying it implies) on its own clock.
-		const cap = arena.memory.length >> Arena.NodeIndexShift;
-		if (currentVals.length < cap) {
-			currentVals.length = cap;
-			pendingVals.length = cap;
-			fns.length = cap;
-			cleanups.length = cap;
-			owned.length = cap;
-		}
+		// The side columns are NOT presized to capacity: pointer arrays are
+		// traversed by major GC marking, and capacity-sized columns (2M
+		// slots x 5 arrays) put a ~10 ms Mark-Compact tax on every major
+		// collection. Incremental growth costs amortized copying instead,
+		// which measured cheaper everywhere.
 	},
 	update: function updateNode(id, flags): boolean {
 		if ((flags & Host.KindMask) === Host.Signal) {
@@ -486,19 +488,11 @@ export function growCapacity(records: number): void {
  */
 export function reset(): void {
 	system.reset();
-	// Truncate-then-represize: drops every held value while keeping the
-	// columns at capacity (no regrow tax on the next mint burst).
-	const cap = M.length >> Arena.NodeIndexShift;
 	currentVals.length = 0;
 	pendingVals.length = 0;
 	fns.length = 0;
 	cleanups.length = 0;
 	owned.length = 0;
-	currentVals.length = cap;
-	pendingVals.length = cap;
-	fns.length = cap;
-	cleanups.length = cap;
-	owned.length = cap;
 	pendingRegions.length = 0;
 	queued.length = 0;
 	queuedGens.length = 0;
@@ -791,6 +785,39 @@ export function dispose(id: SignalId): void {
 		fns[id >> Arena.NodeIndexShift] = undefined;
 		freeNode(id, M[id + NodeSlot.Gen]);
 	}
+}
+
+/**
+ * AUTOMATIC memory management with a handle object: mint a signal whose
+ * record frees itself when `owner` is garbage collected, stamp the id and
+ * generation onto the owner, and return it. The owner is whatever object
+ * represents the signal to your code (a wrapper with read/write methods, a
+ * component record, ...):
+ *
+ * ```ts
+ * let id: Signal<number>;
+ * const count = signalOwner(0, {
+ *   read: () => get(id),
+ *   write: (v: number) => set(id, v),
+ * });
+ * id = count[SignalIdKey];
+ * ```
+ */
+export function signalOwner<T, R extends WeakKey>(initialValue: T, owner: R): SignalOwner<T, R> {
+	const id = signal(initialValue, owner);
+	const stamped = owner as SignalOwner<T, R>;
+	stamped[SignalIdKey] = id;
+	stamped[SignalGenKey] = M[id + NodeSlot.Gen];
+	return stamped;
+}
+
+/** signalOwner's computed twin: see {@link signalOwner}. */
+export function computedOwner<T, R extends WeakKey>(getter: (previousValue?: T) => T, owner: R): SignalOwner<T, R> {
+	const id = computed(getter, owner);
+	const stamped = owner as SignalOwner<T, R>;
+	stamped[SignalIdKey] = id;
+	stamped[SignalGenKey] = M[id + NodeSlot.Gen];
+	return stamped;
 }
 
 function noopEffectBody(): void {}
