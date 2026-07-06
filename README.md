@@ -12,33 +12,35 @@
 *d*alien-signals is a *d*ata-oriented fork of [alien-signals](https://github.com/stackblitz/alien-signals), a signals reactivity engine. It stores the alien-signals graph in a single `Int32Array` memory arena as contiguous structs, with associated JavaScript values and callbacks in side arrays. Here's a diagram of the data layout of structs in the graph, and their offsets:
 
 ```mermaid
----
-title: "node record — 8 int32 slots, 32 bytes, M[id + slot]"
----
-packet-beta
-0-31: "0 FLAGS — state bits + kind bits"
-32-63: "1 DEPS — first dependency link"
-64-95: "2 DEPS_TAIL — last dependency link"
-96-127: "3 SUBS — first subscriber link"
-128-159: "4 SUBS_TAIL — last subscriber link"
-160-191: "5 GEN — generation counter"
-192-223: "6 VSTAMP_HI — write-epoch stamp, high"
-224-255: "7 VSTAMP_LO — write-epoch stamp, low"
-```
-
-```mermaid
----
-title: "link record (one graph edge) — same plane, same 32 bytes"
----
-packet-beta
-0-31: "0 VERSION — re-track marker"
-32-63: "1 DEP — node id being read"
-64-95: "2 SUB — node id doing the reading"
-96-127: "3 PREV_SUB — subscriber list of DEP"
-128-159: "4 NEXT_SUB — subscriber list of DEP"
-160-191: "5 PREV_DEP — dependency list of SUB"
-192-223: "6 NEXT_DEP — dependency list of SUB"
-224-255: "7 FREE_NEXT — free-list pointer"
+classDiagram
+    direction LR
+    class Node["node record — 8 int32 slots, 32 bytes"] {
+        0 FLAGS : state bits + kind bits
+        1 DEPS : first dependency link
+        2 DEPS_TAIL : last dependency link
+        3 SUBS : first subscriber link
+        4 SUBS_TAIL : last subscriber link
+        5 GEN : generation counter
+        6 VSTAMP_HI : write-epoch stamp, high
+        7 VSTAMP_LO : write-epoch stamp, low
+    }
+    class Link["link record, one graph edge — same plane, same 32 bytes"] {
+        0 VERSION : re-track marker
+        1 DEP : node id being read
+        2 SUB : node id doing the reading
+        3 PREV_SUB : subscriber list of DEP
+        4 NEXT_SUB : subscriber list of DEP
+        5 PREV_DEP : dependency list of SUB
+        6 NEXT_DEP : dependency list of SUB
+        7 FREE_NEXT : free-list pointer
+    }
+    class SideArrays["side arrays — plain JS, indexed by the same id"] {
+        values : 2 slots per record
+        fns : 1 slot per record
+    }
+    Node --> Link : DEPS, SUBS
+    Link --> Node : DEP, SUB
+    Node ..> SideArrays : id
 ```
 
 Node records (signals, computeds, effects, scopes) and link records (the edges between them) interleave in the same plane, handed out by one bump pointer and recycled through free lists. Ids are pre-multiplied (`id = recordIndex × 8`) so every field access is a single indexed load, `M[id + SLOT]`, and record 0 is burned as *null* so every "is there a link?" check is `x !== 0`. Two side arrays indexed by the same id hold the only GC-visible parts: `values` (two slots per record — current value, plus staged value or effect cleanup) and `fns` (the getter or callback). The graph itself is invisible to the garbage collector.
