@@ -1003,6 +1003,13 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 	// Local aliases for the shared side arrays (stable identities): one load
 	// at construction, then context-specialized constants in the hot paths.
 	const pendingFree = shared.pendingFree;
+	// Seam callbacks are fixed at system creation (options are the only way
+	// to set them), so each generation captures them as construction consts:
+	// walk call sites become direct, foldable, inlinable calls instead of
+	// per-call property loads off `shared`.
+	const hostUpdate = shared.hostUpdate;
+	const hostNotify = shared.hostNotify;
+	const lifecycleArmed = shared.hostWatched !== undefined || shared.hostUnwatched !== undefined;
 	const hostState = shared.hostState;
 
 	return {
@@ -1236,8 +1243,8 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			} else {
 				M[dep + NodeSlot.Subs] = newLink;
 				// First subscriber: watched-lifecycle arming (out of the common
-				// re-subscribe path; two context compares on first-link only).
-				if (shared.hostWatched !== undefined || shared.hostUnwatched !== undefined) {
+				// re-subscribe path; one folded compare on first-link only).
+				if (lifecycleArmed) {
 					hostWatchedNode(dep);
 				}
 			}
@@ -1592,7 +1599,6 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		// marked resolved so walks terminate.
 		function update(node: number): boolean {
 			const flags = M[node + NodeSlot.Flags];
-			const hostUpdate = shared.hostUpdate;
 			if (hostUpdate !== undefined) {
 				return hostUpdate(node, flags);
 			}
@@ -1605,7 +1611,6 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		// bit is the dedup (one notification until the host re-arms it).
 		function notify(e: number): void {
 			M[e + NodeSlot.Flags] &= ~Flag.Watching;
-			const hostNotify = shared.hostNotify;
 			if (hostNotify !== undefined) {
 				hostNotify(e, M[e + NodeSlot.Gen]);
 			}
