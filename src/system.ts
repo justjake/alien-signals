@@ -240,6 +240,15 @@ export interface ReactiveEngine {
 	/** Link `id` to the active subscriber, if anything is tracking. */
 	track(id: NodeId): void;
 	/**
+	 * Run `fn(arg)` as `id`'s tracked evaluation: the fused equivalent of
+	 * setActiveSub + beginTracking + fn + endTracking + restore.
+	 */
+	runTracked(id: NodeId, fn: (arg: unknown) => unknown, arg: unknown): unknown;
+	/** The node's full flags word (state + host bits). */
+	nodeFlags(id: NodeId): number;
+	/** Write the public+host writable bits; kills the quiet-read stamp. */
+	setNodeFlags(id: NodeId, flags: number): void;
+	/**
 	 * Add a dependency edge: `sub` re-verifies (and effects re-run) when
 	 * `dep` changes. Returns the edge's id (the existing one if the edge is
 	 * already present). The edge behaves exactly like one made by a tracked
@@ -318,6 +327,15 @@ export interface ReactiveSystem {
 	markDirty(id: NodeId): void;
 	/** Link `id` to the active subscriber, if anything is tracking. */
 	track(id: NodeId): void;
+	/**
+	 * Run `fn(arg)` as `id`'s tracked evaluation: the fused equivalent of
+	 * setActiveSub + beginTracking + fn + endTracking + restore.
+	 */
+	runTracked(id: NodeId, fn: (arg: unknown) => unknown, arg: unknown): unknown;
+	/** The node's full flags word (state + host bits). */
+	nodeFlags(id: NodeId): number;
+	/** Write the public+host writable bits; kills the quiet-read stamp. */
+	setNodeFlags(id: NodeId, flags: number): void;
 	/** Add a dependency edge; see {@link ReactiveEngine.link}. */
 	link(depId: NodeId, subId: NodeId): LinkId;
 	/** Remove an edge; see {@link ReactiveEngine.unlink}. */
@@ -731,6 +749,9 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		endTracking: uninitialized,
 		markDirty: uninitialized,
 		track: uninitialized,
+		runTracked: uninitialized,
+		nodeFlags: uninitialized,
+		setNodeFlags: uninitialized,
 		link: uninitialized,
 		unlink: uninitialized,
 		propagate: uninitialized,
@@ -823,6 +844,9 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		track(id: NodeId): void {
 			ensureEngine().track(id);
 		},
+		runTracked(id: NodeId, fn: (arg: unknown) => unknown, arg: unknown): unknown {
+			return ensureEngine().runTracked(id, fn, arg);
+		},
 		link(depId: NodeId, subId: NodeId): LinkId {
 			const engine = ensureEngine();
 			engine.maybeBoundary(); // link allocates a record
@@ -863,13 +887,10 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			return ensureEngine().setActiveSub(id);
 		},
 		nodeFlags(id: number): number {
-			return ensureEngine().buffer()[id + C.FLAGS];
+			return ensureEngine().nodeFlags(id);
 		},
 		setNodeFlags(id: number, flags: number): void {
-			const engine = ensureEngine();
-			const M = engine.buffer();
-			M[id + C.FLAGS] = (M[id + C.FLAGS] & ~C.PUBLIC_MASK) | (flags & C.PUBLIC_MASK);
-			engine.clearStamp(id);
+			ensureEngine().setNodeFlags(id, flags);
 		},
 		buffer(): Int32Array {
 			return ensureEngine().buffer();
@@ -1003,6 +1024,9 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		endTracking,
 		markDirty,
 		track,
+		runTracked,
+		nodeFlags: nodeFlagsOf,
+		setNodeFlags: setNodeFlagsOf,
 		link: linkNode,
 		unlink: unlinkEdge,
 		propagate: propagateNode,
@@ -1182,6 +1206,43 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			M[id + C.FLAGS] &= ~C.RECURSED_CHECK;
 			purgeDeps(id);
 			--enterDepth;
+		}
+
+		function nodeFlagsOf(id: number): number {
+			return retired ? shared.inner!.nodeFlags(id) : M[id + C.FLAGS];
+		}
+
+		function setNodeFlagsOf(id: number, flags: number): void {
+			if (retired) {
+				shared.inner!.setNodeFlags(id, flags);
+				return;
+			}
+			M[id + C.FLAGS] = (M[id + C.FLAGS] & ~(C.PUBLIC_MASK | C.HOST_MASK))
+				| (flags & (C.PUBLIC_MASK | C.HOST_MASK));
+			D[(id >> 1) + 3] = 0;
+		}
+
+		// The fused tracking bracket: setActiveSub + beginTracking + fn +
+		// endTracking + restore, one call instead of five. `arg` threads the
+		// caller's context through so no closure is allocated per run.
+		function runTracked(id: number, fn: (arg: unknown) => unknown, arg: unknown): unknown {
+			if (retired) {
+				return shared.inner!.runTracked(id, fn, arg);
+			}
+			const prevSub = activeSub;
+			activeSub = id;
+			++enterDepth;
+			++cycle;
+			M[id + C.DEPS_TAIL] = 0;
+			M[id + C.FLAGS] = (M[id + C.FLAGS] & ~(C.DIRTY | C.PENDING | C.RECURSED)) | C.RECURSED_CHECK;
+			try {
+				return fn(arg);
+			} finally {
+				M[id + C.FLAGS] &= ~C.RECURSED_CHECK;
+				purgeDeps(id);
+				--enterDepth;
+				activeSub = prevSub;
+			}
 		}
 
 		/** Mark a node definitely-changed and kill its quiet-read stamp. */

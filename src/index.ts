@@ -103,16 +103,20 @@ const {
 
 function recompute(id: NodeId, st: ComputedState): boolean {
 	// Effects created by the previous evaluation dispose first (LIFO).
-	disposeChildren(st);
-	const prevSub = systemSetActiveSub(id);
-	system.beginTracking(id);
-	try {
-		const old = st.value;
-		return old !== (st.value = st.getter(old));
-	} finally {
-		systemSetActiveSub(prevSub);
-		system.endTracking(id);
+	if (st.children.length !== 0) {
+		disposeChildren(st);
 	}
+	const old = st.value;
+	return old !== (st.value = system.e.runTracked(id, evalComputed, st));
+}
+
+function evalEffect(st: unknown): unknown {
+	return (st as EffectState).fn();
+}
+
+function evalComputed(st: unknown): unknown {
+	const c = st as ComputedState;
+	return c.getter(c.value);
 }
 
 function drain(): void {
@@ -169,15 +173,11 @@ function runEffect(id: NodeId, st: EffectState): void {
 		// Re-arm BEFORE running: a write from inside the body (recursed
 		// effects clear their own RecursedCheck) must be able to re-notify.
 		setNodeFlags(id, nodeFlags(id) | ReactiveFlags.Watching);
-		const prevSub = systemSetActiveSub(id);
-		system.beginTracking(id);
 		++runDepth;
 		try {
-			st.cleanup = st.fn();
+			st.cleanup = system.e.runTracked(id, evalEffect, st) as (() => void) | void;
 		} finally {
 			--runDepth;
-			systemSetActiveSub(prevSub);
-			system.endTracking(id);
 		}
 	} else {
 		// Verified clean, not run: re-arm what notify's dedup cleared.
@@ -455,13 +455,13 @@ export function computed<T>(getter: (previousValue?: T) => T): () => T {
 		children: [],
 	};
 	const oper = anon((): T => {
-		if (!system.verified(id)) {
-			if (nodeFlags(id) & ReactiveFlags.RecursedCheck) {
+		if (!e.verified(id)) {
+			if (e.nodeFlags(id) & ReactiveFlags.RecursedCheck) {
 				// Re-entrant self-read during our own recompute: hand back
 				// the stale value instead of recursing (upstream parity).
-			} else if (system.verify(id)) {
+			} else if (e.verify(id)) {
 				if (recompute(id, st)) {
-					system.shallowPropagate(id);
+					e.shallowPropagate(id);
 				}
 				st.evaluated = true;
 			} else if (!st.evaluated) {
@@ -469,10 +469,11 @@ export function computed<T>(getter: (previousValue?: T) => T): () => T {
 				recompute(id, st);
 			}
 		}
-		system.track(id);
+		e.track(id);
 		return st.value as T;
 	});
 	const id = system.custom(Kind.Computed | ReactiveFlags.Mutable, oper);
+	const e = system.e;
 	nodes[id >> 3] = st;
 	computedSrc ??= String(oper);
 	return oper;
