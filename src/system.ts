@@ -324,7 +324,7 @@ export interface ReactiveEngine {
 	 * when the node's value changed out of band, so direct subscribers are
 	 * promoted to DIRTY and actually recompute.
 	 */
-	propagate(id: NodeId): void;
+	propagate(id: NodeId, innerWrite?: boolean): void;
 	/**
 	 * Promote `id`'s PENDING subscribers to DIRTY (they will recompute on
 	 * next pull), queue affected effects, invalidate stamps, and flush
@@ -424,7 +424,7 @@ export interface ReactiveSystem {
 	/** Remove an edge; see {@link ReactiveEngine.unlink}. */
 	unlink(linkId: LinkId): void;
 	/** Push staleness downstream; see {@link ReactiveEngine.propagate}. */
-	propagate(id: NodeId): void;
+	propagate(id: NodeId, innerWrite?: boolean): void;
 	/** Promote pending subscribers; see {@link ReactiveEngine.shallowPropagate}. */
 	shallowPropagate(id: NodeId): void;
 	/** Current generation counter of a record (capture at creation). */
@@ -1187,8 +1187,8 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		unlink(linkId: LinkId): void {
 			ensureEngine().unlink(linkId);
 		},
-		propagate(id: NodeId): void {
-			ensureEngine().propagate(id);
+		propagate(id: NodeId, innerWrite?: boolean): void {
+			ensureEngine().propagate(id, innerWrite);
 		},
 		shallowPropagate(id: NodeId): void {
 			ensureEngine().shallowPropagate(id);
@@ -1618,7 +1618,11 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			if (retired) {
 				return shared.inner!.newCustom(hostBits);
 			}
-			return allocNode(C.K_CUSTOM | C.MUTABLE | (hostBits & C.HOST_MASK));
+			// Host tags plus initial PUBLIC state: the kind declares its own
+			// nature (MUTABLE for value nodes so walks update them and waves
+			// traverse them; WATCHING for effect-likes so notify fires;
+			// neither for wave-opaque bookkeeping nodes).
+			return allocNode(C.K_CUSTOM | (hostBits & (C.HOST_MASK | C.PUBLIC_MASK)));
 		}
 
 		// Generic, gen-guarded free for ANY node id: the explicit-lifetime
@@ -1965,15 +1969,15 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			unlink(linkId);
 		}
 
-		function propagateNode(id: number): void {
+		function propagateNode(id: number, innerWrite?: boolean): void {
 			if (retired) {
-				shared.inner!.propagate(id);
+				shared.inner!.propagate(id, innerWrite);
 				return;
 			}
 			const subs = M[id + C.SUBS];
 			if (subs !== 0) {
 				bumpEpoch();
-				propagate(subs, runDepth !== 0);
+				propagate(subs, innerWrite ?? runDepth !== 0);
 				if (!batchDepth) {
 					flush();
 				}

@@ -95,7 +95,7 @@ function makeUserspace() {
 				return st.current;
 			}
 		};
-		const id = sys.custom(SIG, oper);
+		const id = sys.custom(SIG | ReactiveFlags.Mutable, oper);
 		nodes[id >> 3] = st;
 		return oper as { (): T; (v: T): void };
 	}
@@ -116,14 +116,14 @@ function makeUserspace() {
 			sys.track(id);
 			return st.value;
 		};
-		const id = sys.custom(COMP, oper);
+		const id = sys.custom(COMP | ReactiveFlags.Mutable, oper);
 		nodes[id >> 3] = st;
 		return oper;
 	}
 
 	function effect(fn: () => void | (() => void)) {
 		const st = { fn, cleanup: undefined as (() => void) | undefined };
-		const id = sys.custom(EFF);
+		const id = sys.custom(EFF | ReactiveFlags.Watching);
 		const gen = sys.gen(id);
 		nodes[id >> 3] = st;
 		sys.setNodeFlags(id, sys.nodeFlags(id) | ReactiveFlags.Watching);
