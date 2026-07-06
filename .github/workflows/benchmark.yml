@@ -60,7 +60,7 @@ jobs:
         runtime: [node, bun]
     name: bench-${{ matrix.runtime }}
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 350
     steps:
       # Recreate the local development layout so the harness's relative
       # file: dependencies resolve unchanged:
