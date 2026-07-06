@@ -395,7 +395,52 @@ export declare interface ReactiveSystem {
 }
 ````
 
-Using an ID after its node is disposed or reclaimed is undefined behavior, except through the gen-guarded operations (`dispose`, `runEffect`).
+Using an ID after its node is disposed or reclaimed is undefined behavior, except through the gen-guarded operations (`dispose`, `runEffect`, `free`).
+
+### Userspace node kinds
+
+Core is a kindless graph machine: the walks track `MUTABLE`/`DIRTY`/`PENDING`/`WATCHING` state and resolve a stale node through one seam — signal-ness and computed-ness are library concepts. The built-in primitives are one such library (the optimized, wrapper-free default); hosts can define their own kinds with identical standing:
+
+````ts
+export declare function createReactiveSystem(options?: {
+  /**
+   * Resolve a custom node's update: commit whatever "update" means for
+   * your kind and return whether its value changed (feeding the same
+   * equality cut-off the built-ins use). Dispatch on your host bits:
+   * `flags & HOST_MASK` (bits 16-27, engine-preserved forever).
+   */
+  update?: (id: NodeId, flags: number) => boolean;
+}): ReactiveSystem;
+
+export declare interface ReactiveSystem {
+  /**
+   * Mint a host-kind node. Without `owner` the caller MUST `free(id, gen)`;
+   * with it, the record reclaims when `owner` is garbage collected.
+   */
+  custom(hostBits?: number, owner?: WeakKey): NodeId;
+  free(id: NodeId, gen: number): void;
+
+  /** One float64 compare: nothing observed was written since this node
+   * verified — skip everything. Stamps are written implicitly by core
+   * wherever verification completes. */
+  verified(id: NodeId): boolean;
+  /** True: you must update. False: verified clean (pending cleared, stamped). */
+  verify(id: NodeId): boolean;
+
+  /** Re-track bracket for update code that reads dependencies
+   * (wrap with setActiveSub, like a computed getter). */
+  beginTracking(id: NodeId): void;
+  endTracking(id: NodeId): void;
+
+  /** Mark definitely-changed and kill the quiet-read stamp; follow with
+   * propagate(id) — that pair is "a write" for your kind. */
+  markDirty(id: NodeId): void;
+  /** Link `id` to the active subscriber, if anything is tracking. */
+  track(id: NodeId): void;
+}
+````
+
+`tests/userspacePrimitives.spec.ts` is the proof: signal, computed, and effect implemented entirely from this surface — glitch-free diamonds, equality cut-off, batching, re-tracking, implicit stamping — interoperating both directions with the built-ins in one graph, at parity on the benchmark suite.
 
 ## Constraints
 

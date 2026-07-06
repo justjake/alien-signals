@@ -171,7 +171,10 @@ const enum C {
 	K_COMPUTED = 256,
 	K_EFFECT = 512,
 	K_SCOPE = 1024,
-	KIND_MASK = K_SIGNAL | K_COMPUTED | K_EFFECT | K_SCOPE,
+	// Host-defined node kind: the walks resolve its updates through the
+	// system's `update` callback instead of the built-in library.
+	K_CUSTOM = 16384,
+	KIND_MASK = K_SIGNAL | K_COMPUTED | K_EFFECT | K_SCOPE | K_CUSTOM,
 	// The record's handle was garbage-collected (FinalizationRegistry fired)
 	// while subscribers still existed; reclaim when the last subscriber
 	// unlinks. Engine-internal, outside PUBLIC_MASK.
@@ -182,6 +185,13 @@ const enum C {
 	// The host's start() lifecycle callback ran for this node and its stop()
 	// has not (see ReactiveSystemOptions.start/stop). Engine-internal.
 	HOST_STARTED = 8192,
+	// Bits 16-27 belong to the HOST: custom kinds plant their dispatch tags
+	// here at mint (custom(hostBits)); the engine never touches them and
+	// preserves them across every state rewrite (see STICKY).
+	HOST_SHIFT = 16,
+	HOST_MASK = 0x0FFF0000,
+	// Engine-internal + host bits that every absolute FLAGS store preserves.
+	STICKY = ORPHANED | HOST_STARTED | HOST_MASK,
 	// Bits visible through the public ReactiveNode view (semantic bits +
 	// HasChildEffect, which upstream also kept in the public flags word).
 	PUBLIC_MASK = 127,
@@ -282,6 +292,21 @@ export interface ReactiveEngine {
 	 * no-ops). Only meaningful with a `notify` host scheduler installed.
 	 */
 	runEffect(id: number, gen: number): void;
+	/** Mint a host-kind node (see ReactiveSystem.custom). */
+	newCustom(hostBits: number): NodeId;
+	/** Explicitly free any node id if `gen` still matches. */
+	free(id: NodeId, gen: number): void;
+	/** True: the node must update. False: verified clean (and stamped). */
+	verify(id: NodeId): boolean;
+	/** One f64 compare: may the caller skip verification entirely? */
+	verified(id: NodeId): boolean;
+	/** Re-track bracket for update code that reads dependencies. */
+	beginTracking(id: NodeId): void;
+	endTracking(id: NodeId): void;
+	/** Mark definitely-changed and kill the quiet-read stamp. */
+	markDirty(id: NodeId): void;
+	/** Link `id` to the active subscriber, if anything is tracking. */
+	track(id: NodeId): void;
 	/**
 	 * Add a dependency edge: `sub` re-verifies (and effects re-run) when
 	 * `dep` changes. Returns the edge's id (the existing one if the edge is
@@ -372,6 +397,28 @@ export interface ReactiveSystem {
 	 * no-ops). Only meaningful with a `notify` host scheduler installed.
 	 */
 	runEffect(id: number, gen: number): void;
+	/**
+	 * Mint a host-kind node. `hostBits` (masked to HOST_MASK) are your
+	 * dispatch tags, preserved by the engine across every state rewrite and
+	 * visible in the flags handed to the `update` callback. If `owner` is
+	 * given it is weak-registered: the record reclaims when the owner is
+	 * garbage collected. Without an owner the caller MUST `free`, or the
+	 * record lives until reset().
+	 */
+	custom(hostBits?: number, owner?: WeakKey): NodeId;
+	/** Explicitly free any node id if `gen` still matches. */
+	free(id: NodeId, gen: number): void;
+	/** True: the node must update. False: verified clean (and stamped). */
+	verify(id: NodeId): boolean;
+	/** One f64 compare: may the caller skip verification entirely? */
+	verified(id: NodeId): boolean;
+	/** Re-track bracket for update code that reads dependencies. */
+	beginTracking(id: NodeId): void;
+	endTracking(id: NodeId): void;
+	/** Mark definitely-changed and kill the quiet-read stamp. */
+	markDirty(id: NodeId): void;
+	/** Link `id` to the active subscriber, if anything is tracking. */
+	track(id: NodeId): void;
 	/** Add a dependency edge; see {@link ReactiveEngine.link}. */
 	link(depId: NodeId, subId: NodeId): LinkId;
 	/** Remove an edge; see {@link ReactiveEngine.unlink}. */
@@ -432,6 +479,14 @@ export interface ReactiveSystemOptions {
 	 *   scheduler, startBatch/endBatch no longer defer anything.
 	 */
 	notify?: (effectId: number, gen: number) => void;
+	/**
+	 * Resolve a custom node's update (see `custom`): commit whatever
+	 * "update" means for your kind and return whether its value changed —
+	 * the return feeds the equality cut-off exactly like the built-ins'.
+	 * Called by the graph walks with the node's flags word (dispatch on
+	 * your host bits, `flags & HOST_MASK`) while the node is DIRTY.
+	 */
+	update?: (id: NodeId, flags: number) => boolean;
 	/**
 	 * Watched-lifecycle callbacks. `start` runs when a node gains its FIRST
 	 * subscriber; whatever it returns is stored and passed to `stop` when the
@@ -522,6 +577,7 @@ function cloneWorks(): boolean {
 			inner: undefined,
 			registry: undefined,
 			hostNotify: undefined,
+			hostUpdate: undefined,
 			hostStart: undefined,
 			hostStop: undefined,
 			growPending: false,
@@ -608,6 +664,7 @@ interface EngineShared {
 	inner: Engine | undefined;
 	registry: FinalizationRegistry<number> | undefined;
 	hostNotify: ((effectId: number, gen: number) => void) | undefined;
+	hostUpdate: ((id: NodeId, flags: number) => boolean) | undefined;
 	hostStart: ((id: NodeId, js: unknown) => unknown) | undefined;
 	hostStop: ((id: NodeId, js: unknown, state: unknown) => void) | undefined;
 	growPending: boolean;
@@ -687,6 +744,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		inner: undefined,
 		registry: undefined,
 		hostNotify: options?.notify,
+		hostUpdate: options?.update,
 		hostStart: options?.start,
 		hostStop: options?.stop,
 		growPending: false,
@@ -971,6 +1029,14 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		computedRead: uninitialized,
 		dispose: uninitialized,
 		runEffect: uninitialized,
+		newCustom: uninitialized,
+		free: uninitialized,
+		verify: uninitialized,
+		verified: uninitialized,
+		beginTracking: uninitialized,
+		endTracking: uninitialized,
+		markDirty: uninitialized,
+		track: uninitialized,
 		link: uninitialized,
 		unlink: uninitialized,
 		propagate: uninitialized,
@@ -1004,6 +1070,9 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			}
 			if (configureOptions?.notify !== undefined) {
 				shared.hostNotify = configureOptions.notify;
+			}
+			if (configureOptions?.update !== undefined) {
+				shared.hostUpdate = configureOptions.update;
 			}
 			if (configureOptions?.seeding !== undefined) {
 				seeding = configureOptions.seeding;
@@ -1079,6 +1148,36 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		},
 		runEffect(id: number, gen: number): void {
 			ensureEngine().runEffect(id, gen);
+		},
+		custom(hostBits?: number, owner?: WeakKey): NodeId {
+			const engine = ensureEngine();
+			engine.maybeBoundary();
+			const id = engine.newCustom(hostBits ?? 0);
+			if (owner !== undefined) {
+				shared.registry!.register(owner, id);
+			}
+			return id;
+		},
+		free(id: NodeId, gen: number): void {
+			ensureEngine().free(id, gen);
+		},
+		verify(id: NodeId): boolean {
+			return ensureEngine().verify(id);
+		},
+		verified(id: NodeId): boolean {
+			return ensureEngine().verified(id);
+		},
+		beginTracking(id: NodeId): void {
+			ensureEngine().beginTracking(id);
+		},
+		endTracking(id: NodeId): void {
+			ensureEngine().endTracking(id);
+		},
+		markDirty(id: NodeId): void {
+			ensureEngine().markDirty(id);
+		},
+		track(id: NodeId): void {
+			ensureEngine().track(id);
 		},
 		link(depId: NodeId, subId: NodeId): LinkId {
 			const engine = ensureEngine();
@@ -1295,6 +1394,14 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			computedRead,
 			run,
 			runEffect,
+			newCustom,
+			free: freeNodeId,
+			verify,
+			verified,
+			beginTracking,
+			endTracking,
+			markDirty,
+			track,
 			link: linkNode,
 			unlink: unlinkEdge,
 			propagate: propagateNode,
@@ -1503,6 +1610,127 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			pendingFnClear.length = 0;
 			// Epoch and link-cycle counters keep counting: fresh records hold
 			// zeroed stamps/versions, which can never equal a live counter.
+		}
+
+		// ---- userspace-kind verbs (see ReactiveSystemOptions.update) ----------
+
+		function newCustom(hostBits: number): number {
+			if (retired) {
+				return shared.inner!.newCustom(hostBits);
+			}
+			return allocNode(C.K_CUSTOM | C.MUTABLE | (hostBits & C.HOST_MASK));
+		}
+
+		// Generic, gen-guarded free for ANY node id: the explicit-lifetime
+		// counterpart of owner-based reclamation. Effects and scopes route
+		// through their kind-correct teardown (cleanup, children).
+		function freeNodeId(id: number, gen: number): void {
+			if (retired) {
+				shared.inner!.free(id, gen);
+				return;
+			}
+			if (M[id + C.GEN] !== gen) {
+				return; // already reclaimed (and possibly reused)
+			}
+			const flags = M[id + C.FLAGS];
+			if (!(flags & C.KIND_MASK)) {
+				return; // already freed
+			}
+			if (flags & (C.K_EFFECT | C.K_SCOPE)) {
+				disposeInner(id);
+				maybeBoundary();
+				return;
+			}
+			if (flags & C.HOST_STARTED) {
+				hostStopNode(id);
+			}
+			M[id + C.FLAGS] = 0;
+			disposeAllDepsInReverse(id);
+			let sub = M[id + C.SUBS];
+			while (sub !== 0) {
+				unlink(sub);
+				sub = M[id + C.SUBS];
+			}
+			vals[id >> 2] = undefined;
+			vals[(id >> 2) + 1] = undefined;
+			fnTab[id >> 3] = undefined;
+			pendingFree.push(id);
+			shared.boundaryPending = true;
+			shared.scheduleMaintenance();
+		}
+
+		// Resolve a node's staleness without reading it: true means "you must
+		// update"; false means verified clean (PENDING cleared, and the node
+		// is stamped with the epoch captured BEFORE verification — user code
+		// run during it can only make the stamp miss, never lie).
+		function verify(id: number): boolean {
+			if (retired) {
+				return shared.inner!.verify(id);
+			}
+			const flags = M[id + C.FLAGS];
+			if (flags & C.DIRTY) {
+				return true;
+			}
+			if (!(flags & C.PENDING)) {
+				return false;
+			}
+			const entryEpoch = epoch;
+			if (checkDirty(M[id + C.DEPS], id)) {
+				return true;
+			}
+			M[id + C.FLAGS] &= ~C.PENDING;
+			D[(id >> 1) + 3] = entryEpoch;
+			return false;
+		}
+
+		/** One f64 compare: may the caller skip verification entirely? */
+		function verified(id: number): boolean {
+			return D[(id >> 1) + 3] === epoch;
+		}
+
+		// The re-track bracket (upstream's startTracking/endTracking): a
+		// custom update that reads dependencies wraps its user code in these
+		// (with setActiveSub around them) to get computed-style re-tracking.
+		function beginTracking(id: number): void {
+			if (retired) {
+				shared.inner!.beginTracking(id);
+				return;
+			}
+			++enterDepth;
+			++cycle;
+			M[id + C.DEPS_TAIL] = 0;
+			M[id + C.FLAGS] = (M[id + C.FLAGS] & ~(C.DIRTY | C.PENDING | C.RECURSED)) | C.RECURSED_CHECK;
+		}
+
+		function endTracking(id: number): void {
+			if (retired) {
+				shared.inner!.endTracking(id);
+				return;
+			}
+			M[id + C.FLAGS] &= ~C.RECURSED_CHECK;
+			purgeDeps(id);
+			--enterDepth;
+		}
+
+		/** Mark a node definitely-changed and kill its quiet-read stamp. */
+		function markDirty(id: number): void {
+			if (retired) {
+				shared.inner!.markDirty(id);
+				return;
+			}
+			M[id + C.FLAGS] |= C.DIRTY;
+			D[(id >> 1) + 3] = 0;
+		}
+
+		/** Link `id` to the active subscriber, if anything is tracking. */
+		function track(id: number): void {
+			if (retired) {
+				shared.inner!.track(id);
+				return;
+			}
+			if (activeSub !== 0) {
+				link(id, activeSub, cycle);
+			}
 		}
 
 		function freeRecordCounts(): { freeNodeRecords: number; freeLinkRecords: number } {
@@ -2088,8 +2316,23 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			if (flags & C.K_SIGNAL) {
 				return updateSignal(node);
 			}
+			if (flags & C.K_CUSTOM) {
+				return updateCustom(node, flags);
+			}
 			M[node + C.FLAGS] = (flags & C.KIND_MASK) | C.MUTABLE;
 			return true;
+		}
+
+		// Host-kind resolution (see ReactiveSystemOptions.update). Stamped
+		// with the epoch captured BEFORE the host code runs: a write from
+		// inside it moves the epoch past entryEpoch, so the stamp can only
+		// miss, never lie — the same argument computedRead makes.
+		function updateCustom(node: number, flags: number): boolean {
+			const entryEpoch = epoch;
+			M[node + C.FLAGS] = (flags & (C.KIND_MASK | C.WATCHING | C.STICKY)) | C.MUTABLE;
+			const changed = shared.hostUpdate!(node, flags);
+			D[(node >> 1) + 3] = entryEpoch;
+			return changed;
 		}
 
 		function notify(e: number): void {
@@ -2195,7 +2438,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 				unlinkChildEffects(c);
 			}
 			M[c + C.DEPS_TAIL] = 0;
-			M[c + C.FLAGS] = C.K_COMPUTED | C.MUTABLE | C.RECURSED_CHECK | (entryFlags & (C.ORPHANED | C.FN_INSTALLED | C.HOST_STARTED));
+			M[c + C.FLAGS] = C.K_COMPUTED | C.MUTABLE | C.RECURSED_CHECK | (entryFlags & (C.FN_INSTALLED | C.STICKY));
 			const prevSub = activeSub;
 			activeSub = c;
 			++enterDepth;
@@ -2224,7 +2467,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 
 		function updateSignal(s: number): boolean {
 			// Engine-internal sticky bits survive the state rewrite.
-			M[s + C.FLAGS] = C.K_SIGNAL | C.MUTABLE | (M[s + C.FLAGS] & (C.ORPHANED | C.HOST_STARTED));
+			M[s + C.FLAGS] = C.K_SIGNAL | C.MUTABLE | (M[s + C.FLAGS] & C.STICKY);
 			const v = s >> 2;
 			return vals[v] !== (vals[v] = vals[v + 1]);
 		}
@@ -2254,7 +2497,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 					}
 				}
 				M[e + C.DEPS_TAIL] = 0;
-				M[e + C.FLAGS] = C.K_EFFECT | C.WATCHING | C.RECURSED_CHECK | (M[e + C.FLAGS] & (C.ORPHANED | C.HOST_STARTED));
+				M[e + C.FLAGS] = C.K_EFFECT | C.WATCHING | C.RECURSED_CHECK | (M[e + C.FLAGS] & C.STICKY);
 				const prevSub = activeSub;
 				activeSub = e;
 				++enterDepth;
@@ -2270,7 +2513,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 					purgeDeps(e);
 				}
 			} else if (M[e + C.DEPS] !== 0) {
-				M[e + C.FLAGS] = C.K_EFFECT | C.WATCHING | (flags & (C.HAS_CHILD_EFFECT | C.ORPHANED | C.HOST_STARTED));
+				M[e + C.FLAGS] = C.K_EFFECT | C.WATCHING | (flags & (C.HAS_CHILD_EFFECT | C.STICKY));
 			}
 		}
 
@@ -2539,7 +2782,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			const p = (s >> 2) + 1;
 			if (vals[p] !== (vals[p] = value)) {
 				// Engine-internal sticky bits survive the state rewrite.
-				M[s + C.FLAGS] = C.K_SIGNAL | C.MUTABLE | C.DIRTY | (flags & (C.ORPHANED | C.HOST_STARTED));
+				M[s + C.FLAGS] = C.K_SIGNAL | C.MUTABLE | C.DIRTY | (flags & C.STICKY);
 				const subs = M[s + C.SUBS];
 				if (subs !== 0) {
 					// Stamps only exist on subscribed-or-once-subscribed
@@ -2624,7 +2867,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		// closure, not leaked.
 		function coldEvalWith(c: number, getter: (previousValue?: unknown) => unknown): void {
 			shared.registry!.register(getter, c);
-			M[c + C.FLAGS] = C.K_COMPUTED | C.MUTABLE | C.RECURSED_CHECK | (M[c + C.FLAGS] & (C.ORPHANED | C.HOST_STARTED));
+			M[c + C.FLAGS] = C.K_COMPUTED | C.MUTABLE | C.RECURSED_CHECK | (M[c + C.FLAGS] & C.STICKY);
 			const prevSub = activeSub;
 			activeSub = c;
 			++enterDepth;
@@ -2641,7 +2884,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		// computeds). Out of line: cold, and it keeps computedRead under the
 		// inline budget.
 		function coldEvalInstalled(c: number): void {
-			M[c + C.FLAGS] = C.K_COMPUTED | C.MUTABLE | C.RECURSED_CHECK | (M[c + C.FLAGS] & (C.ORPHANED | C.HOST_STARTED));
+			M[c + C.FLAGS] = C.K_COMPUTED | C.MUTABLE | C.RECURSED_CHECK | (M[c + C.FLAGS] & C.STICKY);
 			const prevSub = activeSub;
 			activeSub = c;
 			++enterDepth;
