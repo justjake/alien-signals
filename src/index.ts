@@ -515,9 +515,14 @@ export function isEffectScope(id: SignalId): boolean {
  * ```
  */
 export function signal<T>(): Signal<T | undefined>;
-export function signal<T>(initialValue: T): Signal<T>;
-export function signal<T>(initialValue?: T): Signal<T | undefined> {
-	const id = system.allocNode(Host.Signal | Flag.Mutable);
+export function signal<T>(initialValue: T, owner?: WeakKey): Signal<T>;
+export function signal<T>(initialValue?: T, owner?: WeakKey): Signal<T | undefined> {
+	// With an owner, the record frees itself when the owner is collected —
+	// the GC-managed lifetime for hosts that wrap handles in objects.
+	// Without one, the handle lives until dispose()/reset().
+	const id = owner !== undefined
+		? system.createNode(owner, Host.Signal | Flag.Mutable)
+		: system.allocNode(Host.Signal | Flag.Mutable);
 	const idx = id >> Arena.NodeIndexShift;
 	currentVals[idx] = initialValue;
 	pendingVals[idx] = initialValue;
@@ -614,10 +619,13 @@ export function set<T>(id: Signal<T>, value: T): void {
  * get(doubled); // 4
  * ```
  */
-export function computed<T>(getter: (previousValue?: T) => T): Signal<T> {
+export function computed<T>(getter: (previousValue?: T) => T, owner?: WeakKey): Signal<T> {
 	// Minted DIRTY: the first read takes the update path (upstream's cold
-	// first evaluation), against an empty subscriber list.
-	const id = system.allocNode(Host.Computed | Flag.Mutable | Flag.Dirty);
+	// first evaluation), against an empty subscriber list. `owner` as in
+	// signal(): its collection frees the record.
+	const id = owner !== undefined
+		? system.createNode(owner, Host.Computed | Flag.Mutable | Flag.Dirty)
+		: system.allocNode(Host.Computed | Flag.Mutable | Flag.Dirty);
 	fns[id >> Arena.NodeIndexShift] = getter as NodeFn;
 	return id;
 }
