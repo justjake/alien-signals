@@ -47,7 +47,7 @@ const BUDGETS: Record<string, number> = {
 	computedRead: INLINE_LIMIT, // id-level / reclaim-off entry point
 	computedReadWith: INLINE_LIMIT, // reclaim-mode handle entry point (carries the getter)
 	// scheduler
-	flush: 200,
+	flush: 280, // engine-local since the closed-engine refactor: carries the retired forwards and in-loop growth check; called, not inlined into hot walks
 };
 
 const pkgRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');

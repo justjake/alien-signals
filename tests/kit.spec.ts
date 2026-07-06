@@ -225,3 +225,57 @@ test('start/stop survive arena growth', () => {
 	stopEffect();
 	expect(events).toEqual(['start', 'stop:state']);
 });
+
+test('stop still fires after the started node was written and recomputed', () => {
+	// Regression: write/updateSignal/updateComputed/run do absolute flag
+	// stores; HOST_STARTED must survive them or the start/stop pairing
+	// silently breaks for any node that changes value while watched.
+	const events: string[] = [];
+	const sys = createReactiveSystem({
+		initialRecords: 4096,
+		start: (id, js) => {
+			events.push('start');
+			return js;
+		},
+		stop: () => {
+			events.push('stop');
+		},
+	});
+	const s = sys.makeSignal(2);
+	const c = sys.makeComputed(() => (s() as number) * 3);
+	const stop = sys.makeEffect(() => {
+		c();
+	});
+	(s as (v: number) => void)(5);
+	sys.startBatch();
+	(s as (v: number) => void)(6);
+	(s as (v: number) => void)(7);
+	sys.endBatch();
+	events.length = 0;
+	stop();
+	expect(events).toEqual(['stop', 'stop']); // computed, then signal
+});
+
+test('a watched child effect gets stop when its parent re-runs or disposes', () => {
+	const events: string[] = [];
+	const sys = createReactiveSystem({
+		initialRecords: 4096,
+		start: (id, js) => {
+			events.push(`start:${typeof js}`);
+			return js;
+		},
+		stop: (id, js) => {
+			events.push(`stop:${typeof js}`);
+		},
+	});
+	const s = sys.makeSignal(0);
+	const stopOuter = sys.makeEffect(() => {
+		s();
+		sys.makeEffect(() => {}); // child: watched via the parent link
+	});
+	expect(events.filter((e) => e.startsWith('start')).length).toBeGreaterThanOrEqual(2);
+	events.length = 0;
+	stopOuter();
+	// The child effect's stop is delivered during the dispose cascade.
+	expect(events.filter((e) => e.startsWith('stop')).length).toBeGreaterThanOrEqual(2);
+});

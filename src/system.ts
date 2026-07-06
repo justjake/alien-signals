@@ -49,15 +49,19 @@
  * Capacity is virtual until touched (large typed arrays are lazily-mapped
  * zero pages), defaults to 8M records (256 MB virtual), and the STARTING
  * size is set per system with configure({ initialRecords }) BEFORE first
- * use. KNOWN COST (measured): the first growth (or creating a SECOND
- * system in the same process) instantiates the engine closures again,
- * which permanently disables V8's function-context specialization — the
- * const-M embedding — process-wide; walk-heavy steady state then runs up
- * to ~1.9x slower. Resizable ArrayBuffers were re-measured as the
- * alternative (identity-stable M, no rebuild) and cost ~1.9-2.3x on hot
- * paths ALWAYS, so migration remains the right trade. A build-time
- * second copy of createEngine (distinct SharedFunctionInfos per growth
- * generation) is the known fix if post-growth speed becomes load-bearing. Exhausting the headroom quarter INSIDE one operation (a single
+ * use. A second instantiation of the engine literals (growth, or another
+ * system in the process) would permanently disable V8's function-context
+ * specialization — the const-M embedding — so generations after the first
+ * are compiled from String(createEngine) via new Function when the host
+ * allows codegen (see instantiateEngine): fresh function identities,
+ * fresh specialization. Measured: post-growth steady state ~1.1-1.2x
+ * (was ~1.9x unfixed; the residual is the retired-forward hop on
+ * pre-growth handles and mixed-generation call-site feedback), cloned
+ * engines alone at parity. Where CSP forbids codegen the static literal
+ * is reused and the ~1.9x cost returns — benchs/postGrowth.mjs measures
+ * both. Resizable ArrayBuffers were re-measured as the alternative
+ * (identity-stable M, no rebuild): ~1.9-2.3x on hot paths ALWAYS, so
+ * migration + clones remains the right trade. Exhausting the headroom quarter INSIDE one operation (a single
  * effect/computed body minting that many nodes mid-run) still throws: no
  * live frame may hold a retired arena. Buffers are allocated LAZILY:
  * importing the library costs nothing. Rejected growth alternatives
@@ -202,11 +206,6 @@ function normalizeRecords(n: number): number {
 	return Math.max(16, Math.ceil(n));
 }
 
-// Placeholder scratch stack shared by unmaterialized systems (walks can only
-// run once an engine exists; materialize() installs the real stacks).
-const EMPTY_I32 = new Int32Array(0);
-
-
 // Handle identity for isSignal/isComputed/isEffect/isEffectScope, at ZERO
 // creation cost. Handles are deliberately ANONYMOUS closures — any NAMED
 // closure (variable-inferred or declared) gets wrapped by esbuild keepNames
@@ -233,13 +232,6 @@ let computedSrc: string | undefined;
 let effectSrc: string | undefined;
 let scopeSrc: string | undefined;
 
-// Handle literals pass through anon() so they sit in ARGUMENT position — a
-// `const oper = <arrow>` initializer would be name-inferred and
-// keepNames-wrapped (the ~120ns/handle tax the anonymity exists to avoid).
-// anon() is an identity function; TurboFan inlines it to nothing.
-function anon<T>(f: T): T {
-	return f;
-}
 
 /** Kind of a handle produced by this module's make* factories. */
 export function handleKind(fn: unknown): HandleKind {
@@ -477,135 +469,173 @@ export type EffectScopeId = number;
 /** Id of an edge record returned by `link`; pass to `unlink`. */
 export type LinkId = number;
 
+// Seeding diversity is tracked per call-site family (see maybeSeed).
+const enum SeedFamily {
+	Getter = 0,
+	Callback = 1,
+}
+
+// ---- engine generations and codegen cloning -------------------------------
+//
+// V8 applies function-context specialization — folding a closure's captured
+// `const M` in as a machine-code constant — only while a function literal has
+// produced exactly ONE closure. The SECOND instantiation of createEngine
+// (arena growth, or another system in the same process) permanently disables
+// that for every engine compiled from the same literal. The escape hatch:
+// code compiled from NEW source text gets fresh function identities, so each
+// later generation is compiled from `String(createEngine)` via new Function
+// when the host allows it. createEngine is deliberately CLOSED — its only
+// free names are its parameters and globals — so its source is compilable
+// anywhere (tests/codegen.spec.ts pins this).
+
+/** Whether this host permits runtime code generation (CSP etc.). Detected once at import. */
+export const codegenAvailable = (() => {
+	try {
+		return (new Function('return 1') as () => number)() === 1;
+	} catch {
+		return false;
+	}
+})();
+
+let engineInstantiations = 0; // process-wide: feedback slots are per-literal
+let engineSourceText: string | undefined;
+
+function instantiateEngine(records: number, from: Int32Array | undefined, boot: EngineState, shared: EngineShared): Engine {
+	if (++engineInstantiations > 1 && codegenAvailable) {
+		// Every generation is compiled from its own source text (the trailing
+		// generation comment defeats V8's eval compilation cache), so every
+		// generation gets its own function identities — and with them its own
+		// context specialization. Falling back to the static literal is
+		// correct but pays the process-wide despecialization documented above.
+		engineSourceText ??= 'return (' + String(createEngine) + ');//gen';
+		const compile = new Function(engineSourceText + engineInstantiations) as () => typeof createEngine;
+		return compile()(records, from, boot, shared);
+	}
+	return createEngine(records, from, boot, shared);
+}
+
+/** Hot per-generation counters handed from a retiring engine to its successor. */
+interface EngineState {
+	recNext: number;
+	nodeFreeHead: number;
+	linkFreeHead: number;
+	epoch: number;
+	cycle: number;
+	batchDepth: number;
+	notifyIndex: number;
+	queuedLength: number;
+}
+
+/**
+ * State shared by every engine generation of one system, plus the factory
+ * services an engine calls back into. Everything here is either a stable
+ * array identity or a cold-path mutable slot; hot scalars live inside the
+ * engine and travel via {@link EngineState}.
+ */
+interface EngineShared {
+	values: unknown[];
+	fns: (Function | undefined)[];
+	queued: number[];
+	pendingFree: number[];
+	pendingFnClear: number[];
+	hostState: unknown[];
+	inner: Engine | undefined;
+	registry: FinalizationRegistry<number> | undefined;
+	hostNotify: ((effectId: number, gen: number) => void) | undefined;
+	hostStart: ((id: NodeId, js: unknown) => unknown) | undefined;
+	hostStop: ((id: NodeId, js: unknown, state: unknown) => void) | undefined;
+	growPending: boolean;
+	boundaryPending: boolean;
+	maybeSeed(fn: Function, family: number): void;
+	grow(): void;
+	boundaryWork(): void;
+	scheduleMaintenance(): void;
+}
+
+interface Engine extends ReactiveEngine {
+	buffer(): Int32Array;
+	computedReadWith(c: number, getter: (previousValue?: unknown) => unknown): unknown;
+	retire(): void;
+	state(): EngineState;
+	busy(): boolean;
+	flush(): void;
+	maybeBoundary(): void;
+	startBatch(): void;
+	endBatch(): void;
+	getBatchDepth(): number;
+	setActiveSub(id: number): number;
+	getActiveSub(): number;
+	resetGuard(): void;
+	resetState(): void;
+	freeRecordCounts(): { freeNodeRecords: number; freeLinkRecords: number };
+	newSignal(value: unknown): number;
+	newComputed(getter: (previousValue?: unknown) => unknown): number;
+	newEffect(fn: () => (() => void) | void): number;
+	newScope(fn: () => void): number;
+	makeSignal(initialValue: unknown): SignalHandle;
+	makeComputed(getter: (previousValue?: unknown) => unknown): () => unknown;
+	makeEffect(fn: () => (() => void) | void): () => void;
+	makeScope(fn: () => void): () => void;
+	orphan(id: number): void;
+	clearStamp(id: number): void;
+	run(e: number): void;
+	requeueAbort(e: number): void;
+	trigger(fn: () => void): void;
+	sweepPendingFree(): void;
+	sweepFnClears(): void;
+}
+
 /**
  * Create an independent reactive graph with its own arena, queues, and
  * dependency-tracking state.
  */
 export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveSystem {
-	// ---- shared mutable state (survives engine rebuilds) ----------------------
-	// Scalar heads/counters live at factory level so a rebuilt engine resumes
-	// exactly where the old one stopped; only the buffer binding lives in the
-	// engine closure.
-	let recNext = 8; // bump pointer, shared by nodes and links (record 0 burned)
-	let nodeFreeHead = 0; // free list threaded through M[id + C.DEPS]
-	let linkFreeHead = 0; // free list threaded through M[id + C.NEXT_DEP]
-	let boundaryPending = false; // pendingFree nonempty (one hot-path load)
-
-	let cycle = 0;
-	// Global write epoch (quiet-read fast path): bumped by every committed
-	// signal write and every trigger(). A computed whose verification stamp
-	// equals the current epoch is provably current — nothing anywhere has
-	// been written since it was last verified — so reads skip the flags
-	// ladder entirely. Preact/Vue 3.6/Svelte ship the same idea; upstream
-	// alien-signals does not. Split lo/hi (manual carry at 2^30) so stamps
-	// fit two i32 record slots and the whole scheme never wraps.
-	let epoch = 1;
-
-	// Invalidate every quiet-read stamp: any observed change MUST pass here
-	// (or use the inline twin in write()) or stamped computeds keep serving
-	// their cached values. A float64 epoch never wraps (2^53 writes is
-	// decades of sustained 10ns writes).
-	function bumpEpoch(): void {
-		++epoch;
-	}
-	let runDepth = 0;
-	let batchDepth = 0;
-	let notifyIndex = 0;
-	let queuedLength = 0;
-	let activeSub = 0;
-	let enterDepth = 0; // live engine frames that captured M; 0 = op boundary
-
-	const queued: number[] = [];
-	const pendingFree: number[] = []; // disposed effect/scope records awaiting sweep
-	// Computeds that lost their last subscriber and should return their
-	// borrowed getter to the owning handle. Deferred to the next operation
-	// boundary: an in-flight walk (e.g. a dispose() called from inside a
-	// getter mid-checkDirty) may still update() the node and needs its
-	// evaluator until the walk unwinds (conformance #203).
-	const pendingFnClear: number[] = [];
-
-	// Side columns, indexed off the id: values[id >> 2] = current/computed
-	// value, values[(id >> 2) + 1] = signal pending value OR effect cleanup fn,
-	// fns[id >> 3] = computed getter / effect fn. Plain arrays grown by push
-	// (stays PACKED; plain-array growth has no binding problem).
-	const values: unknown[] = [undefined, undefined];
-	const fns: (Function | undefined)[] = [undefined];
-
-	// Persistent scratch stacks (upstream's cons-cell Stack<T>). Re-entrant
-	// walks push above the caller's base and restore it on exit. Allocated by
-	// materialize() together with the arena; walks can only run once an
-	// engine (and therefore a node) exists.
-	let propStack: Int32Array = EMPTY_I32;
-	let propSp = 0;
-	let checkStack: Int32Array = EMPTY_I32;
-	let checkSp = 0;
-
-	// Growth is out of line so the walk loops stay under V8's 460-bytecode
-	// inlining budget (enforced by the bytecode budget test).
-	function growPropStack(): void {
-		const bigger = new Int32Array(propStack.length * 2);
-		bigger.set(propStack);
-		propStack = bigger;
-	}
-
-	function growCheckStack(): void {
-		const bigger = new Int32Array(checkStack.length * 2);
-		bigger.set(checkStack);
-		checkStack = bigger;
-	}
-
-	interface Engine extends ReactiveEngine {
-		buffer(): Int32Array;
-		computedReadWith(c: number, getter: (previousValue?: unknown) => unknown): unknown;
-		retire(): void;
-		newSignal(value: unknown): number;
-		newComputed(getter: (previousValue?: unknown) => unknown): number;
-		newEffect(fn: () => (() => void) | void): number;
-		newScope(fn: () => void): number;
-		makeSignal(initialValue: unknown): SignalHandle;
-		makeComputed(getter: (previousValue?: unknown) => unknown): () => unknown;
-		makeEffect(fn: () => (() => void) | void): () => void;
-		makeScope(fn: () => void): () => void;
-		orphan(id: number): void;
-		clearStamp(id: number): void;
-		run(e: number): void;
-		requeueAbort(e: number): void;
-		trigger(fn: () => void): void;
-		sweepPendingFree(): void;
-		sweepFnClears(): void;
-	}
-
 	// LAZY MATERIALIZATION: importing/creating a system allocates nothing.
 	// The arena + scratch stacks come into being at the first primitive
 	// creation, or when configure() is called — whichever happens first.
 	let configuredRecords = options?.initialRecords !== undefined
 		? normalizeRecords(options.initialRecords)
 		: DEFAULT_RECORDS;
-	// Host effect scheduler (see ReactiveSystemOptions.notify). Settable via
-	// createReactiveSystem or configure() — i.e. only before materialization,
-	// so effect scheduling cannot change shape mid-run.
-	let hostNotify = options?.notify;
 	let seeding = options?.seeding ?? 'auto';
-	let hostStart = options?.start;
-	let hostStop = options?.stop;
-	// One slot per record: the state returned by hostStart, held until
-	// hostStop. Only populated when the callbacks are configured.
-	const hostState: unknown[] = [];
-	let inner: Engine | undefined;
-	// Reclaims signal/computed records whose handles were garbage collected
-	// (upstream reclaims them implicitly: its whole graph is GC-visible).
-	// Callbacks run between tasks, so reclamation needs the event loop to
-	// turn — exactly when real applications yield. REQUIRED: this library
-	// does not ship a leaking configuration.
-	let registry: FinalizationRegistry<number>;
-	// Registration is IMMEDIATE (FinalizationRegistry.register, ~15ns): every
-	// batching scheme measured worse — a pending queue strongly retains each
-	// handle until it drains, which carries the whole batch through the
-	// nursery into premature promotion and turns the saving into major-GC
-	// debt.
+
+	// Everything engine generations share: stable array identities plus
+	// cold-path mutable slots (see EngineShared). Hot counters live inside
+	// each engine and travel between generations via EngineState.
+	//
+	// Side columns, indexed off the id: values[id >> 2] = current/computed
+	// value, values[(id >> 2) + 1] = signal pending value OR effect cleanup fn,
+	// fns[id >> 3] = computed getter / effect fn. Plain arrays grown by push
+	// (stays PACKED; plain-array growth has no binding problem). Reclamation
+	// queues (pendingFree/pendingFnClear) and the effect queue are shared so
+	// their contents survive growth. The registry is REQUIRED: dropped
+	// signal/computed handles reclaim their records through it (registration
+	// is immediate — every batching scheme measured worse), and each
+	// registry's callbacks self-disarm once replaced by reset().
+	const shared: EngineShared = {
+		values: [undefined, undefined],
+		fns: [undefined],
+		queued: [],
+		pendingFree: [],
+		pendingFnClear: [],
+		hostState: [],
+		inner: undefined,
+		registry: undefined,
+		hostNotify: options?.notify,
+		hostStart: options?.start,
+		hostStop: options?.stop,
+		growPending: false,
+		boundaryPending: false,
+		maybeSeed,
+		grow,
+		boundaryWork,
+		scheduleMaintenance,
+	};
+	const values = shared.values;
+	const fns = shared.fns;
+	const hostState = shared.hostState;
 
 	function ensureEngine(): Engine {
-		return inner !== undefined ? inner : materialize();
+		return shared.inner !== undefined ? shared.inner : materialize();
 	}
 
 	// Each registry's callback disarms itself once the registry is no longer
@@ -615,22 +645,29 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 	// node now occupies that id.
 	function mintRegistry(): FinalizationRegistry<number> {
 		const minted: FinalizationRegistry<number> = new FinalizationRegistry((id) => {
-			if (registry === minted) {
-				inner!.orphan(id);
+			if (shared.registry === minted) {
+				shared.inner!.orphan(id);
 			}
 		});
 		return minted;
 	}
 
 	function materialize(): Engine {
-		propStack = new Int32Array(4096);
-		checkStack = new Int32Array(4096);
 		if (typeof FinalizationRegistry !== 'function') {
 			throw new Error('dalien-signals requires FinalizationRegistry (ES2021): dropped signal/computed handles reclaim their records through it');
 		}
-		registry = mintRegistry();
-		const engine = createEngine(configuredRecords);
-		inner = engine;
+		shared.registry = mintRegistry();
+		const engine = instantiateEngine(configuredRecords, undefined, {
+			recNext: 8,
+			nodeFreeHead: 0,
+			linkFreeHead: 0,
+			epoch: 1,
+			cycle: 0,
+			batchDepth: 0,
+			notifyIndex: 0,
+			queuedLength: 0,
+		}, shared);
+		shared.inner = engine;
 		facade.e = engine;
 		// Sample each handle literal's source once from throwaway mints so
 		// handleKind() works without any per-mint bookkeeping. (The dummy
@@ -645,12 +682,12 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		// The boot mints above are engine-internal (noop shapes): reset the
 		// seed sampler so they cannot count as the first observed shape and
 		// make every real first getter look like diversity.
-		seedMints[SEED_GETTER] = 0;
-		seedMints[SEED_CALLBACK] = 0;
-		seedSampleAt[SEED_GETTER] = 1;
-		seedSampleAt[SEED_CALLBACK] = 1;
-		seedSrcs[SEED_GETTER] = undefined;
-		seedSrcs[SEED_CALLBACK] = undefined;
+		seedMints[SeedFamily.Getter] = 0;
+		seedMints[SeedFamily.Callback] = 0;
+		seedSampleAt[SeedFamily.Getter] = 1;
+		seedSampleAt[SeedFamily.Callback] = 1;
+		seedSrcs[SeedFamily.Getter] = undefined;
+		seedSrcs[SeedFamily.Callback] = undefined;
 		if (seeding === 'eager' && !seeded && configuredRecords >= 4096) {
 			seeded = true;
 			seedEngine();
@@ -689,12 +726,10 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 	// 10-100 recomputed nodes. benchs/phaseTransition.mjs still verifies
 	// the insurance: a second workload's shapes must not deoptimize the
 	// first's steady state.
-	// Diversity is tracked per call-site family: getters flow through the
-	// recompute/cold-eval sites, effect and scope callbacks through the run
-	// sites. A process with one getter shape AND one effect shape keeps
-	// speculation at both — each site only ever sees its own family.
-	const SEED_GETTER = 0;
-	const SEED_CALLBACK = 1;
+	// Diversity is tracked per call-site family (SeedFamily): getters flow
+	// through the recompute/cold-eval sites, effect and scope callbacks
+	// through the run sites. A process with one getter shape AND one effect
+	// shape keeps speculation at both — each site only sees its own family.
 	const seedMints = [0, 0];
 	const seedSampleAt = [1, 1]; // next mint (per family) to sample
 	const seedSrcs: (string | undefined)[] = [undefined, undefined];
@@ -719,29 +754,28 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		seeded = true;
 		// The warmup is engine-internal: its transient nodes and effect runs
 		// must not leak into host scheduling or lifecycle callbacks.
-		const savedNotify = hostNotify;
-		const savedStart = hostStart;
-		const savedStop = hostStop;
+		const savedNotify = shared.hostNotify;
+		const savedStart = shared.hostStart;
+		const savedStop = shared.hostStop;
 		// The trigger can fire inside a running effect or getter (a mint is
 		// what samples shapes): detach tracking so warmup nodes cannot link
 		// themselves into the user's graph as children of the active sub.
-		const prevSub = activeSub;
-		activeSub = 0;
-		hostNotify = undefined;
-		hostStart = undefined;
-		hostStop = undefined;
+		const prevSub = shared.inner!.setActiveSub(0);
+		shared.hostNotify = undefined;
+		shared.hostStart = undefined;
+		shared.hostStop = undefined;
 		try {
 			seedEngine();
 		} finally {
-			activeSub = prevSub;
-			hostNotify = savedNotify;
-			hostStart = savedStart;
-			hostStop = savedStop;
+			shared.inner!.setActiveSub(prevSub);
+			shared.hostNotify = savedNotify;
+			shared.hostStart = savedStart;
+			shared.hostStop = savedStop;
 		}
 	}
 
 	function seedEngine(): void {
-		const engine = inner!;
+		const engine = shared.inner!;
 		const s0 = engine.makeSignal(0);
 		const read = s0 as () => number;
 		const c1 = engine.makeComputed(() => read() + 1);
@@ -795,23 +829,21 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 	// drain only fires when a long fully-synchronous burst piles work past
 	// the caps, keeping memory bounded without taxing the common op.
 	let maintenanceScheduled = false;
-	let growPending = false; // recNext crossed the growth threshold; grow at next boundary
 
 	// Grow-by-migration: allocate an arena twice the current capacity, copy the
 	// live prefix (ids are arena-relative offsets, so every id survives
-	// verbatim), rebuild the engine over the new `const M`, and retire the old
-	// engine — its public entry points forward to the current engine, so
-	// handles minted before the growth keep working at the cost of one extra
-	// hop. All other state (side arrays, free lists, queues, epoch, registry)
-	// lives at factory scope and is shared by construction. Only runs at
-	// operation boundaries (enterDepth === 0): no live frame holds the old
-	// arena, so nothing can write through it afterwards.
+	// verbatim), build the next engine generation over the new `const M` —
+	// handing the hot counters across via prev.state() — and retire the old
+	// engine, whose public entry points forward to the current one. Handles
+	// minted before the growth keep working at one extra hop. Only runs at
+	// operation boundaries (the engine is not busy): no live frame holds the
+	// old arena, so nothing can write through it afterwards.
 	function grow(): void {
-		growPending = false;
-		const prev = inner!;
-		const next = createEngine(configuredRecords * 2, prev.buffer());
+		shared.growPending = false;
+		const prev = shared.inner!;
+		const next = instantiateEngine(configuredRecords * 2, prev.buffer(), prev.state(), shared);
 		configuredRecords *= 2;
-		inner = next;
+		shared.inner = next;
 		facade.e = next;
 		prev.retire();
 	}
@@ -825,114 +857,363 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 
 	function runMaintenance(): void {
 		maintenanceScheduled = false;
-		if (growPending && !enterDepth) {
+		const engine = shared.inner;
+		if (engine === undefined || engine.busy()) {
+			return;
+		}
+		if (shared.growPending) {
 			grow();
 		}
-		if (boundaryPending && !enterDepth) {
-			boundaryWork();
-		}
-	}
-
-	function maybeBoundary(): void {
-		if (growPending && !enterDepth) {
-			grow();
-		}
-		if (boundaryPending && !enterDepth
-			&& (pendingFree.length > 8192 || pendingFnClear.length > 8192)) {
+		if (shared.boundaryPending) {
 			boundaryWork();
 		}
 	}
 
 	function boundaryWork(): void {
-		boundaryPending = false;
+		shared.boundaryPending = false;
 		// boundaryPending is only ever raised by engine code, so `inner` is
 		// always materialized by the time this runs.
-		if (pendingFnClear.length !== 0) {
-			inner!.sweepFnClears();
+		if (shared.pendingFnClear.length !== 0) {
+			shared.inner!.sweepFnClears();
 		}
 		// Sweep only while the effect queue is empty: an un-flushed queue (e.g.
 		// a read's shallowPropagate notified an effect after the last flush) may
 		// still reference a disposed record, and freeing it here would let a new
 		// node reuse the id and be run() by the stale queue entry.
-		if (pendingFree.length !== 0) {
-			if (!queuedLength) {
-				inner!.sweepPendingFree();
+		if (shared.pendingFree.length !== 0) {
+			if (!shared.inner!.state().queuedLength) {
+				shared.inner!.sweepPendingFree();
 			} else {
-				boundaryPending = true; // retry once the queue drains
+				shared.boundaryPending = true; // retry once the queue drains
 			}
 		}
 	}
 
-	function flush(): void {
-		// Boundary-lite: record reclamation only BEFORE the flush loop, not
-		// between effects (a mid-flush sweep could recycle an id the queue
-		// still holds).
-		maybeBoundary();
-		// A flush implies queued effects, which imply a materialized engine.
-		const engine = inner!;
-		const queue = queued;
-		try {
-			while (notifyIndex < queuedLength) {
-				// Effects mint nodes; between two runs no frame holds M, so a
-				// long flush can grow here instead of risking hard exhaustion.
-				// `engine` then names a retired engine whose run() forwards.
-				if (growPending && !enterDepth) {
-					grow();
+	// ---- the public system object (stable across engine rebuilds) -------------
+	// `e` mirrors `inner` (materialize/boundaryWork reassign both) so hot call
+	// sites reach the engine with one property load; everything else is cold
+	// delegation through ensureEngine(), which materializes on first use.
+
+	// `system.e` before materialization: creation entry points materialize
+	// and delegate; id-level operations throw (ids can only come from a
+	// materialized system). Handle call sites (read/write/computedRead/
+	// dispose) only ever see the real engine's hidden class — handles
+	// post-date materialization — so their ICs stay monomorphic.
+	const bootEngine: ReactiveEngine = {
+		read: uninitialized,
+		write: uninitialized,
+		computedRead: uninitialized,
+		dispose: uninitialized,
+		runEffect: uninitialized,
+		link: uninitialized,
+		unlink: uninitialized,
+		propagate: uninitialized,
+		shallowPropagate: uninitialized,
+		makeSignal: (initialValue?: unknown) => ensureEngine().makeSignal(initialValue),
+		makeComputed: (getter: (previousValue?: unknown) => unknown) => ensureEngine().makeComputed(getter),
+		makeEffect: (fn: () => (() => void) | void) => ensureEngine().makeEffect(fn),
+		makeScope: (fn: () => void) => ensureEngine().makeScope(fn),
+	};
+
+	const facade: ReactiveSystem = {
+		e: bootEngine,
+		makeSignal(initialValue?: unknown): SignalHandle {
+			return ensureEngine().makeSignal(initialValue);
+		},
+		makeComputed(getter: (previousValue?: unknown) => unknown): () => unknown {
+			return ensureEngine().makeComputed(getter);
+		},
+		makeEffect(fn: () => (() => void) | void): () => void {
+			return ensureEngine().makeEffect(fn);
+		},
+		makeScope(fn: () => void): () => void {
+			return ensureEngine().makeScope(fn);
+		},
+		configure(configureOptions?: ReactiveSystemOptions): void {
+			if (shared.inner !== undefined) {
+				throw new Error('dalien-signals: configure() must be called before the first signal/computed/effect/effectScope is created');
+			}
+			if (configureOptions?.initialRecords !== undefined) {
+				configuredRecords = normalizeRecords(configureOptions.initialRecords);
+			}
+			if (configureOptions?.notify !== undefined) {
+				shared.hostNotify = configureOptions.notify;
+			}
+			if (configureOptions?.seeding !== undefined) {
+				seeding = configureOptions.seeding;
+			}
+			if (configureOptions?.start !== undefined) {
+				shared.hostStart = configureOptions.start;
+			}
+			if (configureOptions?.stop !== undefined) {
+				shared.hostStop = configureOptions.stop;
+			}
+			materialize();
+		},
+		reset(): void {
+			const engine = shared.inner;
+			if (engine === undefined) {
+				return; // nothing materialized, nothing to reset
+			}
+			engine.resetGuard();
+			// Bulk arena teardown: rewind the record arena and drop the whole
+			// FinalizationRegistry, so a dead generation is reclaimed by the
+			// GC as a few large objects instead of one weak cell per handle.
+			// Every handle minted before the reset is INVALID afterwards —
+			// calling one is undefined behavior (it reads whatever new node
+			// occupies its record). The engine closures (and their warmed-up
+			// JIT state) are reused; only the arena contents restart.
+			// Watched-lifecycle teardown: every started node gets its stop
+			// before the arena rewinds (newest records first, LIFO-ish). These
+			// callbacks must not touch reactive state mid-reset.
+			const M = engine.buffer();
+			for (let id = engine.state().recNext - 8; id >= 8; id -= 8) {
+				const flags = M[id + C.FLAGS];
+				if (flags & C.HOST_STARTED) {
+					const state = hostState[id >> 3];
+					hostState[id >> 3] = undefined;
+					if (shared.hostStop !== undefined) {
+						shared.hostStop(id, flags & C.K_SIGNAL ? values[id >> 2] : fns[id >> 3], state);
+					}
 				}
-				const e = queue[notifyIndex];
-				queue[notifyIndex++] = 0;
-				engine.run(e);
 			}
-		} finally {
-			while (notifyIndex < queuedLength) {
-				const e = queue[notifyIndex];
-				queue[notifyIndex++] = 0;
-				engine.requeueAbort(e);
-			}
-			notifyIndex = 0;
-			queuedLength = 0;
-		}
+			hostState.length = 0;
+			engine.resetState(); // arena fill + counters + shared queue drains
+			shared.boundaryPending = false;
+			shared.growPending = false; // capacity stays at its grown size
+			values.length = 2;
+			values[0] = undefined;
+			values[1] = undefined;
+			fns.length = 1;
+			fns[0] = undefined;
+			shared.registry = mintRegistry();
+		},
+		signal(initialValue?: unknown): number {
+			const engine = ensureEngine();
+			engine.maybeBoundary();
+			return engine.newSignal(initialValue);
+		},
+		computed(getter: (previousValue?: unknown) => unknown): number {
+			const engine = ensureEngine();
+			engine.maybeBoundary();
+			return engine.newComputed(getter);
+		},
+		effect(fn: () => (() => void) | void): number {
+			const engine = ensureEngine();
+			engine.maybeBoundary();
+			return engine.newEffect(fn);
+		},
+		effectScope(fn: () => void): number {
+			const engine = ensureEngine();
+			engine.maybeBoundary();
+			return engine.newScope(fn);
+		},
+		dispose(id: number, gen: number): void {
+			ensureEngine().dispose(id, gen);
+		},
+		runEffect(id: number, gen: number): void {
+			ensureEngine().runEffect(id, gen);
+		},
+		link(depId: NodeId, subId: NodeId): LinkId {
+			const engine = ensureEngine();
+			engine.maybeBoundary(); // link allocates a record
+			return engine.link(depId, subId);
+		},
+		unlink(linkId: LinkId): void {
+			ensureEngine().unlink(linkId);
+		},
+		propagate(id: NodeId): void {
+			ensureEngine().propagate(id);
+		},
+		shallowPropagate(id: NodeId): void {
+			ensureEngine().shallowPropagate(id);
+		},
+		gen(id: number): number {
+			return ensureEngine().buffer()[id + C.GEN];
+		},
+		signalRead(id: number): unknown {
+			return ensureEngine().read(id);
+		},
+		signalWrite(id: number, value: unknown): void {
+			ensureEngine().write(id, value);
+		},
+		computedRead(id: number): unknown {
+			// No boundary on the read path: top-level first-eval read sequences
+			// allocate well under C.REC_SLACK between the surrounding
+			// safe-points; steady-state reads allocate nothing.
+			return ensureEngine().computedRead(id);
+		},
+		trigger(fn: () => void): void {
+			const engine = ensureEngine();
+			engine.maybeBoundary();
+			engine.trigger(fn);
+		},
+		// Batch and tracking state lives in the engine; opening a batch
+		// materializes (batches exist to hold writes, writes need an arena).
+		startBatch(): void {
+			ensureEngine().startBatch();
+		},
+		endBatch(): void {
+			ensureEngine().endBatch();
+		},
+		getBatchDepth(): number {
+			return shared.inner === undefined ? 0 : shared.inner.getBatchDepth();
+		},
+		getActiveSub(): number {
+			return shared.inner === undefined ? 0 : shared.inner.getActiveSub();
+		},
+		setActiveSub(id: number): number {
+			return ensureEngine().setActiveSub(id);
+		},
+		nodeFlags(id: number): number {
+			return ensureEngine().buffer()[id + C.FLAGS];
+		},
+		setNodeFlags(id: number, flags: number): void {
+			const engine = ensureEngine();
+			const M = engine.buffer();
+			M[id + C.FLAGS] = (M[id + C.FLAGS] & ~C.PUBLIC_MASK) | (flags & C.PUBLIC_MASK);
+			engine.clearStamp(id);
+		},
+		buffer(): Int32Array {
+			return ensureEngine().buffer();
+		},
+		stats() {
+			const engine = ensureEngine();
+			const { freeNodeRecords, freeLinkRecords } = engine.freeRecordCounts();
+			return {
+				capacityRecords: engine.buffer().length / 8,
+				allocatedRecords: (engine.state().recNext - 8) / 8,
+				freeNodeRecords,
+				freeLinkRecords,
+				pendingFreeRecords: shared.pendingFree.length,
+				pendingRegistrations: 0,
+				seeded,
+			};
+		},
+	};
+	return facade;
+}
+
+// ---- the engine (one generation over one arena; a CLOSED function) --------
+// createEngine's only free names are its parameters and globals: engine
+// generations after the first are compiled from String(createEngine) (see
+// instantiateEngine), and eval'd code can see nothing else. Hot counters are
+// plain locals — each generation is a single closure of its own compilation,
+// so V8 folds them (and `const M`) into the optimized code as constants.
+
+function createEngine(records: number, from: Int32Array | undefined, boot: EngineState, shared: EngineShared): Engine {
+	const M = new Int32Array(records * 8);
+	// Float64 view over the same plane for the one-slot epoch stamps.
+	const D = new Float64Array(M.buffer);
+	if (from !== undefined) {
+		// Growth migration: ids are arena-relative offsets, so copying the
+		// live prefix preserves every id, edge, generation, and stamp.
+		M.set(from.subarray(0, boot.recNext));
+	}
+	// Ask for growth once the bump pointer passes 3/4 of the arena
+	// (records * 8 slots * 3/4). The remaining quarter is headroom for
+	// allocations made mid-operation, where growing is unsafe.
+	const growAt = records * 6;
+
+	// Hot per-generation counters, handed off through boot/state().
+	let recNext = boot.recNext; // bump pointer, nodes and links (record 0 burned)
+	let nodeFreeHead = boot.nodeFreeHead; // free list threaded through M[id + C.DEPS]
+	let linkFreeHead = boot.linkFreeHead; // free list threaded through M[id + C.NEXT_DEP]
+	// Global write epoch (quiet-read fast path): bumped by every committed
+	// signal write and every trigger(). A computed whose verification stamp
+	// equals the current epoch is provably current — nothing anywhere has
+	// been written since it was last verified — so reads skip the flags
+	// ladder entirely. One float64 (2^53 never wraps).
+	let epoch = boot.epoch;
+	let cycle = boot.cycle;
+	let batchDepth = boot.batchDepth;
+	let notifyIndex = boot.notifyIndex;
+	let queuedLength = boot.queuedLength;
+	// Always neutral at a generation boundary:
+	let activeSub = 0;
+	let runDepth = 0;
+	let enterDepth = 0; // live engine frames that captured M; 0 = op boundary
+
+	function snapshot(): EngineState {
+		return { recNext, nodeFreeHead, linkFreeHead, epoch, cycle, batchDepth, notifyIndex, queuedLength };
 	}
 
-	// ---- the engine (rebuilt on growth; M is closure-const) -------------------
+	// Invalidate every quiet-read stamp: any observed change MUST pass here
+	// (or use the inline twin in write()) or stamped computeds keep serving
+	// their cached values.
+	function bumpEpoch(): void {
+		++epoch;
+	}
 
-	function createEngine(records: number, from?: Int32Array): Engine {
-		const M = new Int32Array(records * 8);
-		// Float64 view over the same plane for the one-slot epoch stamps.
-		const D = new Float64Array(M.buffer);
-		if (from !== undefined) {
-			// Growth migration: ids are arena-relative offsets, so copying the
-			// live prefix preserves every id, edge, generation, and stamp.
-			M.set(from.subarray(0, recNext));
-		}
-		// Ask for growth once the bump pointer passes 3/4 of the arena
-		// (records * 8 slots * 3/4). The remaining quarter is headroom for
-		// allocations made mid-operation, where growing is unsafe.
-		const growAt = records * 6;
-		// A retired engine's public entry points forward to the factory's
-		// current `inner`: handles minted before a growth keep working at one
-		// extra hop. Set at most once, at an operation boundary. Zeroing the
-		// old arena makes every quiet-read stamp miss (a zeroed stamp can
-		// never equal the live epoch: epochHi starts at 1 and only grows), so
-		// computedRead/computedReadWith keep their stamp-hit fast paths
-		// guard-free and check `retired` only in the slow tail.
-		let retired = false;
-		function retire(): void {
-			retired = true;
-			M.fill(0, 0, recNext);
-		}
-		// Function-scope aliases for the factory-level side arrays: esbuild
-		// bundling demotes module/factory-scope `const` to mutable `var` only at
-		// module scope; these locals fold via the same one-closure-cell context
-		// specialization that embeds M.
-		const vals = values;
-		const fnTab = fns;
-		const queue = queued;
+	// Persistent scratch stacks (upstream's cons-cell Stack<T>). Re-entrant
+	// walks push above the caller's base and restore it on exit. Walks never
+	// span a generation boundary, so each generation gets fresh stacks.
+	let propStack = new Int32Array(4096);
+	let propSp = 0;
+	let checkStack = new Int32Array(4096);
+	let checkSp = 0;
 
-		return {
-			buffer: () => M,
-			computedReadWith,
-			retire,
+	// Stack growth is out of line so the walk loops stay under V8's
+	// 460-bytecode inlining budget (enforced by the bytecode budget test).
+	function growPropStack(): void {
+		const bigger = new Int32Array(propStack.length * 2);
+		bigger.set(propStack);
+		propStack = bigger;
+	}
+
+	function growCheckStack(): void {
+		const bigger = new Int32Array(checkStack.length * 2);
+		bigger.set(checkStack);
+		checkStack = bigger;
+	}
+
+	// A retired engine's public entry points forward to shared.inner (the
+	// current generation): handles minted before a growth keep working at one
+	// extra hop. Set at most once, at an operation boundary. Zeroing the
+	// old arena makes every quiet-read stamp miss (a zeroed stamp can
+	// never equal the live epoch, which starts at 1 and only grows), so
+	// computedRead/computedReadWith keep their stamp-hit fast paths
+	// guard-free and check `retired` only in the slow tail.
+	let retired = false;
+	function retire(): void {
+		retired = true;
+		M.fill(0, 0, recNext);
+	}
+
+	// Handle literals pass through anon() so they sit in ARGUMENT position —
+	// a `const oper = <arrow>` initializer would be name-inferred and
+	// keepNames-wrapped (the ~120ns/handle tax anonymity exists to avoid).
+	// Identity function; TurboFan inlines it to nothing. Lives inside the
+	// engine so the closed-function property holds.
+	function anon<T>(f: T): T {
+		return f;
+	}
+
+	// Local aliases for the shared side arrays (stable identities): one load
+	// at construction, then context-specialized constants in the hot paths.
+	const vals = shared.values;
+	const fnTab = shared.fns;
+	const queue = shared.queued;
+	const pendingFree = shared.pendingFree;
+	const pendingFnClear = shared.pendingFnClear;
+	const hostState = shared.hostState;
+
+	return {
+		buffer: () => M,
+		computedReadWith,
+		retire,
+		state: snapshot,
+		busy,
+		flush,
+		maybeBoundary,
+		startBatch,
+		endBatch,
+		getBatchDepth,
+		setActiveSub,
+		getActiveSub,
+		resetGuard,
+		resetState,
+		freeRecordCounts,
 			newSignal,
 			newComputed,
 			newEffect,
@@ -971,7 +1252,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		function makeSignal(initialValue: unknown): SignalHandle {
 			maybeBoundary(); // may grow, retiring this engine
 			if (retired) {
-				return inner!.makeSignal(initialValue);
+				return shared.inner!.makeSignal(initialValue);
 			}
 			const id = newSignal(initialValue);
 			const oper = anon(((...value: [unknown?]): unknown => {
@@ -981,8 +1262,8 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 					return read(id);
 				}
 			}) as SignalHandle);
-			if (registry !== undefined) {
-				registry.register(oper, id);
+			if (shared.registry !== undefined) {
+				shared.registry.register(oper, id);
 			}
 			return oper;
 		}
@@ -994,10 +1275,10 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		// -> handle), making the FinalizationRegistry unable to ever fire —
 		// upstream has no such anchor because its whole graph is GC-traceable.
 		function makeComputed(getter: (previousValue?: unknown) => unknown): () => unknown {
-			maybeSeed(getter, SEED_GETTER);
+			shared.maybeSeed(getter, SeedFamily.Getter);
 			maybeBoundary(); // may grow, retiring this engine
 			if (retired) {
-				return inner!.makeComputed(getter);
+				return shared.inner!.makeComputed(getter);
 			}
 			const id = allocNode(C.K_COMPUTED);
 			// Registration is deferred to the first evaluation (see
@@ -1010,10 +1291,10 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		}
 
 		function makeEffect(fn: () => (() => void) | void): () => void {
-			maybeSeed(fn, SEED_CALLBACK);
+			shared.maybeSeed(fn, SeedFamily.Callback);
 			maybeBoundary(); // may grow, retiring this engine
 			if (retired) {
-				return inner!.makeEffect(fn);
+				return shared.inner!.makeEffect(fn);
 			}
 			const id = newEffect(fn);
 			const gen = M[id + C.GEN];
@@ -1023,10 +1304,10 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		}
 
 		function makeScope(fn: () => void): () => void {
-			maybeSeed(fn, SEED_CALLBACK);
+			shared.maybeSeed(fn, SeedFamily.Callback);
 			maybeBoundary(); // may grow, retiring this engine
 			if (retired) {
-				return inner!.makeScope(fn);
+				return shared.inner!.makeScope(fn);
 			}
 			const id = newScope(fn);
 			const gen = M[id + C.GEN];
@@ -1040,6 +1321,136 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 
 		// ---- allocation --------------------------------------------------------
 
+		function busy(): boolean {
+			return enterDepth !== 0;
+		}
+
+		function startBatch(): void {
+			if (retired) {
+				shared.inner!.startBatch();
+				return;
+			}
+			++batchDepth;
+		}
+
+		function endBatch(): void {
+			if (retired) {
+				shared.inner!.endBatch();
+				return;
+			}
+			if (!--batchDepth) {
+				flush();
+			}
+		}
+
+		function getBatchDepth(): number {
+			return retired ? shared.inner!.getBatchDepth() : batchDepth;
+		}
+
+		function setActiveSub(id: number): number {
+			if (retired) {
+				return shared.inner!.setActiveSub(id);
+			}
+			const prev = activeSub;
+			activeSub = id;
+			return prev;
+		}
+
+		function getActiveSub(): number {
+			return retired ? shared.inner!.getActiveSub() : activeSub;
+		}
+
+		// May grow — retiring THIS engine — so mint paths re-check `retired`
+		// right after calling it.
+		function maybeBoundary(): void {
+			if (enterDepth !== 0) {
+				return;
+			}
+			if (shared.growPending) {
+				shared.grow();
+			}
+			if (shared.boundaryPending
+				&& (pendingFree.length > 8192 || pendingFnClear.length > 8192)) {
+				shared.boundaryWork();
+			}
+		}
+
+		function flush(): void {
+			if (retired) {
+				shared.inner!.flush();
+				return;
+			}
+			// Boundary-lite: record reclamation only BEFORE the flush loop, not
+			// between effects (a mid-flush sweep could recycle an id the queue
+			// still holds).
+			maybeBoundary();
+			if (retired) {
+				// maybeBoundary grew: the successor inherited the queue indices.
+				shared.inner!.flush();
+				return;
+			}
+			try {
+				while (notifyIndex < queuedLength) {
+					// Effects mint nodes; between two runs no frame holds M, so
+					// a long flush can grow here instead of risking hard
+					// exhaustion. The successor inherits the queue indices.
+					if (shared.growPending && !enterDepth) {
+						shared.grow();
+						if (retired) {
+							shared.inner!.flush();
+							return;
+						}
+					}
+					const e = queue[notifyIndex];
+					queue[notifyIndex++] = 0;
+					run(e);
+				}
+			} finally {
+				while (notifyIndex < queuedLength) {
+					const e = queue[notifyIndex];
+					queue[notifyIndex++] = 0;
+					requeueAbort(e);
+				}
+				notifyIndex = 0;
+				queuedLength = 0;
+			}
+		}
+
+		function resetGuard(): void {
+			if (enterDepth !== 0 || activeSub !== 0 || batchDepth !== 0 || runDepth !== 0) {
+				throw new Error('dalien-signals: reset() called during an active operation (inside an effect, computed, batch, or trigger)');
+			}
+		}
+
+		// Bulk arena teardown (see ReactiveSystem.reset): rewind the arena and
+		// this generation's counters. The factory handles the side columns,
+		// the registry, and host-lifecycle stops.
+		function resetState(): void {
+			M.fill(0, 0, recNext);
+			recNext = 8;
+			nodeFreeHead = 0;
+			linkFreeHead = 0;
+			notifyIndex = 0;
+			queuedLength = 0;
+			queue.length = 0;
+			pendingFree.length = 0;
+			pendingFnClear.length = 0;
+			// Epoch and link-cycle counters keep counting: fresh records hold
+			// zeroed stamps/versions, which can never equal a live counter.
+		}
+
+		function freeRecordCounts(): { freeNodeRecords: number; freeLinkRecords: number } {
+			let freeNodeRecords = 0;
+			for (let id = nodeFreeHead; id !== 0; id = M[id + C.DEPS]) {
+				++freeNodeRecords;
+			}
+			let freeLinkRecords = 0;
+			for (let id = linkFreeHead; id !== 0; id = M[id + C.FREE_NEXT]) {
+				++freeLinkRecords;
+			}
+			return { freeNodeRecords, freeLinkRecords };
+		}
+
 		function allocNode(flags: number): number {
 			let id: number;
 			if (nodeFreeHead !== 0) {
@@ -1052,9 +1463,9 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 					throw new Error('dalien-signals: record arena exhausted inside one operation (growth runs between operations); configure({ initialRecords }) with more capacity');
 				}
 				recNext = id + 8;
-				if (recNext > growAt && !growPending) {
-					growPending = true;
-					scheduleMaintenance();
+				if (recNext > growAt && !shared.growPending) {
+					shared.growPending = true;
+					shared.scheduleMaintenance();
 				}
 				// Size the side columns for a fresh record only (recycled ids
 				// are already inside the sized region). push keeps the arrays
@@ -1088,7 +1499,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 
 		function sweepPendingFree(): void {
 			if (retired) {
-				inner!.sweepPendingFree();
+				shared.inner!.sweepPendingFree();
 				return;
 			}
 			for (let i = 0; i < pendingFree.length; ++i) {
@@ -1103,7 +1514,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		// re-installed on its next tracked read).
 		function sweepFnClears(): void {
 			if (retired) {
-				inner!.sweepFnClears();
+				shared.inner!.sweepFnClears();
 				return;
 			}
 			for (let i = 0; i < pendingFnClear.length; ++i) {
@@ -1131,9 +1542,9 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 					throw new Error('dalien-signals: record arena exhausted inside one operation (growth runs between operations); configure({ initialRecords }) with more capacity');
 				}
 				recNext = id + 8;
-				if (recNext > growAt && !growPending) {
-					growPending = true;
-					scheduleMaintenance();
+				if (recNext > growAt && !shared.growPending) {
+					shared.growPending = true;
+					shared.scheduleMaintenance();
 				}
 			}
 			return id;
@@ -1191,7 +1602,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 				M[dep + C.SUBS] = newLink;
 				// First subscriber: watched-lifecycle start (out of the common
 				// re-subscribe path; one context compare on first-link only).
-				if (hostStart !== undefined) {
+				if (shared.hostStart !== undefined) {
 					hostStartNode(dep);
 				}
 			}
@@ -1234,7 +1645,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		// re-track exactly like read-discovered edges (upstream parity).
 		function linkNode(dep: number, sub: number): number {
 			if (retired) {
-				return inner!.link(dep, sub);
+				return shared.inner!.link(dep, sub);
 			}
 			const prevDep = M[sub + C.DEPS_TAIL];
 			if (prevDep !== 0 && M[prevDep + C.DEP] === dep) {
@@ -1254,7 +1665,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 
 		function unlinkEdge(linkId: number): void {
 			if (retired) {
-				inner!.unlink(linkId);
+				shared.inner!.unlink(linkId);
 				return;
 			}
 			unlink(linkId);
@@ -1262,7 +1673,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 
 		function propagateNode(id: number): void {
 			if (retired) {
-				inner!.propagate(id);
+				shared.inner!.propagate(id);
 				return;
 			}
 			const subs = M[id + C.SUBS];
@@ -1277,7 +1688,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 
 		function shallowPropagateNode(id: number): void {
 			if (retired) {
-				inner!.shallowPropagate(id);
+				shared.inner!.shallowPropagate(id);
 				return;
 			}
 			const subs = M[id + C.SUBS];
@@ -1300,7 +1711,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 				return;
 			}
 			M[id + C.FLAGS] = flags | C.HOST_STARTED;
-			hostState[id >> 3] = hostStart!(
+			hostState[id >> 3] = shared.hostStart!(
 				id,
 				flags & C.K_SIGNAL ? vals[id >> 2] : fnTab[id >> 3],
 			);
@@ -1311,8 +1722,8 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			M[id + C.FLAGS] = flags;
 			const state = hostState[id >> 3];
 			hostState[id >> 3] = undefined;
-			if (hostStop !== undefined) {
-				hostStop(id, flags & C.K_SIGNAL ? vals[id >> 2] : fnTab[id >> 3], state);
+			if (shared.hostStop !== undefined) {
+				shared.hostStop(id, flags & C.K_SIGNAL ? vals[id >> 2] : fnTab[id >> 3], state);
 			}
 		}
 
@@ -1643,7 +2054,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			// Host scheduler: hand over the ordered segment instead of keeping
 			// it queued. Out of line to keep notify (called from the propagate
 			// ladder) inside its bytecode budget.
-			if (hostNotify !== undefined) {
+			if (shared.hostNotify !== undefined) {
 				notifyHost(firstInsertedIndex);
 			}
 		}
@@ -1651,7 +2062,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		// The flags bookkeeping notify already did (WATCHING cleared) is the
 		// same dedup the built-in queue relies on; run() restores it.
 		function notifyHost(first: number): void {
-			const host = hostNotify!;
+			const host = shared.hostNotify!;
 			for (let i = first; i < queuedLength; ++i) {
 				const id = queue[i];
 				queue[i] = 0;
@@ -1680,8 +2091,8 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 						// Schedule the borrowed getter's return to its owning
 						// handle (boundary-deferred; see pendingFnClear).
 						pendingFnClear.push(node);
-						boundaryPending = true;
-						scheduleMaintenance();
+						shared.boundaryPending = true;
+						shared.scheduleMaintenance();
 					}
 					if (M[node + C.DEPS_TAIL] !== 0) {
 						M[node + C.FLAGS] = C.K_COMPUTED | C.MUTABLE | C.DIRTY | (flags & C.FN_INSTALLED);
@@ -1718,7 +2129,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 				unlinkChildEffects(c);
 			}
 			M[c + C.DEPS_TAIL] = 0;
-			M[c + C.FLAGS] = C.K_COMPUTED | C.MUTABLE | C.RECURSED_CHECK | (entryFlags & (C.ORPHANED | C.FN_INSTALLED));
+			M[c + C.FLAGS] = C.K_COMPUTED | C.MUTABLE | C.RECURSED_CHECK | (entryFlags & (C.ORPHANED | C.FN_INSTALLED | C.HOST_STARTED));
 			const prevSub = activeSub;
 			activeSub = c;
 			++enterDepth;
@@ -1746,7 +2157,8 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		}
 
 		function updateSignal(s: number): boolean {
-			M[s + C.FLAGS] = C.K_SIGNAL | C.MUTABLE;
+			// Engine-internal sticky bits survive the state rewrite.
+			M[s + C.FLAGS] = C.K_SIGNAL | C.MUTABLE | (M[s + C.FLAGS] & (C.ORPHANED | C.HOST_STARTED));
 			const v = s >> 2;
 			return vals[v] !== (vals[v] = vals[v + 1]);
 		}
@@ -1757,7 +2169,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			// as before) or a retired engine's zeroed arena (forward).
 			if (!(flags & C.KIND_MASK)) {
 				if (retired) {
-					inner!.run(e);
+					shared.inner!.run(e);
 				}
 				return;
 			}
@@ -1776,7 +2188,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 					}
 				}
 				M[e + C.DEPS_TAIL] = 0;
-				M[e + C.FLAGS] = C.K_EFFECT | C.WATCHING | C.RECURSED_CHECK;
+				M[e + C.FLAGS] = C.K_EFFECT | C.WATCHING | C.RECURSED_CHECK | (M[e + C.FLAGS] & (C.ORPHANED | C.HOST_STARTED));
 				const prevSub = activeSub;
 				activeSub = e;
 				++enterDepth;
@@ -1792,7 +2204,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 					purgeDeps(e);
 				}
 			} else if (M[e + C.DEPS] !== 0) {
-				M[e + C.FLAGS] = C.K_EFFECT | C.WATCHING | (flags & C.HAS_CHILD_EFFECT);
+				M[e + C.FLAGS] = C.K_EFFECT | C.WATCHING | (flags & (C.HAS_CHILD_EFFECT | C.ORPHANED | C.HOST_STARTED));
 			}
 		}
 
@@ -1804,7 +2216,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		function runEffect(e: number, gen: number): void {
 			maybeBoundary(); // growth-safe point between host-scheduled runs
 			if (retired) {
-				inner!.runEffect(e, gen);
+				shared.inner!.runEffect(e, gen);
 				return;
 			}
 			if (M[e + C.GEN] !== gen) {
@@ -1817,7 +2229,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			if (M[e + C.FLAGS] & C.KIND_MASK) {
 				M[e + C.FLAGS] |= C.WATCHING | C.RECURSED;
 			} else if (retired) {
-				inner!.requeueAbort(e);
+				shared.inner!.requeueAbort(e);
 			}
 		}
 
@@ -1844,6 +2256,9 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			if (!(flags & C.KIND_MASK)) {
 				return; // already disposed
 			}
+			if (flags & C.HOST_STARTED) {
+				hostStopNode(e); // a watched child effect: stop before teardown
+			}
 			M[e + C.FLAGS] = 0;
 			disposeAllDepsInReverse(e);
 			const sub = M[e + C.SUBS];
@@ -1864,13 +2279,13 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			// hold this id; the record is swept back onto the free list at the
 			// next operation boundary.
 			pendingFree.push(e);
-			boundaryPending = true;
-			scheduleMaintenance();
+			shared.boundaryPending = true;
+			shared.scheduleMaintenance();
 		}
 
 		function dispose(e: number, gen: number): void {
 			if (retired) {
-				inner!.dispose(e, gen);
+				shared.inner!.dispose(e, gen);
 				return;
 			}
 			if (M[e + C.GEN] !== gen) {
@@ -1891,7 +2306,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		// setNodeFlags may mark Dirty/Pending without a write).
 		function clearStamp(id: number): void {
 			if (retired) {
-				inner!.clearStamp(id);
+				shared.inner!.clearStamp(id);
 				return;
 			}
 			D[(id >> 1) + 3] = 0;
@@ -1904,7 +2319,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		// frees signal/computed records, so the id cannot be stale here.
 		function orphan(id: number): void {
 			if (retired) {
-				inner!.orphan(id);
+				shared.inner!.orphan(id);
 				return;
 			}
 			const flags = M[id + C.FLAGS];
@@ -1925,8 +2340,8 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			M[id + C.FLAGS] = 0;
 			disposeAllDepsInReverse(id);
 			pendingFree.push(id);
-			boundaryPending = true;
-			scheduleMaintenance();
+			shared.boundaryPending = true;
+			shared.scheduleMaintenance();
 		}
 
 		function disposeAllDepsInReverse(sub: number): void {
@@ -1950,7 +2365,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 
 		function newSignal(value: unknown): number {
 			if (retired) {
-				return inner!.newSignal(value);
+				return shared.inner!.newSignal(value);
 			}
 			const id = allocNode(C.K_SIGNAL | C.MUTABLE);
 			const v = id >> 2;
@@ -1961,9 +2376,9 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 
 		function newComputed(getter: (previousValue?: unknown) => unknown): number {
 			if (retired) {
-				return inner!.newComputed(getter);
+				return shared.inner!.newComputed(getter);
 			}
-			maybeSeed(getter, SEED_GETTER);
+			shared.maybeSeed(getter, SeedFamily.Getter);
 			const id = allocNode(C.K_COMPUTED);
 			fnTab[id >> 3] = getter;
 			return id;
@@ -1971,9 +2386,9 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 
 		function newEffect(fn: () => (() => void) | void): number {
 			if (retired) {
-				return inner!.newEffect(fn);
+				return shared.inner!.newEffect(fn);
 			}
-			maybeSeed(fn, SEED_CALLBACK);
+			shared.maybeSeed(fn, SeedFamily.Callback);
 			const e = allocNode(C.K_EFFECT | C.WATCHING | C.RECURSED_CHECK);
 			fnTab[e >> 3] = fn;
 			const prevSub = activeSub;
@@ -1997,9 +2412,9 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 
 		function newScope(fn: () => void): number {
 			if (retired) {
-				return inner!.newScope(fn);
+				return shared.inner!.newScope(fn);
 			}
-			maybeSeed(fn, SEED_CALLBACK);
+			shared.maybeSeed(fn, SeedFamily.Callback);
 			const e = allocNode(C.K_SCOPE | C.MUTABLE);
 			const prevSub = activeSub;
 			activeSub = e;
@@ -2025,7 +2440,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			const flags = M[s + C.FLAGS];
 			if (!(flags & C.K_SIGNAL)) {
 				if (retired) {
-					return inner!.read(s);
+					return shared.inner!.read(s);
 				}
 				return vals[s >> 2]; // freed record: contract-violating read, kept harmless
 			}
@@ -2048,15 +2463,17 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		function write(s: number, value: unknown): void {
 			// Same kind-bit piggyback as read(): the staging store below must
 			// not run for a retired engine (vals is the shared current truth).
-			if (!(M[s + C.FLAGS] & C.K_SIGNAL)) {
+			const flags = M[s + C.FLAGS];
+			if (!(flags & C.K_SIGNAL)) {
 				if (retired) {
-					inner!.write(s, value);
+					shared.inner!.write(s, value);
 				}
 				return; // freed record: contract-violating write, dropped
 			}
 			const p = (s >> 2) + 1;
 			if (vals[p] !== (vals[p] = value)) {
-				M[s + C.FLAGS] = C.K_SIGNAL | C.MUTABLE | C.DIRTY;
+				// Engine-internal sticky bits survive the state rewrite.
+				M[s + C.FLAGS] = C.K_SIGNAL | C.MUTABLE | C.DIRTY | (flags & (C.ORPHANED | C.HOST_STARTED));
 				const subs = M[s + C.SUBS];
 				if (subs !== 0) {
 					// Stamps only exist on subscribed-or-once-subscribed
@@ -2084,7 +2501,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			// Guard-free fast path above: a retired engine's arena is zeroed,
 			// so its stamps can never hit and every call lands here.
 			if (retired) {
-				return inner!.computedRead(c);
+				return shared.inner!.computedRead(c);
 			}
 			// Stamp with the epoch captured BEFORE the body: if user code run
 			// during verification writes a signal (bumping the epoch), the
@@ -2140,8 +2557,8 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		// with it; that memory is still reachable from the caller's own
 		// closure, not leaked.
 		function coldEvalWith(c: number, getter: (previousValue?: unknown) => unknown): void {
-			registry.register(getter, c);
-			M[c + C.FLAGS] = C.K_COMPUTED | C.MUTABLE | C.RECURSED_CHECK;
+			shared.registry!.register(getter, c);
+			M[c + C.FLAGS] = C.K_COMPUTED | C.MUTABLE | C.RECURSED_CHECK | (M[c + C.FLAGS] & (C.ORPHANED | C.HOST_STARTED));
 			const prevSub = activeSub;
 			activeSub = c;
 			++enterDepth;
@@ -2158,7 +2575,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		// computeds). Out of line: cold, and it keeps computedRead under the
 		// inline budget.
 		function coldEvalInstalled(c: number): void {
-			M[c + C.FLAGS] = C.K_COMPUTED | C.MUTABLE | C.RECURSED_CHECK;
+			M[c + C.FLAGS] = C.K_COMPUTED | C.MUTABLE | C.RECURSED_CHECK | (M[c + C.FLAGS] & (C.ORPHANED | C.HOST_STARTED));
 			const prevSub = activeSub;
 			activeSub = c;
 			++enterDepth;
@@ -2194,7 +2611,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			// Guard-free fast path above: a retired engine's arena is zeroed,
 			// so its stamps can never hit and every call lands here.
 			if (retired) {
-				return inner!.computedReadWith(c, getter);
+				return shared.inner!.computedReadWith(c, getter);
 			}
 			const entryEpoch = epoch;
 			const flags = M[c + C.FLAGS];
@@ -2242,7 +2659,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		// is reclaimed at the next boundary.
 		function trigger(fn: () => void): void {
 			if (retired) {
-				inner!.trigger(fn);
+				shared.inner!.trigger(fn);
 				return;
 			}
 			const sub = allocNode(C.WATCHING | C.RECURSED_CHECK);
@@ -2267,8 +2684,8 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 					}
 				}
 				pendingFree.push(sub);
-				boundaryPending = true;
-				scheduleMaintenance();
+				shared.boundaryPending = true;
+				shared.scheduleMaintenance();
 				--enterDepth;
 				if (!--batchDepth) {
 					flush();
@@ -2277,227 +2694,4 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		}
 	}
 
-	// ---- the public system object (stable across engine rebuilds) -------------
-	// `e` mirrors `inner` (materialize/boundaryWork reassign both) so hot call
-	// sites reach the engine with one property load; everything else is cold
-	// delegation through ensureEngine(), which materializes on first use.
 
-	// `system.e` before materialization: creation entry points materialize
-	// and delegate; id-level operations throw (ids can only come from a
-	// materialized system). Handle call sites (read/write/computedRead/
-	// dispose) only ever see the real engine's hidden class — handles
-	// post-date materialization — so their ICs stay monomorphic.
-	const bootEngine: ReactiveEngine = {
-		read: uninitialized,
-		write: uninitialized,
-		computedRead: uninitialized,
-		dispose: uninitialized,
-		runEffect: uninitialized,
-		link: uninitialized,
-		unlink: uninitialized,
-		propagate: uninitialized,
-		shallowPropagate: uninitialized,
-		makeSignal: (initialValue?: unknown) => ensureEngine().makeSignal(initialValue),
-		makeComputed: (getter: (previousValue?: unknown) => unknown) => ensureEngine().makeComputed(getter),
-		makeEffect: (fn: () => (() => void) | void) => ensureEngine().makeEffect(fn),
-		makeScope: (fn: () => void) => ensureEngine().makeScope(fn),
-	};
-
-	const facade: ReactiveSystem = {
-		e: bootEngine,
-		makeSignal(initialValue?: unknown): SignalHandle {
-			return ensureEngine().makeSignal(initialValue);
-		},
-		makeComputed(getter: (previousValue?: unknown) => unknown): () => unknown {
-			return ensureEngine().makeComputed(getter);
-		},
-		makeEffect(fn: () => (() => void) | void): () => void {
-			return ensureEngine().makeEffect(fn);
-		},
-		makeScope(fn: () => void): () => void {
-			return ensureEngine().makeScope(fn);
-		},
-		configure(configureOptions?: ReactiveSystemOptions): void {
-			if (inner !== undefined) {
-				throw new Error('dalien-signals: configure() must be called before the first signal/computed/effect/effectScope is created');
-			}
-			if (configureOptions?.initialRecords !== undefined) {
-				configuredRecords = normalizeRecords(configureOptions.initialRecords);
-			}
-			if (configureOptions?.notify !== undefined) {
-				hostNotify = configureOptions.notify;
-			}
-			if (configureOptions?.seeding !== undefined) {
-				seeding = configureOptions.seeding;
-			}
-			if (configureOptions?.start !== undefined) {
-				hostStart = configureOptions.start;
-			}
-			if (configureOptions?.stop !== undefined) {
-				hostStop = configureOptions.stop;
-			}
-			materialize();
-		},
-		reset(): void {
-			if (inner === undefined) {
-				return; // nothing materialized, nothing to reset
-			}
-			if (enterDepth !== 0 || activeSub !== 0 || batchDepth !== 0 || runDepth !== 0) {
-				throw new Error('dalien-signals: reset() called during an active operation (inside an effect, computed, batch, or trigger)');
-			}
-			// Bulk arena teardown: rewind the record arena and drop the whole
-			// FinalizationRegistry, so a dead generation is reclaimed by the
-			// GC as a few large objects instead of one weak cell per handle.
-			// Every handle minted before the reset is INVALID afterwards —
-			// calling one is undefined behavior (it reads whatever new node
-			// occupies its record). The engine closures (and their warmed-up
-			// JIT state) are reused; only the arena contents restart.
-			// Watched-lifecycle teardown: every started node gets its stop
-			// before the arena rewinds (newest records first, LIFO-ish). These
-			// callbacks must not touch reactive state mid-reset.
-			const M = inner.buffer();
-			for (let id = recNext - 8; id >= 8; id -= 8) {
-				const flags = M[id + C.FLAGS];
-				if (flags & C.HOST_STARTED) {
-					const state = hostState[id >> 3];
-					hostState[id >> 3] = undefined;
-					if (hostStop !== undefined) {
-						hostStop(id, flags & C.K_SIGNAL ? values[id >> 2] : fns[id >> 3], state);
-					}
-				}
-			}
-			hostState.length = 0;
-			M.fill(0, 0, recNext);
-			recNext = 8;
-			nodeFreeHead = 0;
-			linkFreeHead = 0;
-			boundaryPending = false;
-			growPending = false; // capacity stays at its grown size
-			notifyIndex = 0;
-			queuedLength = 0;
-			queued.length = 0;
-			pendingFree.length = 0;
-			pendingFnClear.length = 0;
-			values.length = 2;
-			values[0] = undefined;
-			values[1] = undefined;
-			fns.length = 1;
-			fns[0] = undefined;
-			// Epoch and link-cycle counters keep counting: fresh records hold
-			// zeroed stamps/versions, which can never equal a live counter.
-			registry = mintRegistry();
-		},
-		signal(initialValue?: unknown): number {
-			const engine = ensureEngine();
-			maybeBoundary();
-			return engine.newSignal(initialValue);
-		},
-		computed(getter: (previousValue?: unknown) => unknown): number {
-			const engine = ensureEngine();
-			maybeBoundary();
-			return engine.newComputed(getter);
-		},
-		effect(fn: () => (() => void) | void): number {
-			const engine = ensureEngine();
-			maybeBoundary();
-			return engine.newEffect(fn);
-		},
-		effectScope(fn: () => void): number {
-			const engine = ensureEngine();
-			maybeBoundary();
-			return engine.newScope(fn);
-		},
-		dispose(id: number, gen: number): void {
-			ensureEngine().dispose(id, gen);
-		},
-		runEffect(id: number, gen: number): void {
-			ensureEngine().runEffect(id, gen);
-		},
-		link(depId: NodeId, subId: NodeId): LinkId {
-			const engine = ensureEngine();
-			maybeBoundary(); // link allocates a record
-			return engine.link(depId, subId);
-		},
-		unlink(linkId: LinkId): void {
-			ensureEngine().unlink(linkId);
-		},
-		propagate(id: NodeId): void {
-			ensureEngine().propagate(id);
-		},
-		shallowPropagate(id: NodeId): void {
-			ensureEngine().shallowPropagate(id);
-		},
-		gen(id: number): number {
-			return ensureEngine().buffer()[id + C.GEN];
-		},
-		signalRead(id: number): unknown {
-			return ensureEngine().read(id);
-		},
-		signalWrite(id: number, value: unknown): void {
-			ensureEngine().write(id, value);
-		},
-		computedRead(id: number): unknown {
-			// No boundary on the read path: top-level first-eval read sequences
-			// allocate well under C.REC_SLACK between the surrounding
-			// safe-points; steady-state reads allocate nothing.
-			return ensureEngine().computedRead(id);
-		},
-		trigger(fn: () => void): void {
-			const engine = ensureEngine();
-			maybeBoundary();
-			engine.trigger(fn);
-		},
-		startBatch(): void {
-			++batchDepth;
-		},
-		endBatch(): void {
-			if (!--batchDepth) {
-				flush();
-			}
-		},
-		getBatchDepth(): number {
-			return batchDepth;
-		},
-		getActiveSub(): number {
-			return activeSub;
-		},
-		setActiveSub(id: number): number {
-			const prev = activeSub;
-			activeSub = id;
-			return prev;
-		},
-		nodeFlags(id: number): number {
-			return ensureEngine().buffer()[id + C.FLAGS];
-		},
-		setNodeFlags(id: number, flags: number): void {
-			const engine = ensureEngine();
-			const M = engine.buffer();
-			M[id + C.FLAGS] = (M[id + C.FLAGS] & ~C.PUBLIC_MASK) | (flags & C.PUBLIC_MASK);
-			engine.clearStamp(id);
-		},
-		buffer(): Int32Array {
-			return ensureEngine().buffer();
-		},
-		stats() {
-			const M = ensureEngine().buffer();
-			let freeNodeRecords = 0;
-			for (let id = nodeFreeHead; id !== 0; id = M[id + C.DEPS]) {
-				++freeNodeRecords;
-			}
-			let freeLinkRecords = 0;
-			for (let id = linkFreeHead; id !== 0; id = M[id + C.FREE_NEXT]) {
-				++freeLinkRecords;
-			}
-			return {
-				capacityRecords: M.length / 8,
-				allocatedRecords: (recNext - 8) / 8,
-				freeNodeRecords,
-				freeLinkRecords,
-				pendingFreeRecords: pendingFree.length,
-				pendingRegistrations: 0,
-				seeded,
-			};
-		},
-	};
-	return facade;
-}
