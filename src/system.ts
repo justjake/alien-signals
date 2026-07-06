@@ -398,17 +398,22 @@ export interface ReactiveSystem {
 	 * alive (a handle closure, a state object). Grows the arena first when
 	 * it is running out of space. `hostBits` seeds the node's flags word as
 	 * in arena.allocNode.
+	 *
+	 * There is deliberately no owner -> id lookup here: keeping one costs a
+	 * WeakMap write and a tokened registry entry per mint (measured ~10x on
+	 * creation-heavy workloads). Hold the id (disposers close over it), or
+	 * keep your own map.
 	 */
 	createNode(owner: WeakKey, hostBits?: number): SignalId;
 	/**
-	 * Free a node made by createNode, by its owner or by its id. The owner
-	 * form also cancels the garbage-collection watch, and is gen-guarded by
-	 * the generation captured at createNode. The id form is gen-guarded
-	 * when `gen` is given; without it the record's CURRENT generation is
-	 * used — only omit it for an id you know is live. Unknown owners, stale
-	 * generations, and already-freed nodes are harmless no-ops.
+	 * Free a node made by createNode. Gen-guarded when `gen` is given;
+	 * without it the record's CURRENT generation is used — only omit it for
+	 * an id you know is live. Stale generations and already-freed nodes are
+	 * harmless no-ops. (The garbage-collection watch on the owner is NOT
+	 * cancelled; when it eventually fires, the generation guard makes it a
+	 * no-op.)
 	 */
-	disposeNode(node: WeakKey | SignalId, gen?: SignalGen): void;
+	disposeNode(id: SignalId, gen?: SignalGen): void;
 	/**
 	 * The node's current generation (memory[id + NodeSlot.Gen]): capture at
 	 * mint and compare before acting on a stored id — a mismatch means the
@@ -748,12 +753,6 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 	// minted before the growth keep working at one extra hop. Only runs at
 	// operation boundaries (the engine is not busy): no live frame holds the
 	// old arena, so nothing can write through it afterwards.
-	// Owner -> (id, gen) for disposeNode(owner); the stored gen makes the
-	// owner form safe even if the record was manually freed and reused in
-	// the meantime. Replaced at reset() with the registry (post-reset owners
-	// must not free the new generation's records).
-	let ownerIds = new WeakMap<WeakKey, [SignalId, SignalGen]>();
-
 	const allocatedCallbacks: Array<(arena: ReactiveArena) => void> = [];
 	if (options?.allocated !== undefined) {
 		allocatedCallbacks.push(options.allocated);
@@ -871,32 +870,17 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 			shared.boundaryPending = false;
 			shared.growPending = false; // capacity stays at its grown size
 			shared.registry = mintRegistry();
-			ownerIds = new WeakMap();
 		},
 		createNode(owner: WeakKey, hostBits?: number): SignalId {
 			const engine = shared.inner!;
 			engine.maybeBoundary();
 			const id = engine.allocNode(hostBits ?? 0);
-			ownerIds.set(owner, [id, engine.memory[id + NodeSlot.Gen]]);
-			shared.registry!.register(owner, id, owner);
+			shared.registry!.register(owner, id);
 			return id;
 		},
-		disposeNode(node: WeakKey | SignalId, gen?: SignalGen): void {
+		disposeNode(id: SignalId, gen?: SignalGen): void {
 			const engine = shared.inner!;
-			let id: SignalId;
-			if (typeof node === 'number') {
-				id = node;
-				gen ??= engine.memory[id + NodeSlot.Gen];
-			} else {
-				const mapped = ownerIds.get(node);
-				if (mapped === undefined) {
-					return; // not an owner we know (or already disposed)
-				}
-				[id, gen] = mapped;
-				ownerIds.delete(node);
-				shared.registry!.unregister(node);
-			}
-			engine.freeNode(id, gen);
+			engine.freeNode(id, gen ?? engine.memory[id + NodeSlot.Gen]);
 		},
 		generationOf(id: SignalId): SignalGen {
 			return shared.inner!.memory[id + NodeSlot.Gen];
