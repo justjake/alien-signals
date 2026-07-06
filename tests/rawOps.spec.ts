@@ -52,21 +52,21 @@ test('propagate marks downstream pending and notifies watchers', () => {
 	const { link, propagate, checkDirty } = sys.arena;
 	link(src, watcher, 1);
 	M[src + NodeSlot.Flags] |= ReactiveFlags.Dirty;
-	propagate(M[src + NodeSlot.Subs] as LinkId, false);
+	propagate(M[src + NodeSlot.Subs], false);
 	expect(notified).toEqual([watcher]);
 	// dedup: Watching cleared until re-armed
 	M[src + NodeSlot.Flags] |= ReactiveFlags.Dirty;
-	propagate(M[src + NodeSlot.Subs] as LinkId, false);
+	propagate(M[src + NodeSlot.Subs], false);
 	expect(notified).toEqual([watcher]);
 	// The host "runs" the watcher: resolving its staleness through the
 	// update seam clears the pending state, then re-arming Watching makes
 	// it notifiable again (an already-pending watcher is deliberately not
 	// re-notified).
-	checkDirty(M[watcher + NodeSlot.Deps] as LinkId, watcher);
+	checkDirty(M[watcher + NodeSlot.Deps], watcher);
 	M[watcher + NodeSlot.Flags] &= ~(ReactiveFlags.Dirty | ReactiveFlags.Pending);
 	M[watcher + NodeSlot.Flags] |= ReactiveFlags.Watching;
 	M[src + NodeSlot.Flags] |= ReactiveFlags.Dirty;
-	propagate(M[src + NodeSlot.Subs] as LinkId, false);
+	propagate(M[src + NodeSlot.Subs], false);
 	expect(notified).toEqual([watcher, watcher]);
 });
 
@@ -89,9 +89,9 @@ test('checkDirty resolves staleness through the update seam', () => {
 	const { link, propagate, checkDirty } = sys.arena;
 	link(src, mid, 1);
 	M[src + NodeSlot.Flags] |= ReactiveFlags.Dirty;
-	propagate(M[src + NodeSlot.Subs] as LinkId, false);
+	propagate(M[src + NodeSlot.Subs], false);
 	expect(M[mid + NodeSlot.Flags] & ReactiveFlags.Pending).not.toBe(0);
-	expect(checkDirty(M[mid + NodeSlot.Deps] as LinkId, mid)).toBe(true);
+	expect(checkDirty(M[mid + NodeSlot.Deps], mid)).toBe(true);
 	expect(updated).toEqual([src]);
 });
 

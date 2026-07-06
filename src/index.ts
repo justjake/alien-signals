@@ -82,7 +82,7 @@ let runDepth = 0;
 let batchDepth = 0;
 let notifyIndex = 0;
 let queuedLength = 0;
-let activeSub: SignalId = 0 as SignalId;
+let activeSub: SignalId = 0;
 /** The tracking-pass counter (upstream's `cycle`): link versions. */
 let cycle = 0;
 /**
@@ -152,17 +152,17 @@ const system = createReactiveSystem({
 		while (true) {
 			queued[insertIndex] = e;
 			queuedGens[insertIndex++] = eGen;
-			const subsLink = M[e + NodeSlot.Subs] as LinkId;
+			const subsLink = M[e + NodeSlot.Subs];
 			if (!subsLink) {
 				break;
 			}
-			e = M[subsLink + LinkSlot.Sub] as SignalId;
+			e = M[subsLink + LinkSlot.Sub];
 			const flags = M[e + NodeSlot.Flags];
 			if (!(flags & Flag.Watching)) {
 				break;
 			}
 			M[e + NodeSlot.Flags] = flags & ~Flag.Watching;
-			eGen = M[e + NodeSlot.Gen] as SignalGen;
+			eGen = M[e + NodeSlot.Gen];
 		}
 		queuedLength = insertIndex;
 		while (firstInsertedIndex < --insertIndex) {
@@ -236,7 +236,7 @@ function run(id: SignalId, st: EffectState): void {
 		flags & Flag.Dirty
 		|| (
 			flags & Flag.Pending
-			&& checkDirty(M[id + NodeSlot.Deps] as LinkId, id)
+			&& checkDirty(M[id + NodeSlot.Deps], id)
 		)
 	) {
 		if (flags & Host.HasChildEffect) {
@@ -275,7 +275,7 @@ function flush(): void {
 		while (notifyIndex < queuedLength) {
 			const id = queued[notifyIndex];
 			const gen = queuedGens[notifyIndex];
-			queued[notifyIndex++] = 0 as SignalId;
+			queued[notifyIndex++] = 0;
 			if (M[id + NodeSlot.Gen] === gen) {
 				const st = nodes[id >> Arena.NodeIndexShift] as EffectState | undefined;
 				if (st !== undefined) {
@@ -290,7 +290,7 @@ function flush(): void {
 		while (notifyIndex < queuedLength) {
 			const id = queued[notifyIndex];
 			const gen = queuedGens[notifyIndex];
-			queued[notifyIndex++] = 0 as SignalId;
+			queued[notifyIndex++] = 0;
 			if (M[id + NodeSlot.Gen] === gen && nodes[id >> Arena.NodeIndexShift] !== undefined) {
 				M[id + NodeSlot.Flags] |= Flag.Watching | Flag.Recursed;
 			}
@@ -306,7 +306,7 @@ function runCleanup(st: EffectState): void {
 	const cleanup = st.cleanup as () => void;
 	st.cleanup = undefined;
 	const prevSub = activeSub;
-	activeSub = 0 as SignalId;
+	activeSub = 0;
 	++M[SysSlot.EnterDepth];
 	try {
 		cleanup();
@@ -321,9 +321,9 @@ function runCleanup(st: EffectState): void {
 // unwatched(), which disposes it. Values and computeds in the walk are left
 // alone.
 function disposeChildEffects(sub: SignalId): void {
-	let l = M[sub + NodeSlot.DepsTail] as LinkId;
+	let l = M[sub + NodeSlot.DepsTail];
 	while (l !== 0) {
-		const prev = M[l + LinkSlot.PrevDep] as LinkId;
+		const prev = M[l + LinkSlot.PrevDep];
 		if ((M[M[l + LinkSlot.Dep] + NodeSlot.Flags] & Host.KindMask) >= Host.Effect) {
 			unlink(l, sub);
 		}
@@ -332,9 +332,9 @@ function disposeChildEffects(sub: SignalId): void {
 }
 
 function disposeAllDepsInReverse(sub: SignalId): void {
-	let l = M[sub + NodeSlot.DepsTail] as LinkId;
+	let l = M[sub + NodeSlot.DepsTail];
 	while (l !== 0) {
-		const prev = M[l + LinkSlot.PrevDep] as LinkId;
+		const prev = M[l + LinkSlot.PrevDep];
 		unlink(l, sub);
 		l = prev;
 	}
@@ -343,8 +343,8 @@ function disposeAllDepsInReverse(sub: SignalId): void {
 // Drop the dependency edges a tracking pass did not re-establish (upstream's
 // purgeDeps): everything after the pass's depsTail ages out.
 function purgeDeps(sub: SignalId): void {
-	const depsTail = M[sub + NodeSlot.DepsTail] as LinkId;
-	let l = depsTail !== 0 ? (M[depsTail + LinkSlot.NextDep] as LinkId) : (M[sub + NodeSlot.Deps] as LinkId);
+	const depsTail = M[sub + NodeSlot.DepsTail];
+	let l = depsTail !== 0 ? M[depsTail + LinkSlot.NextDep] : M[sub + NodeSlot.Deps];
 	while (l !== 0) {
 		l = unlink(l, sub);
 	}
@@ -365,7 +365,7 @@ function disposeEffect(id: SignalId): void {
 		return; // already disposed
 	}
 	nodes[id >> Arena.NodeIndexShift] = undefined;
-	system.free(id, M[id + NodeSlot.Gen] as SignalGen);
+	system.free(id, M[id + NodeSlot.Gen]);
 	if (st.cleanup) {
 		runCleanup(st);
 	}
@@ -419,7 +419,7 @@ export function getActiveSub(): SignalId {
  */
 export function setActiveSub(sub?: SignalId): SignalId {
 	const prev = activeSub;
-	activeSub = sub !== undefined ? sub : (0 as SignalId);
+	activeSub = sub !== undefined ? sub : 0;
 	return prev;
 }
 
@@ -545,7 +545,7 @@ export function signal<T>(initialValue?: T): {
 				M[id + NodeSlot.Flags] = (M[id + NodeSlot.Flags] & Host.Hidden) | Flag.Mutable | Flag.Dirty;
 				// Every committed write invalidates the version snapshots.
 				++globalVersion;
-				const subs = M[id + NodeSlot.Subs] as LinkId;
+				const subs = M[id + NodeSlot.Subs];
 				if (subs !== 0) {
 					propagate(subs, runDepth !== 0);
 					if (!batchDepth) {
@@ -558,7 +558,7 @@ export function signal<T>(initialValue?: T): {
 			if (flags & Flag.Dirty) {
 				// Commit-on-read: a staged write inside an open batch.
 				if (updateSignal(id, flags, st)) {
-					const subs = M[id + NodeSlot.Subs] as LinkId;
+					const subs = M[id + NodeSlot.Subs];
 					if (subs !== 0) {
 						shallowPropagate(subs);
 					}
@@ -604,16 +604,16 @@ export function computed<T>(getter: (previousValue?: T) => T): () => T {
 		const flags = M[id + NodeSlot.Flags];
 		if (flags & Flag.Dirty) {
 			if (updateComputed(id, st, flags)) {
-				const subs = M[id + NodeSlot.Subs] as LinkId;
+				const subs = M[id + NodeSlot.Subs];
 				if (subs !== 0) {
 					shallowPropagate(subs);
 				}
 			}
 		} else if (flags & Flag.Pending) {
 			const entryVersion = globalVersion;
-			if (checkDirty(M[id + NodeSlot.Deps] as LinkId, id)) {
+			if (checkDirty(M[id + NodeSlot.Deps], id)) {
 				if (updateComputed(id, st, M[id + NodeSlot.Flags])) {
-					const subs = M[id + NodeSlot.Subs] as LinkId;
+					const subs = M[id + NodeSlot.Subs];
 					if (subs !== 0) {
 						shallowPropagate(subs);
 					}
@@ -657,7 +657,7 @@ export function effect(fn: () => void | (() => void)): () => void {
 	// graph — they run until stopped.
 	const st = new EffectState(fn);
 	const id = system.createReactiveNode(st, Host.Effect | Flag.Watching | Flag.RecursedCheck);
-	const gen = M[id + NodeSlot.Gen] as SignalGen;
+	const gen = M[id + NodeSlot.Gen];
 	nodes[id >> Arena.NodeIndexShift] = st;
 	const prevSub = activeSub;
 	activeSub = id;
@@ -703,7 +703,7 @@ export function effect(fn: () => void | (() => void)): () => void {
 export function effectScope(fn: () => void): () => void {
 	const st = new EffectState(fn as () => void);
 	const id = system.createReactiveNode(st, Host.Scope | Flag.Mutable);
-	const gen = M[id + NodeSlot.Gen] as SignalGen;
+	const gen = M[id + NodeSlot.Gen];
 	nodes[id >> Arena.NodeIndexShift] = st;
 	const prevSub = activeSub;
 	activeSub = id;
@@ -734,7 +734,7 @@ function noopEffectBody(): void {}
 // default system, so the id stays valid), and Watching|RecursedCheck
 // together keep the propagation ladder from ever notifying it. A reentrant
 // trigger — rare — falls back to a throwaway node.
-let triggerScratch: SignalId = 0 as SignalId;
+let triggerScratch: SignalId = 0;
 let triggerScratchBusy = false;
 
 /**
@@ -772,11 +772,11 @@ export function trigger(fn: () => void): void {
 		activeSub = prevSub;
 		M[id + NodeSlot.Flags] &= Host.Hidden;
 		++globalVersion;
-		let l = M[id + NodeSlot.Deps] as LinkId;
+		let l = M[id + NodeSlot.Deps];
 		while (l !== 0) {
-			const dep = M[l + LinkSlot.Dep] as SignalId;
+			const dep = M[l + LinkSlot.Dep];
 			l = unlink(l, id);
-			const subs = M[dep + NodeSlot.Subs] as LinkId;
+			const subs = M[dep + NodeSlot.Subs];
 			if (subs !== 0) {
 				propagate(subs, runDepth !== 0);
 				shallowPropagate(subs);
@@ -787,7 +787,7 @@ export function trigger(fn: () => void): void {
 			triggerScratchBusy = false;
 		} else {
 			nodes[id >> Arena.NodeIndexShift] = undefined;
-			system.free(id, M[id + NodeSlot.Gen] as SignalGen);
+			system.free(id, M[id + NodeSlot.Gen]);
 		}
 		if (!--batchDepth) {
 			flush();

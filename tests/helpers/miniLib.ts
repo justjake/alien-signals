@@ -16,7 +16,7 @@ export function makeMiniLib(options?: Omit<ReactiveSystemOptions, 'update' | 'no
 	const nodes: any[] = [];
 	const queue: Array<[SignalId, SignalGen]> = [];
 	const notified: number[] = [];
-	let activeSub: SignalId = 0 as SignalId;
+	let activeSub: SignalId = 0;
 	let batchDepth = 0;
 	let cycle = 0;
 	let globalVersion = 1;
@@ -46,9 +46,9 @@ export function makeMiniLib(options?: Omit<ReactiveSystemOptions, 'update' | 'no
 			if ((M[id + NodeSlot.Flags] & KIND) === COMP) {
 				M[id + NodeSlot.Flags] = (M[id + NodeSlot.Flags] & HIDDEN) | Flag.Mutable | Flag.Dirty;
 				D[(id >> Arena.VersionShift) + Arena.VersionOffset] = 0;
-				let l = M[id + NodeSlot.DepsTail] as LinkId;
+				let l = M[id + NodeSlot.DepsTail];
 				while (l !== 0) {
-					const prev = M[l + LinkSlot.PrevDep] as LinkId;
+					const prev = M[l + LinkSlot.PrevDep];
 					unlink(l, id);
 					l = prev;
 				}
@@ -75,8 +75,8 @@ export function makeMiniLib(options?: Omit<ReactiveSystemOptions, 'update' | 'no
 	});
 
 	function purgeDeps(sub: SignalId): void {
-		const depsTail = M[sub + NodeSlot.DepsTail] as LinkId;
-		let l: LinkId = depsTail !== 0 ? (M[depsTail + LinkSlot.NextDep] as LinkId) : (M[sub + NodeSlot.Deps] as LinkId);
+		const depsTail = M[sub + NodeSlot.DepsTail];
+		let l: LinkId = depsTail !== 0 ? M[depsTail + LinkSlot.NextDep] : M[sub + NodeSlot.Deps];
 		while (l !== 0) {
 			l = unlink(l, sub);
 		}
@@ -120,7 +120,7 @@ export function makeMiniLib(options?: Omit<ReactiveSystemOptions, 'update' | 'no
 					continue;
 				}
 				const flags = M[id + NodeSlot.Flags];
-				if (flags & Flag.Dirty || (flags & Flag.Pending && checkDirty(M[id + NodeSlot.Deps] as LinkId, id))) {
+				if (flags & Flag.Dirty || (flags & Flag.Pending && checkDirty(M[id + NodeSlot.Deps], id))) {
 					st.cleanup?.();
 					st.cleanup = undefined;
 					M[id + NodeSlot.DepsTail] = 0;
@@ -164,7 +164,7 @@ export function makeMiniLib(options?: Omit<ReactiveSystemOptions, 'update' | 'no
 				if (st.pending !== (st.pending = a[0] as T)) {
 					M[id + NodeSlot.Flags] = (M[id + NodeSlot.Flags] & HIDDEN) | Flag.Mutable | Flag.Dirty;
 					++globalVersion;
-					const subs = M[id + NodeSlot.Subs] as LinkId;
+					const subs = M[id + NodeSlot.Subs];
 					if (subs !== 0) {
 						propagate(subs, false);
 						if (!batchDepth) {
@@ -177,7 +177,7 @@ export function makeMiniLib(options?: Omit<ReactiveSystemOptions, 'update' | 'no
 				if (flags & Flag.Dirty) {
 					M[id + NodeSlot.Flags] = (flags & HIDDEN) | Flag.Mutable;
 					if (st.current !== (st.current = st.pending)) {
-						const subs = M[id + NodeSlot.Subs] as LinkId;
+						const subs = M[id + NodeSlot.Subs];
 						if (subs !== 0) {
 							shallowPropagate(subs);
 						}
@@ -202,16 +202,16 @@ export function makeMiniLib(options?: Omit<ReactiveSystemOptions, 'update' | 'no
 				const flags = M[id + NodeSlot.Flags];
 				if (flags & Flag.Dirty) {
 					if (recompute(id, st)) {
-						const subs = M[id + NodeSlot.Subs] as LinkId;
+						const subs = M[id + NodeSlot.Subs];
 						if (subs !== 0) {
 							shallowPropagate(subs);
 						}
 					}
 				} else if (flags & Flag.Pending) {
 					const entryVersion = globalVersion;
-					if (checkDirty(M[id + NodeSlot.Deps] as LinkId, id)) {
+					if (checkDirty(M[id + NodeSlot.Deps], id)) {
 						if (recompute(id, st)) {
-							const subs = M[id + NodeSlot.Subs] as LinkId;
+							const subs = M[id + NodeSlot.Subs];
 							if (subs !== 0) {
 								shallowPropagate(subs);
 							}
@@ -236,7 +236,7 @@ export function makeMiniLib(options?: Omit<ReactiveSystemOptions, 'update' | 'no
 	function effect(fn: () => void | (() => void)): () => void {
 		const st = { fn, cleanup: undefined as (() => void) | void };
 		const id = sys.createReactiveNode(st, EFF | Flag.Watching | Flag.RecursedCheck);
-		const gen = M[id + NodeSlot.Gen] as SignalGen;
+		const gen = M[id + NodeSlot.Gen];
 		nodes[id >> Arena.NodeIndexShift] = st;
 		const prevSub = activeSub;
 		activeSub = id;

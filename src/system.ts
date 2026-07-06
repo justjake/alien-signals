@@ -484,19 +484,17 @@ export interface ReactiveSystemOptions {
 	allocated?: (arena: ReactiveArena) => void;
 }
 
-// Branded number types: a SignalId is not a LinkId is not a generation, and
-// the compiler enforces it. Values read back out of the arena are plain
-// numbers — cast at the read site, which doubles as documentation of what
-// the slot holds.
-declare const SignalIdBrand: unique symbol;
+// Branded number types, deliberately LENIENT: any plain number is
+// assignable to them (arena reads need no casts — `const dep: SignalId =
+// M[l + LinkSlot.Dep]` just works), but the brands are mutually exclusive,
+// so a SignalId handed where a LinkId belongs is still a compile error.
+declare const IdOf: unique symbol;
 /** A node record's id: its starting slot offset in the arena (record * 8). */
-export type SignalId = number & { readonly [SignalIdBrand]: true };
-declare const LinkIdBrand: unique symbol;
+export type SignalId = number & { [IdOf]?: 'signal' };
 /** An edge record's id, returned by `link`; pass to `unlink`. */
-export type LinkId = number & { readonly [LinkIdBrand]: true };
-declare const SignalGenBrand: unique symbol;
+export type LinkId = number & { [IdOf]?: 'link' };
 /** A node record's generation; stale (id, gen) pairs are harmless no-ops. */
-export type SignalGen = number & { readonly [SignalGenBrand]: true };
+export type SignalGen = number & { [IdOf]?: 'generation' };
 
 
 // ---- engine generations and codegen cloning -------------------------------
@@ -565,7 +563,7 @@ function cloneWorks(): boolean {
 		const M = probe.memory;
 		M[a + NodeSlot.Flags] |= Flag.Dirty;
 		probe.propagate(edge, false);
-		return probe.checkDirty(M[b + NodeSlot.Deps] as LinkId, b) === true;
+		return probe.checkDirty(M[b + NodeSlot.Deps], b) === true;
 	} catch {
 		return false;
 	}
@@ -846,7 +844,7 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 					const state = hostState[id >> Arena.NodeIndexShift];
 					hostState[id >> Arena.NodeIndexShift] = undefined;
 					if (shared.hostUnwatched !== undefined) {
-						shared.hostUnwatched(id as SignalId, state);
+						shared.hostUnwatched(id, state);
 					}
 				}
 			}
@@ -867,7 +865,7 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 			shared.inner!.free(id, gen);
 		},
 		gen(id: SignalId): SignalGen {
-			return shared.inner!.memory[id + NodeSlot.Gen] as SignalGen;
+			return shared.inner!.memory[id + NodeSlot.Gen];
 		},
 		stats() {
 			const engine = shared.inner!;
@@ -1030,7 +1028,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			// nature (MUTABLE for value nodes so walks update them and waves
 			// traverse them; WATCHING for effect-likes so notify fires;
 			// neither for wave-opaque bookkeeping nodes).
-			return allocNode(hostBits & (Flag.HostMask | Flag.PublicMask)) as SignalId;
+			return allocNode(hostBits & (Flag.HostMask | Flag.PublicMask));
 		}
 
 		// Generic, gen-guarded free for ANY node id: the explicit-lifetime
@@ -1038,7 +1036,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		// through their kind-correct teardown (cleanup, children).
 		function freeNodeId(id: number, gen: number): void {
 			if (retired) {
-				shared.inner!.free(id as SignalId, gen as SignalGen);
+				shared.inner!.free(id, gen);
 				return;
 			}
 			if (M[id + NodeSlot.Gen] !== gen) {
@@ -1147,18 +1145,18 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		function link(dep: number, sub: number, version: number): LinkId {
 			const prevDep = M[sub + NodeSlot.DepsTail];
 			if (prevDep !== 0 && M[prevDep + LinkSlot.Dep] === dep) {
-				return prevDep as LinkId;
+				return prevDep;
 			}
 			const nextDep = prevDep !== 0 ? M[prevDep + LinkSlot.NextDep] : M[sub + NodeSlot.Deps];
 			if (nextDep !== 0 && M[nextDep + LinkSlot.Dep] === dep) {
 				M[nextDep + LinkSlot.Version] = version;
 				M[sub + NodeSlot.DepsTail] = nextDep;
-				return nextDep as LinkId;
+				return nextDep;
 			}
 			linkInsert(dep, sub, version, prevDep, nextDep);
 			// Insert and its dedup fast path both leave the edge as the
 			// dep's subscriber tail.
-			return M[dep + NodeSlot.SubsTail] as LinkId;
+			return M[dep + NodeSlot.SubsTail];
 		}
 
 		// Insertion tail of link(): kept out of line so the steady-state
@@ -1225,7 +1223,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			} else if (!(M[dep + NodeSlot.Subs] = nextSub)) {
 				unwatched(dep);
 			}
-			return nextDep as LinkId;
+			return nextDep;
 		}
 
 		// ---- watched lifecycle (ReactiveSystemOptions.start/stop) -------------
@@ -1239,7 +1237,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			}
 			M[id + NodeSlot.Flags] = flags | Flag.HostStarted;
 			const hostWatched = shared.hostWatched;
-			hostState[id >> Arena.NodeIndexShift] = hostWatched !== undefined ? hostWatched(id as SignalId) : undefined;
+			hostState[id >> Arena.NodeIndexShift] = hostWatched !== undefined ? hostWatched(id) : undefined;
 		}
 
 		function hostUnwatchedNode(id: number): void {
@@ -1248,7 +1246,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			const state = hostState[id >> Arena.NodeIndexShift];
 			hostState[id >> Arena.NodeIndexShift] = undefined;
 			if (shared.hostUnwatched !== undefined) {
-				shared.hostUnwatched(id as SignalId, state);
+				shared.hostUnwatched(id, state);
 			}
 		}
 
@@ -1549,7 +1547,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			const flags = M[node + NodeSlot.Flags];
 			const hostUpdate = shared.hostUpdate;
 			if (hostUpdate !== undefined) {
-				return hostUpdate(node as SignalId, flags);
+				return hostUpdate(node, flags);
 			}
 			M[node + NodeSlot.Flags] = flags & ~(Flag.Dirty | Flag.Pending);
 			return true;
@@ -1562,7 +1560,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			M[e + NodeSlot.Flags] &= ~Flag.Watching;
 			const hostNotify = shared.hostNotify;
 			if (hostNotify !== undefined) {
-				hostNotify(e as SignalId, M[e + NodeSlot.Gen] as SignalGen);
+				hostNotify(e, M[e + NodeSlot.Gen]);
 			}
 		}
 
