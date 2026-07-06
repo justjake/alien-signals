@@ -26,7 +26,7 @@ test('createReactiveSystem honors initialRecords (stride-8 arena)', () => {
 
 test('configure after a node exists throws (per-system)', () => {
 	const sys = createReactiveSystem({ initialRecords: 128 });
-	sys.custom(0);
+	sys.createReactiveNode({});
 	expect(() => sys.configure({ initialRecords: 256 })).toThrowError(/before the first/);
 });
 

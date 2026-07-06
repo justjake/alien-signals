@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { createReactiveSystem, ReactiveFlags } from '../src/system';
+import { NodeIdKey, ReactiveFlags, createReactiveSystem } from '../src/system';
 import { makeMiniLib } from './helpers/miniLib';
 
 // The notify seam is THE effect mechanism: the propagation ladder hands
@@ -61,8 +61,8 @@ test('without a notify option, watching nodes are silently skipped', () => {
 		initialRecords: 4096,
 		update: () => true,
 	});
-	const src = sys.custom(1 << 16 | ReactiveFlags.Mutable);
-	const watcher = sys.custom(3 << 16 | ReactiveFlags.Watching);
+	const src = sys.createReactiveNode({}, 1 << 16 | ReactiveFlags.Mutable)[NodeIdKey];
+	const watcher = sys.createReactiveNode({}, 3 << 16 | ReactiveFlags.Watching)[NodeIdKey];
 	const M = sys.buffer();
 	const edge = sys.e.link(src, watcher, 1);
 	M[src] |= ReactiveFlags.Dirty; // slot 0 = flags

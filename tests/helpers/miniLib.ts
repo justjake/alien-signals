@@ -1,67 +1,66 @@
-import { createReactiveSystem, ReactiveFlags } from '../../src/system';
-import type { LinkId, NodeId, ReactiveSystemOptions } from '../../src/system';
+import { Arena, Flag, LinkSlot, NodeGenKey, NodeIdKey, NodeSlot, SysSlot, createReactiveSystem } from '../../src/system';
+import type { LinkId, NodeGen, NodeId, ReactiveNode, ReactiveSystemOptions } from '../../src/system';
 
 // A minimal userspace kind library for system-level tests: the smallest
 // signal/computed/effect built the way src/index.ts is built — host-owned
 // tracking state and direct record writes over the five raw graph ops.
 // Mirrors src/index.ts's architecture without its policy depth.
 
-export const SIG = 1 << 16;
-export const COMP = 2 << 16;
-export const EFF = 3 << 16;
-const KIND = 15 << 16;
+export const SIG = 1 << Flag.HostShift;
+export const COMP = 2 << Flag.HostShift;
+export const EFF = 3 << Flag.HostShift;
+const KIND = 15 << Flag.HostShift;
+const HIDDEN = ~Flag.PublicMask;
 
-// Record layout twins (tests are cold; plain consts are fine here).
-const FLAGS = 0;
-const DEPS = 1;
-const DEPS_TAIL = 2;
-const SUBS = 3;
-const GEN = 5;
-const L_PREV_DEP = 5;
-const L_NEXT_DEP = 6;
-const SYS_ENTER = 1;
-const SYS_CYCLE = 2;
-const SYS_EPOCH = 3;
-const HIDDEN = ~127;
-const { Mutable, Watching, RecursedCheck, Dirty, Pending } = ReactiveFlags;
+interface MiniNode extends ReactiveNode {
+	[NodeIdKey]: NodeId;
+	[NodeGenKey]: NodeGen;
+}
 
-export function makeMiniLib(options?: Omit<ReactiveSystemOptions, 'update' | 'notify'>) {
+export function makeMiniLib(options?: Omit<ReactiveSystemOptions, 'update' | 'notify' | 'onGrow'>) {
 	const nodes: any[] = [];
-	const queue: Array<[NodeId, number]> = [];
+	const queue: Array<[NodeId, NodeGen]> = [];
 	const notified: number[] = [];
-	let activeSub = 0;
+	let activeSub: NodeId = 0 as NodeId;
 	let batchDepth = 0;
+	let cycle = 0;
+	let epoch = 1;
 	let draining = false;
 
 	const sys = createReactiveSystem({
 		...options,
-		start(id) {
-			return options?.start !== undefined ? options.start(id) : undefined;
+		onGrow() {
+			M = sys.buffer();
+			D = sys.stampView();
+			({ link, unlink, propagate, checkDirty, shallowPropagate } = sys.e);
 		},
-		stop(id, state) {
+		watched(id) {
+			return options?.watched !== undefined ? options.watched(id) : undefined;
+		},
+		unwatched(id, state) {
 			// Library policy on unwatch (mirrors src/index.ts): a computed
 			// that lost its last subscriber drops its deps and goes dirty.
-			if ((M[id + FLAGS] & KIND) === COMP) {
-				M[id + FLAGS] = (M[id + FLAGS] & HIDDEN) | Mutable | Dirty;
-				D[(id >> 1) + 3] = 0;
-				let l = M[id + DEPS_TAIL];
+			if ((M[id + NodeSlot.Flags] & KIND) === COMP) {
+				M[id + NodeSlot.Flags] = (M[id + NodeSlot.Flags] & HIDDEN) | Flag.Mutable | Flag.Dirty;
+				D[(id >> Arena.StampShift) + Arena.StampOffset] = 0;
+				let l = M[id + NodeSlot.DepsTail] as LinkId;
 				while (l !== 0) {
-					const prev = M[l + L_PREV_DEP];
+					const prev = M[l + LinkSlot.PrevDep] as LinkId;
 					unlink(l, id);
 					l = prev;
 				}
 			}
-			if (options?.stop !== undefined) {
-				options.stop(id, state);
+			if (options?.unwatched !== undefined) {
+				options.unwatched(id, state);
 			}
 		},
 		update(id, flags) {
-			const st = nodes[id >> 3];
+			const st = nodes[id >> Arena.NodeIndexShift];
 			if (st === undefined) {
 				return true;
 			}
 			if ((flags & KIND) === SIG) {
-				M[id + FLAGS] = (flags & HIDDEN) | Mutable;
+				M[id + NodeSlot.Flags] = (flags & HIDDEN) | Flag.Mutable;
 				return st.current !== (st.current = st.pending);
 			}
 			return recompute(id, st);
@@ -72,20 +71,16 @@ export function makeMiniLib(options?: Omit<ReactiveSystemOptions, 'update' | 'no
 		},
 	});
 
-	// The arena views and the five ops, re-captured whenever growth migrates
-	// the graph to a bigger arena. Materializes eagerly — fine for tests.
+	// The arena views and the five ops; the onGrow option above re-captures
+	// them whenever growth migrates the graph. Materializes eagerly — fine
+	// for tests.
 	let M = sys.buffer();
 	let D = sys.stampView();
 	let { link, unlink, propagate, checkDirty, shallowPropagate } = sys.e;
-	sys.onGrow(() => {
-		M = sys.buffer();
-		D = sys.stampView();
-		({ link, unlink, propagate, checkDirty, shallowPropagate } = sys.e);
-	});
 
 	function purgeDeps(sub: NodeId): void {
-		const depsTail = M[sub + DEPS_TAIL];
-		let l: LinkId = depsTail !== 0 ? M[depsTail + L_NEXT_DEP] : M[sub + DEPS];
+		const depsTail = M[sub + NodeSlot.DepsTail] as LinkId;
+		let l: LinkId = depsTail !== 0 ? (M[depsTail + LinkSlot.NextDep] as LinkId) : (M[sub + NodeSlot.Deps] as LinkId);
 		while (l !== 0) {
 			l = unlink(l, sub);
 		}
@@ -93,22 +88,22 @@ export function makeMiniLib(options?: Omit<ReactiveSystemOptions, 'update' | 'no
 
 	// The host-owned re-track bracket (upstream's updateComputed shape).
 	function recompute(id: NodeId, st: any): boolean {
-		M[id + DEPS_TAIL] = 0;
-		M[id + FLAGS] = (M[id + FLAGS] & HIDDEN) | Mutable | RecursedCheck;
+		M[id + NodeSlot.DepsTail] = 0;
+		M[id + NodeSlot.Flags] = (M[id + NodeSlot.Flags] & HIDDEN) | Flag.Mutable | Flag.RecursedCheck;
 		const prevSub = activeSub;
 		activeSub = id;
-		++M[SYS_CYCLE];
-		++M[SYS_ENTER];
-		const entryEpoch = D[SYS_EPOCH];
+		++cycle;
+		++M[SysSlot.EnterDepth];
+		const entryEpoch = epoch;
 		try {
 			const old = st.value;
 			const changed = old !== (st.value = st.getter(old));
-			D[(id >> 1) + 3] = entryEpoch;
+			D[(id >> Arena.StampShift) + Arena.StampOffset] = entryEpoch;
 			return changed;
 		} finally {
-			--M[SYS_ENTER];
+			--M[SysSlot.EnterDepth];
 			activeSub = prevSub;
-			M[id + FLAGS] &= ~RecursedCheck;
+			M[id + NodeSlot.Flags] &= ~Flag.RecursedCheck;
 			purgeDeps(id);
 		}
 	}
@@ -121,34 +116,34 @@ export function makeMiniLib(options?: Omit<ReactiveSystemOptions, 'update' | 'no
 		try {
 			while (queue.length) {
 				const [id, gen] = queue.shift()!;
-				if (M[id + GEN] !== gen) {
+				if (M[id + NodeSlot.Gen] !== gen) {
 					continue;
 				}
-				const st = nodes[id >> 3];
+				const st = nodes[id >> Arena.NodeIndexShift];
 				if (st === undefined) {
 					continue;
 				}
-				const flags = M[id + FLAGS];
-				if (flags & Dirty || (flags & Pending && checkDirty(M[id + DEPS], id))) {
+				const flags = M[id + NodeSlot.Flags];
+				if (flags & Flag.Dirty || (flags & Flag.Pending && checkDirty(M[id + NodeSlot.Deps] as LinkId, id))) {
 					st.cleanup?.();
 					st.cleanup = undefined;
-					M[id + DEPS_TAIL] = 0;
-					M[id + FLAGS] = (M[id + FLAGS] & HIDDEN) | Watching | RecursedCheck;
+					M[id + NodeSlot.DepsTail] = 0;
+					M[id + NodeSlot.Flags] = (M[id + NodeSlot.Flags] & HIDDEN) | Flag.Watching | Flag.RecursedCheck;
 					const prevSub = activeSub;
 					activeSub = id;
-					++M[SYS_CYCLE];
-					++M[SYS_ENTER];
+					++cycle;
+					++M[SysSlot.EnterDepth];
 					try {
 						st.cleanup = st.fn();
 					} finally {
-						--M[SYS_ENTER];
+						--M[SysSlot.EnterDepth];
 						activeSub = prevSub;
-						M[id + FLAGS] &= ~RecursedCheck;
+						M[id + NodeSlot.Flags] &= ~Flag.RecursedCheck;
 						purgeDeps(id);
 					}
 				} else {
 					// Verified clean, not run: clear Pending, re-arm Watching.
-					M[id + FLAGS] = (flags & HIDDEN) | Watching;
+					M[id + NodeSlot.Flags] = (flags & HIDDEN) | Flag.Watching;
 				}
 			}
 		} finally {
@@ -171,9 +166,9 @@ export function makeMiniLib(options?: Omit<ReactiveSystemOptions, 'update' | 'no
 		const oper = (...a: [T?]): T | void => {
 			if (a.length) {
 				if (st.pending !== (st.pending = a[0] as T)) {
-					M[id + FLAGS] = (M[id + FLAGS] & HIDDEN) | Mutable | Dirty;
-					++D[SYS_EPOCH];
-					const subs = M[id + SUBS];
+					M[id + NodeSlot.Flags] = (M[id + NodeSlot.Flags] & HIDDEN) | Flag.Mutable | Flag.Dirty;
+					++epoch;
+					const subs = M[id + NodeSlot.Subs] as LinkId;
 					if (subs !== 0) {
 						propagate(subs, false);
 						if (!batchDepth) {
@@ -182,24 +177,24 @@ export function makeMiniLib(options?: Omit<ReactiveSystemOptions, 'update' | 'no
 					}
 				}
 			} else {
-				const flags = M[id + FLAGS];
-				if (flags & Dirty) {
-					M[id + FLAGS] = (flags & HIDDEN) | Mutable;
+				const flags = M[id + NodeSlot.Flags];
+				if (flags & Flag.Dirty) {
+					M[id + NodeSlot.Flags] = (flags & HIDDEN) | Flag.Mutable;
 					if (st.current !== (st.current = st.pending)) {
-						const subs = M[id + SUBS];
+						const subs = M[id + NodeSlot.Subs] as LinkId;
 						if (subs !== 0) {
 							shallowPropagate(subs);
 						}
 					}
 				}
 				if (activeSub !== 0) {
-					link(id, activeSub, M[SYS_CYCLE]);
+					link(id, activeSub, cycle);
 				}
 				return st.current;
 			}
 		};
-		const id = sys.custom(SIG | Mutable, oper);
-		nodes[id >> 3] = st;
+		const id = sys.createReactiveNode<MiniNode>(oper as object as MiniNode, SIG | Flag.Mutable)[NodeIdKey];
+		nodes[id >> Arena.NodeIndexShift] = st;
 		return oper as { (): T; (v: T): void };
 	}
 
@@ -207,63 +202,64 @@ export function makeMiniLib(options?: Omit<ReactiveSystemOptions, 'update' | 'no
 		const st = { value: undefined as T, getter };
 		const oper = (): T => {
 			// The quiet-read stamp gate, then upstream's computedOper ladder.
-			if (D[(id >> 1) + 3] !== D[SYS_EPOCH]) {
-				const flags = M[id + FLAGS];
-				if (flags & Dirty) {
+			if (D[(id >> Arena.StampShift) + Arena.StampOffset] !== epoch) {
+				const flags = M[id + NodeSlot.Flags];
+				if (flags & Flag.Dirty) {
 					if (recompute(id, st)) {
-						const subs = M[id + SUBS];
+						const subs = M[id + NodeSlot.Subs] as LinkId;
 						if (subs !== 0) {
 							shallowPropagate(subs);
 						}
 					}
-				} else if (flags & Pending) {
-					const entryEpoch = D[SYS_EPOCH];
-					if (checkDirty(M[id + DEPS], id)) {
+				} else if (flags & Flag.Pending) {
+					const entryEpoch = epoch;
+					if (checkDirty(M[id + NodeSlot.Deps] as LinkId, id)) {
 						if (recompute(id, st)) {
-							const subs = M[id + SUBS];
+							const subs = M[id + NodeSlot.Subs] as LinkId;
 							if (subs !== 0) {
 								shallowPropagate(subs);
 							}
 						}
 					} else {
-						M[id + FLAGS] = flags & ~Pending;
-						D[(id >> 1) + 3] = entryEpoch;
+						M[id + NodeSlot.Flags] = flags & ~Flag.Pending;
+						D[(id >> Arena.StampShift) + Arena.StampOffset] = entryEpoch;
 					}
 				}
 			}
 			if (activeSub !== 0) {
-				link(id, activeSub, M[SYS_CYCLE]);
+				link(id, activeSub, cycle);
 			}
 			return st.value;
 		};
 		// Minted Dirty: the first read takes the update path.
-		const id = sys.custom(COMP | Mutable | Dirty, oper);
-		nodes[id >> 3] = st;
+		const id = sys.createReactiveNode<MiniNode>(oper as object as MiniNode, COMP | Flag.Mutable | Flag.Dirty)[NodeIdKey];
+		nodes[id >> Arena.NodeIndexShift] = st;
 		return oper;
 	}
 
 	function effect(fn: () => void | (() => void)): () => void {
 		const st = { fn, cleanup: undefined as (() => void) | void };
-		const id = sys.custom(EFF | Watching | RecursedCheck);
-		const gen = M[id + GEN];
-		nodes[id >> 3] = st;
+		const node = sys.createReactiveNode<MiniNode>(st as object as MiniNode, EFF | Flag.Watching | Flag.RecursedCheck);
+		const id = node[NodeIdKey];
+		const gen = node[NodeGenKey];
+		nodes[id >> Arena.NodeIndexShift] = st;
 		const prevSub = activeSub;
 		activeSub = id;
-		++M[SYS_ENTER];
+		++M[SysSlot.EnterDepth];
 		try {
 			st.cleanup = fn();
 		} finally {
-			--M[SYS_ENTER];
+			--M[SysSlot.EnterDepth];
 			activeSub = prevSub;
-			M[id + FLAGS] &= ~RecursedCheck;
+			M[id + NodeSlot.Flags] &= ~Flag.RecursedCheck;
 		}
 		return () => {
-			const live = nodes[id >> 3];
-			if (live === undefined || M[id + GEN] !== gen) {
+			const live = nodes[id >> Arena.NodeIndexShift];
+			if (live === undefined || M[id + NodeSlot.Gen] !== gen) {
 				return;
 			}
 			// Graph teardown is free()'s job ALONE (see src/index.ts).
-			nodes[id >> 3] = undefined;
+			nodes[id >> Arena.NodeIndexShift] = undefined;
 			sys.free(id, gen);
 			live.cleanup?.();
 		};

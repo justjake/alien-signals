@@ -11,7 +11,7 @@ import {
 	startBatch,
 	trigger,
 } from '../../esm/index.mjs';
-import { createReactiveSystem, ReactiveFlags } from '../../esm/system.mjs';
+import { NodeIdKey, ReactiveFlags, createReactiveSystem } from '../../esm/system.mjs';
 
 const a = signal(1);
 const b = signal(2);
@@ -69,9 +69,11 @@ const sys = createReactiveSystem({
 	},
 	notify() {},
 });
-const nsId = sys.custom(1 << 16 | ReactiveFlags.Mutable);
-nodes[nsId >> 3] = { current: 1, pending: 1 };
-const watcherId = sys.custom(2 << 16 | ReactiveFlags.Watching);
+const nsOwner = { current: 1, pending: 1 };
+const nsId = sys.createReactiveNode(nsOwner, 1 << 16 | ReactiveFlags.Mutable)[NodeIdKey];
+nodes[nsId >> 3] = nsOwner;
+const watcherOwner = {};
+const watcherId = sys.createReactiveNode(watcherOwner, 2 << 16 | ReactiveFlags.Watching)[NodeIdKey];
 const M = sys.buffer();
 const rawEdge = sys.e.link(nsId, watcherId, 1);
 nodes[nsId >> 3].pending = 2;

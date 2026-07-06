@@ -1,10 +1,22 @@
 import { expect, test } from 'vitest';
-import { NodeSlot, ReactiveFlags, createReactiveSystem } from '../src/system';
+import { NodeIdKey, NodeSlot, ReactiveFlags, createReactiveSystem } from '../src/system';
+import type { LinkId, NodeId, ReactiveSystem } from '../src/system';
 import { makeMiniLib } from './helpers/miniLib';
+
+// Raw tests deal in plain ids; each minted owner is pinned in `owners` so
+// garbage collection cannot reclaim records mid-test.
+function minter(sys: ReactiveSystem): (hostBits?: number) => NodeId {
+	const owners: object[] = [];
+	return (hostBits?: number) => {
+		const owner = {};
+		owners.push(owner);
+		return sys.createReactiveNode(owner, hostBits)[NodeIdKey];
+	};
+}
 
 // The raw graph ops at the engine level (system.e): upstream alien-signals'
 // five algorithms driven kindlessly, with the host reading records itself,
-// plus the start/stop watched lifecycle those walks deliver.
+// plus the watched/unwatched lifecycle those walks deliver.
 
 test('link returns the edge id; the same pair dedupes; unlink removes', () => {
 	const sys = createReactiveSystem({
@@ -12,8 +24,9 @@ test('link returns the edge id; the same pair dedupes; unlink removes', () => {
 		update: () => true,
 		notify: () => {},
 	});
-	const dep = sys.custom(1 << 16 | ReactiveFlags.Mutable);
-	const sub = sys.custom(2 << 16 | ReactiveFlags.Mutable);
+	const mint = minter(sys);
+	const dep = mint(1 << 16 | ReactiveFlags.Mutable);
+	const sub = mint(2 << 16 | ReactiveFlags.Mutable);
 	const { link, unlink } = sys.e;
 	const l1 = link(dep, sub, 1);
 	const l2 = link(dep, sub, 1);
@@ -32,27 +45,28 @@ test('propagate marks downstream pending and notifies watchers', () => {
 			notified.push(id);
 		},
 	});
-	const src = sys.custom(1 << 16 | ReactiveFlags.Mutable);
-	const watcher = sys.custom(3 << 16 | ReactiveFlags.Watching);
+	const mint = minter(sys);
+	const src = mint(1 << 16 | ReactiveFlags.Mutable);
+	const watcher = mint(3 << 16 | ReactiveFlags.Watching);
 	const M = sys.buffer();
 	const { link, propagate, checkDirty } = sys.e;
 	link(src, watcher, 1);
 	M[src + NodeSlot.Flags] |= ReactiveFlags.Dirty;
-	propagate(M[src + NodeSlot.Subs], false);
+	propagate(M[src + NodeSlot.Subs] as LinkId, false);
 	expect(notified).toEqual([watcher]);
 	// dedup: Watching cleared until re-armed
 	M[src + NodeSlot.Flags] |= ReactiveFlags.Dirty;
-	propagate(M[src + NodeSlot.Subs], false);
+	propagate(M[src + NodeSlot.Subs] as LinkId, false);
 	expect(notified).toEqual([watcher]);
 	// The host "runs" the watcher: resolving its staleness through the
 	// update seam clears the pending state, then re-arming Watching makes
 	// it notifiable again (an already-pending watcher is deliberately not
 	// re-notified).
-	checkDirty(M[watcher + NodeSlot.Deps], watcher);
+	checkDirty(M[watcher + NodeSlot.Deps] as LinkId, watcher);
 	M[watcher + NodeSlot.Flags] &= ~(ReactiveFlags.Dirty | ReactiveFlags.Pending);
 	M[watcher + NodeSlot.Flags] |= ReactiveFlags.Watching;
 	M[src + NodeSlot.Flags] |= ReactiveFlags.Dirty;
-	propagate(M[src + NodeSlot.Subs], false);
+	propagate(M[src + NodeSlot.Subs] as LinkId, false);
 	expect(notified).toEqual([watcher, watcher]);
 });
 
@@ -68,35 +82,37 @@ test('checkDirty resolves staleness through the update seam', () => {
 		},
 		notify: () => {},
 	});
-	const src = sys.custom(1 << 16 | ReactiveFlags.Mutable);
-	const mid = sys.custom(2 << 16 | ReactiveFlags.Mutable);
+	const mint = minter(sys);
+	const src = mint(1 << 16 | ReactiveFlags.Mutable);
+	const mid = mint(2 << 16 | ReactiveFlags.Mutable);
 	const M = sys.buffer();
 	const { link, propagate, checkDirty } = sys.e;
 	link(src, mid, 1);
 	M[src + NodeSlot.Flags] |= ReactiveFlags.Dirty;
-	propagate(M[src + NodeSlot.Subs], false);
+	propagate(M[src + NodeSlot.Subs] as LinkId, false);
 	expect(M[mid + NodeSlot.Flags] & ReactiveFlags.Pending).not.toBe(0);
-	expect(checkDirty(M[mid + NodeSlot.Deps], mid)).toBe(true);
+	expect(checkDirty(M[mid + NodeSlot.Deps] as LinkId, mid)).toBe(true);
 	expect(updated).toEqual([src]);
 });
 
-test('start fires on first subscriber only; stop on last unlink with state', () => {
+test('watched fires on first subscriber only; unwatched on last unlink with state', () => {
 	const events: string[] = [];
 	const sys = createReactiveSystem({
 		initialRecords: 4096,
 		update: () => true,
 		notify: () => {},
-		start: (id) => {
+		watched: (id) => {
 			events.push(`start:${id}`);
 			return `state:${id}`;
 		},
-		stop: (id, state) => {
+		unwatched: (id, state) => {
 			events.push(`stop:${id}:${state}`);
 		},
 	});
-	const dep = sys.custom(1 << 16 | ReactiveFlags.Mutable);
-	const s1 = sys.custom(2 << 16);
-	const s2 = sys.custom(2 << 16);
+	const mint = minter(sys);
+	const dep = mint(1 << 16 | ReactiveFlags.Mutable);
+	const s1 = mint(2 << 16);
+	const s2 = mint(2 << 16);
 	const { link, unlink } = sys.e;
 	const l1 = link(dep, s1, 1);
 	expect(events).toEqual([`start:${dep}`]);
@@ -108,15 +124,15 @@ test('start fires on first subscriber only; stop on last unlink with state', () 
 	expect(events).toEqual([`start:${dep}`, `stop:${dep}:state:${dep}`]);
 });
 
-test('stop survives writes and recomputes of the started node', () => {
+test('unwatched survives writes and recomputes of the watched node', () => {
 	const events: string[] = [];
 	const lib = makeMiniLib({
 		initialRecords: 4096,
-		start: () => {
+		watched: () => {
 			events.push('start');
 			return undefined;
 		},
-		stop: () => {
+		unwatched: () => {
 			events.push('stop');
 		},
 	});
@@ -136,24 +152,43 @@ test('stop survives writes and recomputes of the started node', () => {
 	expect(events).toEqual(['stop', 'stop']); // computed, then signal
 });
 
-test('reset() delivers stop for every started node, newest first', () => {
+test('reset() delivers unwatched for every watched node, newest first', () => {
 	const stops: number[] = [];
 	const sys = createReactiveSystem({
 		initialRecords: 4096,
 		update: () => true,
 		notify: () => {},
-		start: (id) => id,
-		stop: (id) => {
+		watched: (id) => id,
+		unwatched: (id) => {
 			stops.push(id);
 		},
 	});
-	const d1 = sys.custom(1 << 16 | ReactiveFlags.Mutable);
-	const d2 = sys.custom(1 << 16 | ReactiveFlags.Mutable);
-	const sub = sys.custom(2 << 16);
+	const mint = minter(sys);
+	const d1 = mint(1 << 16 | ReactiveFlags.Mutable);
+	const d2 = mint(1 << 16 | ReactiveFlags.Mutable);
+	const sub = mint(2 << 16);
 	sys.e.link(d1, sub, 1);
 	sys.e.link(d2, sub, 1);
 	sys.reset();
 	expect(stops).toEqual([d2, d1]);
+});
+
+test('unwatched is delivered even when watched is not defined', () => {
+	const stops: number[] = [];
+	const sys = createReactiveSystem({
+		initialRecords: 4096,
+		update: () => true,
+		notify: () => {},
+		unwatched: (id) => {
+			stops.push(id);
+		},
+	});
+	const mint = minter(sys);
+	const dep = mint(1 << 16 | ReactiveFlags.Mutable);
+	const sub = mint(2 << 16);
+	const l = sys.e.link(dep, sub, 1);
+	sys.e.unlink(l, sub);
+	expect(stops).toEqual([dep]);
 });
 
 test('free(id, gen): explicit lifetime; stale gens are no-ops', () => {
@@ -162,7 +197,8 @@ test('free(id, gen): explicit lifetime; stale gens are no-ops', () => {
 		update: () => true,
 		notify: () => {},
 	});
-	const id = sys.custom(1 << 16 | ReactiveFlags.Mutable);
+	const mint = minter(sys);
+	const id = mint(1 << 16 | ReactiveFlags.Mutable);
 	const gen = sys.gen(id);
 	sys.free(id, gen);
 	sys.free(id, gen); // double free: gen/live checks make it harmless

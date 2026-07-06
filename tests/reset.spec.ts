@@ -54,7 +54,7 @@ test('pre-reset finalizations cannot reclaim post-reset records', async () => {
 	// finalizer must self-disarm after reset replaces the registry.
 	(() => {
 		const owner = { alive: true };
-		lib.sys.custom(1 << 16, owner);
+		lib.sys.createReactiveNode(owner, 1 << 16);
 	})();
 	lib.sys.reset();
 	const survivor = lib.signal(42);

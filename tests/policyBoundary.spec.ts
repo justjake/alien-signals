@@ -19,10 +19,15 @@ const PUBLIC_SURFACE = new Set([
 	'ReactiveFlags',
 	'NodeId',
 	'LinkId',
+	'NodeGen',
+	'NodeIdKey',
+	'NodeGenKey',
 	// the record layout (trusted hosts address the arena directly)
 	'NodeSlot',
 	'LinkSlot',
 	'SysSlot',
+	'Arena',
+	'Flag',
 	// codegen feature detection
 	'codegenAvailable',
 	'codegenSupported',

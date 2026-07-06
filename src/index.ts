@@ -2,103 +2,101 @@
  * The default signal library: signal, computed, effect, and effectScope,
  * implemented ENTIRELY in userspace with the same division of labor as
  * upstream alien-signals — this module owns all tracking state (the active
- * subscriber, run depth, the batch counter, the effect queue) and manipulates
- * node records directly in the shared arena, while the core supplies the five
- * graph algorithms (link/unlink/propagate/checkDirty/shallowPropagate),
- * allocation, and growth. Each function here is a transliteration of its
- * upstream counterpart from `node.field` to `M[id + Slot]`; values and
- * callbacks live on plain host objects in the `nodes` table.
+ * subscriber, run depth, the batch counter, the pass cycle, the write epoch,
+ * the effect queue) and manipulates node records directly in the shared
+ * arena, while the core supplies the five graph algorithms
+ * (link/unlink/propagate/checkDirty/shallowPropagate), allocation, and
+ * growth. Each function here is a transliteration of its upstream
+ * counterpart from `node.field` to `M[id + Slot]`; values and callbacks live
+ * on the node-state objects in the `nodes` table.
  */
 import {
+	Arena,
+	Flag,
+	LinkSlot,
+	NodeGenKey,
+	NodeIdKey,
+	NodeSlot,
+	SysSlot,
 	createReactiveSystem,
 	type LinkId,
+	type NodeGen,
 	type NodeId,
 	type ReactiveNode,
 } from './system.js';
 
-// ---- arena vocabulary (same-file const enums: inlined by every toolchain) --
-// Twins of the layout the core exports as NodeSlot/LinkSlot/SysSlot: declared
-// again HERE because toolchains only reliably inline const enum members used
-// in the same file, and these appear in every hot path below. The record
-// layout is a frozen ABI (32-byte records, 8 int32 slots), so the duplication
-// is safe by construction.
+// ---- host flag vocabulary ----------------------------------------------------
+// The layout and the flag bits come from system.ts (the authority on the
+// arena); this enum holds only what is THIS library's policy: its kind tags
+// (planted in the host bits the engine preserves) and the child-effect
+// marker upstream also keeps outside ReactiveFlags.
 
-/** Node record slots (M arena; ids are pre-multiplied record offsets). */
-const enum Node {
-	Flags = 0,
-	Deps = 1,
-	DepsTail = 2,
-	Subs = 3,
-	SubsTail = 4,
-	Gen = 5,
-}
-
-/** Link (edge) record slots. */
-const enum Link {
-	Dep = 1,
-	Sub = 2,
-	NextSub = 4,
-	PrevDep = 5,
-	NextDep = 6,
-}
-
-/** Record-0 system slots shared with the core (see SysSlot in system.ts). */
-const enum Sys {
-	/** Live frames holding the arena; growth waits until it is zero. */
-	EnterDepth = 1,
-	/** The tracking-pass counter (upstream's `cycle`); versions for link(). */
-	Cycle = 2,
-	/** f64 index of the write epoch in the stamp view D. */
-	EpochF64 = 3,
-}
-
-/**
- * Flag bits. The low seven are the public update-state bits (upstream's
- * ReactiveFlags plus HasChildEffect); bits 16-27 are this library's kind
- * tags, planted at mint and preserved by the engine. Everything outside the
- * low seven — engine liveness and reclamation bits as well as the kind
- * tags — must ride through every absolute flag store, so stores are written
- * `(flags & Flag.Hidden) | newBits`.
- */
-const enum Flag {
-	Mutable = 1,
-	Watching = 2,
-	RecursedCheck = 4,
-	Recursed = 8,
-	Dirty = 16,
-	Pending = 32,
+const enum Host {
 	/** This effect/scope/computed created child effects; dispose them on re-run. */
 	HasChildEffect = 64,
 	/** Everything absolute flag stores must preserve (engine bits + kind tags). */
-	Hidden = ~127,
-	Signal = 1 << 16,
-	Computed = 2 << 16,
-	Effect = 3 << 16,
-	Scope = 4 << 16,
-	KindMask = 7 << 16,
+	Hidden = ~Flag.PublicMask,
+	Signal = 1 << Flag.HostShift,
+	Computed = 2 << Flag.HostShift,
+	Effect = 3 << Flag.HostShift,
+	Scope = 4 << Flag.HostShift,
+	KindMask = 7 << Flag.HostShift,
 }
 
-// ---- host node state --------------------------------------------------------
+// ---- node state ----------------------------------------------------------------
+// The state object IS the reactive node: it carries the arena id and
+// generation (assigned at mint), and `flags` is a live view over the
+// record's public update-state bits, so the upstream pattern
+// `getActiveSub()!.flags &= ~ReactiveFlags.RecursedCheck` works on any node
+// this library hands out — no wrapper objects.
 
-interface SignalState {
+class NodeState implements ReactiveNode {
+	declare [NodeIdKey]: NodeId;
+	declare [NodeGenKey]: NodeGen;
+	get flags(): number {
+		return M[this[NodeIdKey] + NodeSlot.Flags] & Flag.PublicMask;
+	}
+	set flags(value: number) {
+		const id = this[NodeIdKey];
+		M[id + NodeSlot.Flags] = (M[id + NodeSlot.Flags] & Host.Hidden) | (value & Flag.PublicMask);
+		// Flag surgery may mark Dirty/Pending without a write: the cached
+		// verification can no longer be trusted.
+		D[(id >> Arena.StampShift) + Arena.StampOffset] = 0;
+	}
+}
+
+class SignalState extends NodeState {
 	current: unknown;
 	pending: unknown;
+	constructor(value: unknown) {
+		super();
+		this.current = value;
+		this.pending = value;
+	}
 }
 
-interface ComputedState {
-	value: unknown;
+class ComputedState extends NodeState {
+	value: unknown = undefined;
 	getter: (previousValue?: unknown) => unknown;
+	constructor(getter: (previousValue?: unknown) => unknown) {
+		super();
+		this.getter = getter;
+	}
 }
 
-interface EffectState {
+class EffectState extends NodeState {
 	fn: () => (() => void) | void;
-	cleanup: (() => void) | void;
+	cleanup: (() => void) | void = undefined;
+	constructor(fn: () => (() => void) | void) {
+		super();
+		this.fn = fn;
+	}
 }
 
-// Dense id -> state map (records are 32 bytes; ids are premultiplied by 8).
-// Slots are cleared by the same code paths that free records, so the map's
-// lifecycle mirrors the arena's exactly.
-const nodes: (SignalState | ComputedState | EffectState | undefined)[] = [];
+// Dense id -> state map, indexed by record number. Slots are cleared by the
+// same code paths that free records, so the map's lifecycle mirrors the
+// arena's exactly.
+const nodes: (NodeState | undefined)[] = [];
 
 // ---- host-owned tracking state (upstream's module lets) ---------------------
 
@@ -106,21 +104,29 @@ let runDepth = 0;
 let batchDepth = 0;
 let notifyIndex = 0;
 let queuedLength = 0;
-let activeSub: NodeId = 0;
+let activeSub: NodeId = 0 as NodeId;
+/** The tracking-pass counter (upstream's `cycle`): link versions. */
+let cycle = 0;
+/**
+ * The write epoch: bumped by every committed write and trigger. A node whose
+ * stamp (in the arena's stamp view D) equals it is provably current —
+ * nothing observed has been written since its last verification.
+ */
+let epoch = 1;
 
 // The effect queue holds (id, generation) pairs: a generation mismatch at
 // flush time means the record was freed (and possibly reused) after being
 // queued, so the entry is skipped instead of running a stranger.
-const queued: number[] = [];
-const queuedGens: number[] = [];
+const queued: NodeId[] = [];
+const queuedGens: NodeGen[] = [];
 
 // ---- the shared arena and the five graph ops --------------------------------
 // Captured lazily at the first node mint (the system materializes its arena
-// on first use so configure() can still size it) and re-captured by onGrow
-// whenever growth migrates the graph to a bigger arena. Ids and link ids
-// survive growth verbatim — only these views and closures change — so host
-// code never caches M, D, or an op in a local across a call that can
-// allocate.
+// on first use so configure() can still size it) and re-captured by the
+// onGrow option whenever growth migrates the graph to a bigger arena. Ids
+// and link ids survive growth verbatim — only these views and closures
+// change — so host code never caches M, D, or an op in a local across a
+// call that can allocate.
 
 let M: Int32Array = new Int32Array(0);
 let D: Float64Array = new Float64Array(0);
@@ -141,18 +147,19 @@ function capture(): void {
 	shallowPropagate = e.shallowPropagate;
 }
 
-// ---- the system, driven by this library's update/notify/stop seams ----------
+// ---- the system, driven by this library's update/notify/unwatched seams -----
 
 const system = createReactiveSystem({
+	onGrow: capture,
 	update: function updateNode(id, flags): boolean {
-		const st = nodes[id >> 3];
+		const st = nodes[id >> Arena.NodeIndexShift];
 		if (st === undefined) {
 			return true; // freed mid-walk: treat as changed, the walk moves on
 		}
-		if ((flags & Flag.KindMask) === Flag.Signal) {
+		if ((flags & Host.KindMask) === Host.Signal) {
 			return updateSignal(id, flags, st as SignalState);
 		}
-		return updateComputed(id, st as ComputedState);
+		return updateComputed(id, st as ComputedState, flags);
 	},
 	// Upstream's notify: queue the effect, then hoist queued ancestors above
 	// it (clearing Watching as the dedup) and reverse the run so outer
@@ -166,17 +173,17 @@ const system = createReactiveSystem({
 		while (true) {
 			queued[insertIndex] = e;
 			queuedGens[insertIndex++] = eGen;
-			const subsLink = M[e + Node.Subs];
+			const subsLink = M[e + NodeSlot.Subs] as LinkId;
 			if (!subsLink) {
 				break;
 			}
-			e = M[subsLink + Link.Sub];
-			const flags = M[e + Node.Flags];
+			e = M[subsLink + LinkSlot.Sub] as NodeId;
+			const flags = M[e + NodeSlot.Flags];
 			if (!(flags & Flag.Watching)) {
 				break;
 			}
-			M[e + Node.Flags] = flags & ~Flag.Watching;
-			eGen = M[e + Node.Gen];
+			M[e + NodeSlot.Flags] = flags & ~Flag.Watching;
+			eGen = M[e + NodeSlot.Gen] as NodeGen;
 		}
 		queuedLength = insertIndex;
 		while (firstInsertedIndex < --insertIndex) {
@@ -188,103 +195,101 @@ const system = createReactiveSystem({
 			queuedGens[insertIndex] = leftGen;
 		}
 	},
-	start() {
-		return undefined; // presence enables stop() delivery
-	},
 	// Upstream's unwatched, delivered when a node's last subscriber unlinks.
-	stop: function stopNode(id): void {
-		const flags = M[id + Node.Flags];
-		const kind = flags & Flag.KindMask;
-		if (kind === Flag.Computed) {
-			if (M[id + Node.Deps] !== 0) {
+	unwatched: function unwatchedNode(id): void {
+		const flags = M[id + NodeSlot.Flags];
+		const kind = flags & Host.KindMask;
+		if (kind === Host.Computed) {
+			if (M[id + NodeSlot.Deps] !== 0) {
 				// Drop the dependency graph and force re-evaluation on the
 				// next read (the zeroed stamp defeats the quiet-read gate).
-				M[id + Node.Flags] = (flags & Flag.Hidden) | Flag.Mutable | Flag.Dirty;
-				D[(id >> 1) + 3] = 0;
+				M[id + NodeSlot.Flags] = (flags & Host.Hidden) | Flag.Mutable | Flag.Dirty;
+				D[(id >> Arena.StampShift) + Arena.StampOffset] = 0;
 				disposeAllDepsInReverse(id);
 			}
-		} else if (kind >= Flag.Effect) {
+		} else if (kind >= Host.Effect) {
 			disposeEffect(id);
 		}
 	},
 });
 
 const { configure: systemConfigure } = system;
-system.onGrow(capture);
 
 // ---- update behaviors (upstream index.ts, transliterated) -------------------
 
 function updateSignal(id: NodeId, flags: number, st: SignalState): boolean {
-	M[id + Node.Flags] = (flags & Flag.Hidden) | Flag.Mutable;
+	M[id + NodeSlot.Flags] = (flags & Host.Hidden) | Flag.Mutable;
 	return st.current !== (st.current = st.pending);
 }
 
-function updateComputed(id: NodeId, st: ComputedState): boolean {
-	const flags = M[id + Node.Flags];
-	if (flags & Flag.HasChildEffect) {
+// `flags` is the caller's already-loaded word: both call sites (the update
+// seam and computedOper's read ladder) have it in hand, and the bits this
+// function keeps (Hidden, HasChildEffect) cannot change under checkDirty.
+function updateComputed(id: NodeId, st: ComputedState, flags: number): boolean {
+	if (flags & Host.HasChildEffect) {
 		disposeChildEffects(id);
 	}
-	M[id + Node.DepsTail] = 0;
-	M[id + Node.Flags] = (flags & Flag.Hidden) | Flag.Mutable | Flag.RecursedCheck;
+	M[id + NodeSlot.DepsTail] = 0;
+	M[id + NodeSlot.Flags] = (flags & Host.Hidden) | Flag.Mutable | Flag.RecursedCheck;
 	const prevSub = activeSub;
 	activeSub = id;
-	++M[Sys.Cycle];
-	++M[Sys.EnterDepth];
-	const entryEpoch = D[Sys.EpochF64];
+	++cycle;
+	++M[SysSlot.EnterDepth];
+	const entryEpoch = epoch;
 	try {
 		const oldValue = st.value;
 		const changed = oldValue !== (st.value = st.getter(oldValue));
 		// Stamp with the epoch captured BEFORE the getter ran: a write from
 		// inside it moved the epoch past entryEpoch, so the stamp can only
 		// miss, never lie. Skipped when the getter throws.
-		D[(id >> 1) + 3] = entryEpoch;
+		D[(id >> Arena.StampShift) + Arena.StampOffset] = entryEpoch;
 		return changed;
 	} finally {
-		--M[Sys.EnterDepth];
+		--M[SysSlot.EnterDepth];
 		activeSub = prevSub;
-		M[id + Node.Flags] &= ~Flag.RecursedCheck;
+		M[id + NodeSlot.Flags] &= ~Flag.RecursedCheck;
 		purgeDeps(id);
 	}
 }
 
 // Re-run an effect the queue delivered (upstream's run).
 function run(id: NodeId, st: EffectState): void {
-	const flags = M[id + Node.Flags];
+	const flags = M[id + NodeSlot.Flags];
 	if (
 		flags & Flag.Dirty
 		|| (
 			flags & Flag.Pending
-			&& checkDirty(M[id + Node.Deps], id)
+			&& checkDirty(M[id + NodeSlot.Deps] as LinkId, id)
 		)
 	) {
-		if (flags & Flag.HasChildEffect) {
+		if (flags & Host.HasChildEffect) {
 			disposeChildEffects(id);
 		}
 		if (st.cleanup) {
 			runCleanup(st);
-			if (nodes[id >> 3] !== st) {
+			if (nodes[id >> Arena.NodeIndexShift] !== st) {
 				return; // the cleanup disposed this effect
 			}
 		}
-		M[id + Node.DepsTail] = 0;
-		M[id + Node.Flags] = (M[id + Node.Flags] & Flag.Hidden) | Flag.Watching | Flag.RecursedCheck;
+		M[id + NodeSlot.DepsTail] = 0;
+		M[id + NodeSlot.Flags] = (M[id + NodeSlot.Flags] & Host.Hidden) | Flag.Watching | Flag.RecursedCheck;
 		const prevSub = activeSub;
 		activeSub = id;
-		++M[Sys.Cycle];
-		++M[Sys.EnterDepth];
+		++cycle;
+		++M[SysSlot.EnterDepth];
 		++runDepth;
 		try {
 			st.cleanup = st.fn();
 		} finally {
 			--runDepth;
-			--M[Sys.EnterDepth];
+			--M[SysSlot.EnterDepth];
 			activeSub = prevSub;
-			M[id + Node.Flags] &= ~Flag.RecursedCheck;
+			M[id + NodeSlot.Flags] &= ~Flag.RecursedCheck;
 			purgeDeps(id);
 		}
-	} else if (M[id + Node.Deps] !== 0) {
+	} else if (M[id + NodeSlot.Deps] !== 0) {
 		// Verified clean, not run: re-arm what notify's dedup cleared.
-		M[id + Node.Flags] = (flags & (Flag.Hidden | Flag.HasChildEffect)) | Flag.Watching;
+		M[id + NodeSlot.Flags] = (flags & (Host.Hidden | Host.HasChildEffect)) | Flag.Watching;
 	}
 }
 
@@ -293,9 +298,9 @@ function flush(): void {
 		while (notifyIndex < queuedLength) {
 			const id = queued[notifyIndex];
 			const gen = queuedGens[notifyIndex];
-			queued[notifyIndex++] = 0;
-			if (M[id + Node.Gen] === gen) {
-				const st = nodes[id >> 3] as EffectState | undefined;
+			queued[notifyIndex++] = 0 as NodeId;
+			if (M[id + NodeSlot.Gen] === gen) {
+				const st = nodes[id >> Arena.NodeIndexShift] as EffectState | undefined;
 				if (st !== undefined) {
 					run(id, st);
 				}
@@ -308,9 +313,9 @@ function flush(): void {
 		while (notifyIndex < queuedLength) {
 			const id = queued[notifyIndex];
 			const gen = queuedGens[notifyIndex];
-			queued[notifyIndex++] = 0;
-			if (M[id + Node.Gen] === gen && nodes[id >> 3] !== undefined) {
-				M[id + Node.Flags] |= Flag.Watching | Flag.Recursed;
+			queued[notifyIndex++] = 0 as NodeId;
+			if (M[id + NodeSlot.Gen] === gen && nodes[id >> Arena.NodeIndexShift] !== undefined) {
+				M[id + NodeSlot.Flags] |= Flag.Watching | Flag.Recursed;
 			}
 		}
 		notifyIndex = 0;
@@ -324,24 +329,25 @@ function runCleanup(st: EffectState): void {
 	const cleanup = st.cleanup as () => void;
 	st.cleanup = undefined;
 	const prevSub = activeSub;
-	activeSub = 0;
-	++M[Sys.EnterDepth];
+	activeSub = 0 as NodeId;
+	++M[SysSlot.EnterDepth];
 	try {
 		cleanup();
 	} finally {
-		--M[Sys.EnterDepth];
+		--M[SysSlot.EnterDepth];
 		activeSub = prevSub;
 	}
 }
 
 // Unlink the child effects/scopes a re-running parent created last time:
-// each unlink empties the child's subscriber list, which delivers stop(),
-// which disposes it. Values and computeds in the walk are left alone.
+// each unlink empties the child's subscriber list, which delivers
+// unwatched(), which disposes it. Values and computeds in the walk are left
+// alone.
 function disposeChildEffects(sub: NodeId): void {
-	let l = M[sub + Node.DepsTail];
+	let l = M[sub + NodeSlot.DepsTail] as LinkId;
 	while (l !== 0) {
-		const prev = M[l + Link.PrevDep];
-		if ((M[M[l + Link.Dep] + Node.Flags] & Flag.KindMask) >= Flag.Effect) {
+		const prev = M[l + LinkSlot.PrevDep] as LinkId;
+		if ((M[M[l + LinkSlot.Dep] + NodeSlot.Flags] & Host.KindMask) >= Host.Effect) {
 			unlink(l, sub);
 		}
 		l = prev;
@@ -349,9 +355,9 @@ function disposeChildEffects(sub: NodeId): void {
 }
 
 function disposeAllDepsInReverse(sub: NodeId): void {
-	let l = M[sub + Node.DepsTail];
+	let l = M[sub + NodeSlot.DepsTail] as LinkId;
 	while (l !== 0) {
-		const prev = M[l + Link.PrevDep];
+		const prev = M[l + LinkSlot.PrevDep] as LinkId;
 		unlink(l, sub);
 		l = prev;
 	}
@@ -360,28 +366,28 @@ function disposeAllDepsInReverse(sub: NodeId): void {
 // Drop the dependency edges a tracking pass did not re-establish (upstream's
 // purgeDeps): everything after the pass's depsTail ages out.
 function purgeDeps(sub: NodeId): void {
-	const depsTail = M[sub + Node.DepsTail];
-	let l = depsTail !== 0 ? M[depsTail + Link.NextDep] : M[sub + Node.Deps];
+	const depsTail = M[sub + NodeSlot.DepsTail] as LinkId;
+	let l = depsTail !== 0 ? (M[depsTail + LinkSlot.NextDep] as LinkId) : (M[sub + NodeSlot.Deps] as LinkId);
 	while (l !== 0) {
 		l = unlink(l, sub);
 	}
 }
 
 // The effect/scope teardown (upstream's effectOper + effectScopeOper), shared
-// by user disposers and stop() delivery. The graph teardown itself — deps
-// unlinked in reverse, subscribers unlinked, child stops delivered — is
+// by user disposers and unwatched() delivery. The graph teardown itself —
+// deps unlinked in reverse, subscribers unlinked, child stops delivered — is
 // free()'s job, and ONLY free's: doing any of it here too would unlink the
 // same edges twice (a self-dispose mid-run leaves DepsTail mid-chain, so a
 // second reverse walk re-frees links and corrupts the free list). Clearing
-// the nodes slot FIRST makes the reentrant stop() that free delivers for
-// this very node a no-op.
+// the nodes slot FIRST makes the reentrant unwatched() that free delivers
+// for this very node a no-op.
 function disposeEffect(id: NodeId): void {
-	const st = nodes[id >> 3] as EffectState | undefined;
+	const st = nodes[id >> Arena.NodeIndexShift] as EffectState | undefined;
 	if (st === undefined) {
 		return; // already disposed
 	}
-	nodes[id >> 3] = undefined;
-	system.free(id, M[id + Node.Gen]);
+	nodes[id >> Arena.NodeIndexShift] = undefined;
+	system.free(id, st[NodeGenKey]);
 	if (st.cleanup) {
 		runCleanup(st);
 	}
@@ -397,82 +403,58 @@ function disposeScopeNode(id: NodeId): void {
 // ---- brands ------------------------------------------------------------------
 // Every handle of a kind is an instantiation of the SAME closure literal, so
 // Function.prototype.toString() is identical across all of them: kind checks
-// are a cold string compare that survives keepNames pipelines. anon() keeps
-// the literals in argument position so they stay nameless.
+// are a cold string compare.
 
 let signalSrc: string | undefined;
 let computedSrc: string | undefined;
 let effectSrc: string | undefined;
 let scopeSrc: string | undefined;
 
-function anon<T>(f: T): T {
+/**
+ * Identity helper that keeps a closure literal ANONYMOUS. Passed in argument
+ * position, a function expression gets no inferred name, so every instance
+ * of the literal has an empty `.name` and byte-identical source text for the
+ * String(fn) brand checks above — and name-preserving build pipelines
+ * (keepNames-style) have no name to re-attach, which would otherwise wrap
+ * the literal differently per site.
+ */
+function anonymous<T>(f: T): T {
 	return f;
 }
 
 // ---- public API ---------------------------------------------------------------
 
-const NODE_ID = Symbol('dalien.nodeId');
-
 /**
- * Live view over a node record: `.flags` reads/writes the semantic flag bits
- * in the record arena (the documented upstream pattern
- * `getActiveSub()!.flags &= ~ReactiveFlags.RecursedCheck` keeps working).
- */
-class NodeView implements ReactiveNode {
-	[NODE_ID]: number;
-	constructor(id: number) {
-		this[NODE_ID] = id;
-	}
-	get flags(): number {
-		return M[this[NODE_ID] + Node.Flags] & ~Flag.Hidden;
-	}
-	set flags(value: number) {
-		const id = this[NODE_ID];
-		M[id + Node.Flags] = (M[id + Node.Flags] & Flag.Hidden) | (value & ~Flag.Hidden);
-		D[(id >> 1) + 3] = 0; // flag surgery invalidates the quiet-read stamp
-	}
-}
-
-let activeSubView: NodeView | undefined;
-
-/**
- * Return a live view of the node currently recording signal reads.
+ * Return the node currently recording signal reads: the actual node-state
+ * object, whose `flags` property is a live view of the record's public
+ * update-state bits (the upstream escape hatch
+ * `getActiveSub()!.flags &= ~ReactiveFlags.RecursedCheck` works).
  *
  * Returns `undefined` outside a computed getter, effect callback, effect
- * scope, or other dependency-tracking operation. Writing `view.flags`
- * changes that node's public update flags immediately.
+ * scope, or other dependency-tracking operation.
  */
-export function getActiveSub(): ReactiveNode | undefined {
-	const id = activeSub;
-	if (!id) {
-		return undefined;
-	}
-	if (activeSubView === undefined || activeSubView[NODE_ID] !== id) {
-		activeSubView = new NodeView(id);
-	}
-	return activeSubView;
+export function getActiveSub(): (ReactiveNode & { flags: number }) | undefined {
+	return activeSub !== 0 ? nodes[activeSub >> Arena.NodeIndexShift] : undefined;
 }
 
 /**
  * Set the node that records subsequent signal reads.
  *
- * Pass a view previously returned by {@link getActiveSub}, or `undefined` to
- * disable tracking. Returns the previous view so callers can restore it.
+ * Pass a node previously returned by {@link getActiveSub}, or `undefined` to
+ * disable tracking. Returns the previous node so callers can restore it.
  */
 export function setActiveSub(sub?: ReactiveNode): ReactiveNode | undefined {
-	let id = 0;
+	const prev = activeSub;
 	if (sub !== undefined) {
-		id = (sub as NodeView)[NODE_ID];
+		const id = sub[NodeIdKey];
 		if (typeof id !== 'number') {
-			throw new TypeError('dalien-signals: setActiveSub expects a value returned by getActiveSub()');
+			throw new TypeError('dalien-signals: setActiveSub expects a node returned by getActiveSub()');
 		}
+		activeSub = id;
+	} else {
+		activeSub = 0 as NodeId;
 	}
-	const prevId = activeSub;
-	activeSub = id;
-	if (!prevId) {
-		return undefined;
-	}
-	return new NodeView(prevId);
+	return prev !== 0 ? nodes[prev >> Arena.NodeIndexShift] : undefined;
 }
 
 /**
@@ -571,14 +553,14 @@ export function signal<T>(initialValue?: T): {
 	(): T | undefined;
 	(value: T | undefined): void;
 } {
-	const st: SignalState = { current: initialValue, pending: initialValue };
-	const oper = anon(((...value: [T?]): T | undefined | void => {
+	const st = new SignalState(initialValue);
+	const oper = anonymous(((...value: [T?]): T | undefined | void => {
 		if (value.length) {
 			if (st.pending !== (st.pending = value[0])) {
-				M[id + Node.Flags] = (M[id + Node.Flags] & Flag.Hidden) | Flag.Mutable | Flag.Dirty;
+				M[id + NodeSlot.Flags] = (M[id + NodeSlot.Flags] & Host.Hidden) | Flag.Mutable | Flag.Dirty;
 				// Every committed write invalidates the quiet-read stamps.
-				++D[Sys.EpochF64];
-				const subs = M[id + Node.Subs];
+				++epoch;
+				const subs = M[id + NodeSlot.Subs] as LinkId;
 				if (subs !== 0) {
 					propagate(subs, runDepth !== 0);
 					if (!batchDepth) {
@@ -587,27 +569,32 @@ export function signal<T>(initialValue?: T): {
 				}
 			}
 		} else {
-			const flags = M[id + Node.Flags];
+			const flags = M[id + NodeSlot.Flags];
 			if (flags & Flag.Dirty) {
 				// Commit-on-read: a staged write inside an open batch.
 				if (updateSignal(id, flags, st)) {
-					const subs = M[id + Node.Subs];
+					const subs = M[id + NodeSlot.Subs] as LinkId;
 					if (subs !== 0) {
 						shallowPropagate(subs);
 					}
 				}
 			}
 			if (activeSub !== 0) {
-				link(id, activeSub, M[Sys.Cycle]);
+				link(id, activeSub, cycle);
 			}
 			return st.current as T | undefined;
 		}
 	}) as { (): T | undefined; (value: T | undefined): void });
-	const id = system.custom(Flag.Signal | Flag.Mutable, oper);
+	// The handle is the node's owner: the record reclaims when the last
+	// reference to `oper` is dropped.
+	const node = system.createReactiveNode(oper as object as ReactiveNode, Host.Signal | Flag.Mutable);
 	if (!M.length) {
 		capture();
 	}
-	nodes[id >> 3] = st;
+	const id = node[NodeIdKey];
+	st[NodeIdKey] = id;
+	st[NodeGenKey] = node[NodeGenKey];
+	nodes[id >> Arena.NodeIndexShift] = st;
 	signalSrc ??= String(oper);
 	return oper;
 }
@@ -624,55 +611,56 @@ export function signal<T>(initialValue?: T): {
  * ```
  */
 export function computed<T>(getter: (previousValue?: T) => T): () => T {
-	const st: ComputedState = {
-		value: undefined,
-		getter: getter as (previousValue?: unknown) => unknown,
-	};
-	const oper = anon((): T => {
+	const st = new ComputedState(getter as (previousValue?: unknown) => unknown);
+	const oper = anonymous((): T => {
 		// Quiet-read gate: a stamp equal to the current write epoch proves
 		// nothing observed has been written since the last verification.
-		if (D[(id >> 1) + 3] === D[Sys.EpochF64]) {
+		if (D[(id >> Arena.StampShift) + Arena.StampOffset] === epoch) {
 			if (activeSub !== 0) {
-				link(id, activeSub, M[Sys.Cycle]);
+				link(id, activeSub, cycle);
 			}
 			return st.value as T;
 		}
-		const flags = M[id + Node.Flags];
+		const flags = M[id + NodeSlot.Flags];
 		if (flags & Flag.Dirty) {
-			if (updateComputed(id, st)) {
-				const subs = M[id + Node.Subs];
+			if (updateComputed(id, st, flags)) {
+				const subs = M[id + NodeSlot.Subs] as LinkId;
 				if (subs !== 0) {
 					shallowPropagate(subs);
 				}
 			}
 		} else if (flags & Flag.Pending) {
-			const entryEpoch = D[Sys.EpochF64];
-			if (checkDirty(M[id + Node.Deps], id)) {
-				if (updateComputed(id, st)) {
-					const subs = M[id + Node.Subs];
+			const entryEpoch = epoch;
+			if (checkDirty(M[id + NodeSlot.Deps] as LinkId, id)) {
+				if (updateComputed(id, st, M[id + NodeSlot.Flags])) {
+					const subs = M[id + NodeSlot.Subs] as LinkId;
 					if (subs !== 0) {
 						shallowPropagate(subs);
 					}
 				}
 			} else {
-				M[id + Node.Flags] = flags & ~Flag.Pending;
-				D[(id >> 1) + 3] = entryEpoch;
+				M[id + NodeSlot.Flags] = flags & ~Flag.Pending;
+				D[(id >> Arena.StampShift) + Arena.StampOffset] = entryEpoch;
 			}
 		}
 		// A reentrant self-read lands here with neither bit set (the update
 		// in progress already cleared them): stale read by contract.
 		if (activeSub !== 0) {
-			link(id, activeSub, M[Sys.Cycle]);
+			link(id, activeSub, cycle);
 		}
 		return st.value as T;
 	});
 	// Minted DIRTY: the first read takes the update path (upstream's cold
-	// first evaluation), against an empty subscriber list.
-	const id = system.custom(Flag.Computed | Flag.Mutable | Flag.Dirty, oper);
+	// first evaluation), against an empty subscriber list. The handle owns
+	// the record.
+	const node = system.createReactiveNode(oper as object as ReactiveNode, Host.Computed | Flag.Mutable | Flag.Dirty);
 	if (!M.length) {
 		capture();
 	}
-	nodes[id >> 3] = st;
+	const id = node[NodeIdKey];
+	st[NodeIdKey] = id;
+	st[NodeGenKey] = node[NodeGenKey];
+	nodes[id >> Arena.NodeIndexShift] = st;
 	computedSrc ??= String(oper);
 	return oper;
 }
@@ -690,33 +678,36 @@ export function computed<T>(getter: (previousValue?: T) => T): () => T {
  * ```
  */
 export function effect(fn: () => void | (() => void)): () => void {
-	const st: EffectState = { fn, cleanup: undefined };
-	const id = system.custom(Flag.Effect | Flag.Watching | Flag.RecursedCheck);
+	// The state object is the owner; the nodes table holds it until
+	// disposal, so effects are never garbage-collected out from under the
+	// graph — they run until stopped.
+	const st = system.createReactiveNode<EffectState>(new EffectState(fn), Host.Effect | Flag.Watching | Flag.RecursedCheck);
 	if (!M.length) {
 		capture();
 	}
-	const gen = M[id + Node.Gen];
-	nodes[id >> 3] = st;
+	const id = st[NodeIdKey];
+	const gen = st[NodeGenKey];
+	nodes[id >> Arena.NodeIndexShift] = st;
 	const prevSub = activeSub;
 	activeSub = id;
 	if (prevSub !== 0) {
 		// A child effect is a dependency of its parent: the parent's next
 		// re-run (or disposal) unlinks it, which disposes it.
 		link(id, prevSub, 0);
-		M[prevSub + Node.Flags] |= Flag.HasChildEffect;
+		M[prevSub + NodeSlot.Flags] |= Host.HasChildEffect;
 	}
-	++M[Sys.EnterDepth];
+	++M[SysSlot.EnterDepth];
 	++runDepth;
 	try {
 		st.cleanup = fn();
 	} finally {
 		--runDepth;
-		--M[Sys.EnterDepth];
+		--M[SysSlot.EnterDepth];
 		activeSub = prevSub;
-		M[id + Node.Flags] &= ~Flag.RecursedCheck;
+		M[id + NodeSlot.Flags] &= ~Flag.RecursedCheck;
 	}
-	const dispose = anon((): void => {
-		if (M[id + Node.Gen] === gen) {
+	const dispose = anonymous((): void => {
+		if (M[id + NodeSlot.Gen] === gen) {
 			disposeEffect(id);
 		}
 	});
@@ -739,34 +730,44 @@ export function effect(fn: () => void | (() => void)): () => void {
  * ```
  */
 export function effectScope(fn: () => void): () => void {
-	const st: EffectState = { fn: fn as () => void, cleanup: undefined };
-	const id = system.custom(Flag.Scope | Flag.Mutable);
+	const st = system.createReactiveNode<EffectState>(new EffectState(fn as () => void), Host.Scope | Flag.Mutable);
 	if (!M.length) {
 		capture();
 	}
-	const gen = M[id + Node.Gen];
-	nodes[id >> 3] = st;
+	const id = st[NodeIdKey];
+	const gen = st[NodeGenKey];
+	nodes[id >> Arena.NodeIndexShift] = st;
 	const prevSub = activeSub;
 	activeSub = id;
 	if (prevSub !== 0) {
 		link(id, prevSub, 0);
-		M[prevSub + Node.Flags] |= Flag.HasChildEffect;
+		M[prevSub + NodeSlot.Flags] |= Host.HasChildEffect;
 	}
-	++M[Sys.EnterDepth];
+	++M[SysSlot.EnterDepth];
 	try {
 		fn();
 	} finally {
-		--M[Sys.EnterDepth];
+		--M[SysSlot.EnterDepth];
 		activeSub = prevSub;
 	}
-	const disposeScope = anon((): void => {
-		if (M[id + Node.Gen] === gen) {
+	const disposeScope = anonymous((): void => {
+		if (M[id + NodeSlot.Gen] === gen) {
 			disposeScopeNode(id);
 		}
 	});
 	scopeSrc ??= String(disposeScope);
 	return disposeScope;
 }
+
+function noopEffectBody(): void {}
+
+// One persistent scratch subscriber for trigger(), minted on first use and
+// reused ever after: its record is never freed (this module never resets the
+// default system, so the id stays valid), and Watching|RecursedCheck
+// together keep the propagation ladder from ever notifying it. A reentrant
+// trigger — rare — falls back to a throwaway node.
+let triggerScratch: EffectState | undefined;
+let triggerScratchBusy = false;
 
 /**
  * Notify dependents after mutating values stored inside signals in place.
@@ -775,33 +776,55 @@ export function effectScope(fn: () => void): () => void {
 export function trigger(fn: () => void): void {
 	// A scratch subscriber records the reads; unlinking it afterwards turns
 	// each recorded dependency into an out-of-band invalidation wave.
-	const scratch = system.custom(Flag.Watching | Flag.RecursedCheck);
-	if (!M.length) {
-		capture();
+	let st: EffectState;
+	let persistent = false;
+	if (!triggerScratchBusy && triggerScratch !== undefined) {
+		st = triggerScratch;
+		persistent = true;
+		const sid = st[NodeIdKey];
+		M[sid + NodeSlot.Flags] = (M[sid + NodeSlot.Flags] & Host.Hidden) | Flag.Watching | Flag.RecursedCheck;
+	} else {
+		st = system.createReactiveNode<EffectState>(new EffectState(noopEffectBody), Flag.Watching | Flag.RecursedCheck);
+		if (!M.length) {
+			capture();
+		}
+		nodes[st[NodeIdKey] >> Arena.NodeIndexShift] = st;
+		if (triggerScratch === undefined && !triggerScratchBusy) {
+			triggerScratch = st;
+			persistent = true;
+		}
 	}
-	const gen = M[scratch + Node.Gen];
+	if (persistent) {
+		triggerScratchBusy = true;
+	}
+	const id = st[NodeIdKey];
 	const prevSub = activeSub;
-	activeSub = scratch;
+	activeSub = id;
 	++batchDepth;
-	++M[Sys.EnterDepth];
+	++M[SysSlot.EnterDepth];
 	try {
 		fn();
 	} finally {
 		activeSub = prevSub;
-		M[scratch + Node.Flags] &= Flag.Hidden;
-		++D[Sys.EpochF64];
-		let l = M[scratch + Node.Deps];
+		M[id + NodeSlot.Flags] &= Host.Hidden;
+		++epoch;
+		let l = M[id + NodeSlot.Deps] as LinkId;
 		while (l !== 0) {
-			const dep = M[l + Link.Dep];
-			l = unlink(l, scratch);
-			const subs = M[dep + Node.Subs];
+			const dep = M[l + LinkSlot.Dep] as NodeId;
+			l = unlink(l, id);
+			const subs = M[dep + NodeSlot.Subs] as LinkId;
 			if (subs !== 0) {
 				propagate(subs, runDepth !== 0);
 				shallowPropagate(subs);
 			}
 		}
-		--M[Sys.EnterDepth];
-		system.free(scratch, gen);
+		--M[SysSlot.EnterDepth];
+		if (persistent) {
+			triggerScratchBusy = false;
+		} else {
+			nodes[id >> Arena.NodeIndexShift] = undefined;
+			system.free(id, st[NodeGenKey]);
+		}
 		if (!--batchDepth) {
 			flush();
 		}
