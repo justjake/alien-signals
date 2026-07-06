@@ -27,7 +27,7 @@ const BUDGETS: Record<string, number> = {
 	linkInsert: 340,
 	unlink: 300,
 	propagate: 420,
-	checkDirty: 200, // wrapper + the shallow dirty-first-dep fast path; still well inside the inline limit so run()/computedReadWith can absorb it
+	checkDirty: 400, // wrapper + the one- and two-level shallow fast paths; still inside the inline limit so run()/computedReadWith can absorb it
 	checkDirtyLoop: INLINE_LIMIT,
 	updateAndShallow: 100,
 	shallowPropagate: 160,

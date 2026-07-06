@@ -988,17 +988,46 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 				return true;
 			}
 			const dep = M[startLink + C.DEP];
-			if ((M[dep + C.FLAGS] & (C.MUTABLE | C.DIRTY)) === (C.MUTABLE | C.DIRTY)) {
+			const depFlags = M[dep + C.FLAGS];
+			if ((depFlags & (C.MUTABLE | C.DIRTY)) === (C.MUTABLE | C.DIRTY)) {
 				if (updateAndShallow(dep, M[dep + C.SUBS])) {
 					// Same disposed-sub guard as the loop's return: update()
 					// may run user code that disposes the sub mid-walk.
 					return M[startSub + C.FLAGS] !== 0;
 				}
 				const nextDep = M[startLink + C.NEXT_DEP];
-				if (nextDep === 0) {
+				if (!nextDep) {
 					return false;
 				}
 				startLink = nextDep;
+			} else if ((depFlags & (C.MUTABLE | C.PENDING)) === (C.MUTABLE | C.PENDING)) {
+				// Two-level degenerate case: the pending dep has exactly one
+				// dep of its own and it is directly dirty — the shape of
+				// every effect one computed away from a written signal. The
+				// sequence mirrors the loop's descend-then-unwind for this
+				// shape: update the inner node (subs captured first), then
+				// either recompute the pending dep or clear its Pending.
+				const innerLink = M[dep + C.DEPS];
+				const inner = M[innerLink + C.DEP];
+				if (
+					!M[innerLink + C.NEXT_DEP]
+					&& (M[inner + C.FLAGS] & (C.MUTABLE | C.DIRTY)) === (C.MUTABLE | C.DIRTY)
+				) {
+					if (updateAndShallow(inner, M[inner + C.SUBS])) {
+						if (updateAndShallow(dep, M[dep + C.SUBS])) {
+							return M[startSub + C.FLAGS] !== 0;
+						}
+					} else {
+						M[dep + C.FLAGS] &= ~C.PENDING;
+					}
+					const nextDep = M[startLink + C.NEXT_DEP];
+					if (!nextDep) {
+						return false;
+					}
+					startLink = nextDep;
+				}
+				// Anything deeper falls through to the general loop with no
+				// state mutated.
 			}
 			const stackBase = checkSp;
 			try {

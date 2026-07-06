@@ -32,7 +32,7 @@ const FAMILIES = [
 	{ key: 'batch', label: 'batch: N writes, tiny cone each', color: '#008300' },
 	{ key: 'islands', label: 'islands: fixed cone + N idle nodes', color: INK3, dash: true },
 ];
-const SIZES = [1, 3, 10, 30, 100, 300, 1000, 3000, 10000, 30000];
+const SIZES = [1, 2, 3, 10, 30, 100, 300, 1000, 3000, 10000, 30000];
 
 const series = FAMILIES.map((f) => ({
 	...f,
