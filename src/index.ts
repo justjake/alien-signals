@@ -13,10 +13,13 @@
  * node records directly in the shared arena. Values and callbacks live in
  * side columns indexed by record number.
  *
- * Lifetime is scope- or caller-managed: dispose() effects and scopes (a
- * scope disposal cascades to the effects it owns), and reset() tears down
- * the whole graph. Signals and computeds otherwise live until reset — there
- * is no per-node garbage collection for numeric handles.
+ * Lifetime, in precedence order: an explicit `owner` argument ties a
+ * node's life to that object (freed by the garbage collector when the owner
+ * goes); otherwise the innermost effectScope OWNS nodes minted inside it
+ * and frees them when it disposes (region ownership — the leak-free default
+ * for structured code); at top level, handles are caller-managed via
+ * dispose()/reset(), like any global. Effects always belong to the
+ * effect/scope they were created under and cascade on dispose.
  */
 import {
 	Arena,
@@ -69,11 +72,22 @@ const currentVals: unknown[] = [];
 const pendingVals: unknown[] = [];
 const fns: (NodeFn | undefined)[] = [];
 const cleanups: ((() => void) | void)[] = [];
+// A scope's owned signals/computeds as (id, gen) pairs: freed when the
+// scope disposes. Gen-guarded, so a member freed early (and its record
+// reused) cannot be freed out from under the new occupant.
+const owned: (number[] | undefined)[] = [];
 
 // ---- host-owned tracking state (upstream's module lets) ---------------------
 
 let runDepth = 0;
 let batchDepth = 0;
+/**
+ * The innermost live effectScope: signals and computeds minted inside it
+ * belong to it and are freed when it disposes (region ownership — the
+ * leak-free default for structured code). An explicit `owner` argument
+ * takes precedence; outside any scope, handles are caller-managed.
+ */
+let currentScope: SignalId = 0;
 let notifyIndex = 0;
 let queuedLength = 0;
 let activeSub: SignalId = 0;
@@ -367,6 +381,17 @@ function disposeEffect(id: SignalId): void {
 	if (cleanups[idx]) {
 		runCleanup(idx);
 	}
+	const region = owned[idx];
+	if (region !== undefined) {
+		// A scope frees the signals/computeds minted inside it (gen-guarded:
+		// members freed early, or freed by a nested scope, no-op here).
+		owned[idx] = undefined;
+		for (let i = 0; i < region.length; i += 2) {
+			const member: SignalId = region[i];
+			fns[member >> Arena.NodeIndexShift] = undefined;
+			freeNode(member, region[i + 1]);
+		}
+	}
 }
 
 // ---- public API ---------------------------------------------------------------
@@ -436,11 +461,13 @@ export function reset(): void {
 	pendingVals.length = 0;
 	fns.length = 0;
 	cleanups.length = 0;
+	owned.length = 0;
 	queued.length = 0;
 	queuedGens.length = 0;
 	notifyIndex = 0;
 	queuedLength = 0;
 	activeSub = 0;
+	currentScope = 0;
 	batchDepth = 0;
 	runDepth = 0;
 	triggerScratch = 0;
@@ -526,6 +553,9 @@ export function signal<T>(initialValue?: T, owner?: WeakKey): Signal<T | undefin
 	const idx = id >> Arena.NodeIndexShift;
 	currentVals[idx] = initialValue;
 	pendingVals[idx] = initialValue;
+	if (owner === undefined && currentScope !== 0) {
+		owned[currentScope >> Arena.NodeIndexShift]!.push(id, M[id + NodeSlot.Gen]);
+	}
 	return id;
 }
 
@@ -627,6 +657,9 @@ export function computed<T>(getter: (previousValue?: T) => T, owner?: WeakKey): 
 		? system.createNode(owner, Host.Computed | Flag.Mutable | Flag.Dirty)
 		: system.allocNode(Host.Computed | Flag.Mutable | Flag.Dirty);
 	fns[id >> Arena.NodeIndexShift] = getter as NodeFn;
+	if (owner === undefined && currentScope !== 0) {
+		owned[currentScope >> Arena.NodeIndexShift]!.push(id, M[id + NodeSlot.Gen]);
+	}
 	return id;
 }
 
@@ -684,8 +717,11 @@ export function effect(fn: () => void | (() => void)): SignalId {
 export function effectScope(fn: () => void): SignalId {
 	const id = system.allocNode(Host.Scope | Flag.Mutable);
 	fns[id >> Arena.NodeIndexShift] = fn as NodeFn;
+	owned[id >> Arena.NodeIndexShift] = [];
 	const prevSub = activeSub;
+	const prevScope = currentScope;
 	activeSub = id;
+	currentScope = id;
 	if (prevSub !== 0) {
 		link(id, prevSub, 0);
 		M[prevSub + NodeSlot.Flags] |= Host.HasChildEffect;
@@ -696,6 +732,7 @@ export function effectScope(fn: () => void): SignalId {
 	} finally {
 		--M[SysSlot.EnterDepth];
 		activeSub = prevSub;
+		currentScope = prevScope;
 	}
 	return id;
 }

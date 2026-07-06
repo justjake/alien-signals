@@ -1,4 +1,5 @@
 import { expect, test } from 'vitest';
+import { computed, dispose, effectScope as effectScopeRaw, get, isComputed, isSignal, signal as signalRaw } from '../src';
 import { effectFn as effect, effectScopeFn as effectScope, signalFn as signal } from './helpers/closures';
 
 test('scope dispose runs child effect cleanup', () => {
@@ -70,4 +71,33 @@ test('scope as intermediate parent: cleanup order respects nesting', () => {
 		'outer:run',
 		'inner:run',
 	]);
+});
+
+test('a scope owns the signals and computeds minted inside it', () => {
+	let s!: ReturnType<typeof signalRaw<number>>;
+	let c!: ReturnType<typeof computed<number>>;
+	const scope = effectScopeRaw(() => {
+		s = signalRaw(1);
+		c = computed(() => get(s) + 1);
+		expect(get(c)).toBe(2);
+	});
+	expect(isSignal(s)).toBe(true);
+	expect(isComputed(c)).toBe(true);
+	dispose(scope);
+	// Region ownership: the scope freed its members.
+	expect(isSignal(s)).toBe(false);
+	expect(isComputed(c)).toBe(false);
+});
+
+test('a member disposed early is not double-freed by its scope', () => {
+	let s!: ReturnType<typeof signalRaw<number>>;
+	const scope = effectScopeRaw(() => {
+		s = signalRaw(1);
+	});
+	dispose(s);
+	// The record may be reused by a NEW node before the scope goes.
+	const stranger = signalRaw(42);
+	dispose(scope); // gen guard: must not free the stranger
+	expect(get(stranger)).toBe(42);
+	dispose(stranger);
 });
