@@ -53,10 +53,11 @@
  * list (deferred to the next operation boundary so a mid-flush dispose can
  * never recycle a record the queue or an in-flight walk still references; a
  * generation counter in the record makes stale disposers no-ops). Signal and
- * computed records are owned by the user's handle closures and are NOT
- * reclaimed: dropping the last reference to a signal/computed handle leaks
- * its record. The fix would be a FinalizationRegistry on the handles pushing
- * ids onto the free list — deliberately not implemented here.
+ * computed records are reclaimed through a required FinalizationRegistry:
+ * when the last reference to a handle is collected, the registry callback
+ * pushes the record onto the free list (signals register at mint; computeds
+ * register at first evaluation, with the handle-owned getter as the weak
+ * target). system.reset() reclaims an entire generation wholesale.
  *
  * BREAKING CHANGES vs upstream system.ts: nodes are integer ids, not
  * objects; `createReactiveSystem` no longer takes update/notify/unwatched
