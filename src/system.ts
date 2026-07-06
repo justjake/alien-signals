@@ -164,6 +164,9 @@ const enum C {
 	// A handle-owned getter is currently installed in the fns column (only
 	// while the computed has subscribers — see makeComputed). Engine-internal.
 	FN_INSTALLED = 4096,
+	// The host's start() lifecycle callback ran for this node and its stop()
+	// has not (see ReactiveSystemOptions.start/stop). Engine-internal.
+	HOST_STARTED = 8192,
 	// Bits visible through the public ReactiveNode view (semantic bits +
 	// HasChildEffect, which upstream also kept in the public flags word).
 	PUBLIC_MASK = 127,
@@ -276,6 +279,30 @@ export interface ReactiveEngine {
 	 * no-ops). Only meaningful with a `notify` host scheduler installed.
 	 */
 	runEffect(id: number, gen: number): void;
+	/**
+	 * Add a dependency edge: `sub` re-verifies (and effects re-run) when
+	 * `dep` changes. Returns the edge's id (the existing one if the edge is
+	 * already present). The edge behaves exactly like one made by a tracked
+	 * read: if `sub` re-tracks (recomputes or re-runs), manual edges it does
+	 * not re-establish are dropped.
+	 */
+	link(depId: NodeId, subId: NodeId): LinkId;
+	/** Remove an edge made by `link` (or observed via tracking). */
+	unlink(linkId: LinkId): void;
+	/**
+	 * Mark everything downstream of `id` possibly-stale (PENDING), queue
+	 * affected effects, invalidate quiet-read stamps, and — matching a
+	 * write — flush unless a batch is open. Pair with `shallowPropagate`
+	 * when the node's value changed out of band, so direct subscribers are
+	 * promoted to DIRTY and actually recompute.
+	 */
+	propagate(id: NodeId): void;
+	/**
+	 * Promote `id`'s PENDING subscribers to DIRTY (they will recompute on
+	 * next pull), queue affected effects, invalidate stamps, and flush
+	 * unless a batch is open.
+	 */
+	shallowPropagate(id: NodeId): void;
 	makeSignal(initialValue?: unknown): SignalHandle;
 	makeComputed(getter: (previousValue?: unknown) => unknown): () => unknown;
 	makeEffect(fn: () => (() => void) | void): () => void;
@@ -342,6 +369,14 @@ export interface ReactiveSystem {
 	 * no-ops). Only meaningful with a `notify` host scheduler installed.
 	 */
 	runEffect(id: number, gen: number): void;
+	/** Add a dependency edge; see {@link ReactiveEngine.link}. */
+	link(depId: NodeId, subId: NodeId): LinkId;
+	/** Remove an edge; see {@link ReactiveEngine.unlink}. */
+	unlink(linkId: LinkId): void;
+	/** Push staleness downstream; see {@link ReactiveEngine.propagate}. */
+	propagate(id: NodeId): void;
+	/** Promote pending subscribers; see {@link ReactiveEngine.shallowPropagate}. */
+	shallowPropagate(id: NodeId): void;
 	/** Current generation counter of a record (capture at creation). */
 	gen(id: number): number;
 	signalRead(id: number): unknown;
@@ -392,7 +427,34 @@ export interface ReactiveSystemOptions {
 	 *   scheduler, startBatch/endBatch no longer defer anything.
 	 */
 	notify?: (effectId: number, gen: number) => void;
+	/**
+	 * Watched-lifecycle callbacks. `start` runs when a node gains its FIRST
+	 * subscriber; whatever it returns is stored and passed to `stop` when the
+	 * node's LAST subscriber unlinks. Use for subscription-counted external
+	 * resources (connect on first watch, disconnect on last).
+	 *
+	 * - `js` is the node's payload: a signal's current value, otherwise the
+	 *   node's installed function (undefined for a handle-minted computed
+	 *   whose getter is not yet borrowed).
+	 * - Delivery is INLINE, inside graph operations — treat callbacks like
+	 *   effect-cleanup code (reads/writes are fine and queue normally).
+	 * - Laziness makes "watched" approximate observed-by-an-effect: an
+	 *   unobserved computed never evaluates, so it never links dependencies.
+	 * - `reset()` delivers `stop` for every started node (newest first);
+	 *   those callbacks must not touch reactive state mid-reset.
+	 */
+	start?: (id: NodeId, js: unknown) => unknown;
+	stop?: (id: NodeId, js: unknown, state: unknown) => void;
 }
+
+/** A record id: a node's (or link's) starting offset in the arena. */
+export type NodeId = number;
+export type SignalId = number;
+export type ComputedId = number;
+export type EffectId = number;
+export type EffectScopeId = number;
+/** Id of an edge record returned by `link`; pass to `unlink`. */
+export type LinkId = number;
 
 /**
  * Create an independent reactive graph with its own arena, queues, and
@@ -418,6 +480,16 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 	// fit two i32 record slots and the whole scheme never wraps.
 	let epochLo = 1;
 	let epochHi = 1;
+
+	// Invalidate every quiet-read stamp: any observed change MUST pass here
+	// (or use the inline twin in write()) or stamped computeds keep serving
+	// their cached values.
+	function bumpEpoch(): void {
+		if (++epochLo === 0x40000000) {
+			epochLo = 0;
+			++epochHi;
+		}
+	}
 	let runDepth = 0;
 	let batchDepth = 0;
 	let notifyIndex = 0;
@@ -495,6 +567,11 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 	// createReactiveSystem or configure() — i.e. only before materialization,
 	// so effect scheduling cannot change shape mid-run.
 	let hostNotify = options?.notify;
+	let hostStart = options?.start;
+	let hostStop = options?.stop;
+	// One slot per record: the state returned by hostStart, held until
+	// hostStop. Only populated when the callbacks are configured.
+	const hostState: unknown[] = [];
 	let inner: Engine | undefined;
 	// Reclaims signal/computed records whose handles were garbage collected
 	// (upstream reclaims them implicitly: its whole graph is GC-visible).
@@ -786,6 +863,10 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			computedRead,
 			run,
 			runEffect,
+			link: linkNode,
+			unlink: unlinkEdge,
+			propagate: propagateNode,
+			shallowPropagate: shallowPropagateNode,
 			requeueAbort,
 			dispose,
 			trigger,
@@ -1025,6 +1106,11 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 				M[prevSub + C.NEXT_SUB] = newLink;
 			} else {
 				M[dep + C.SUBS] = newLink;
+				// First subscriber: watched-lifecycle start (out of the common
+				// re-subscribe path; one context compare on first-link only).
+				if (hostStart !== undefined) {
+					hostStartNode(dep);
+				}
 			}
 		}
 
@@ -1056,6 +1142,95 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 				unwatched(dep);
 			}
 			return nextDep;
+		}
+
+		// ---- composable kit (public, id-shaped; cold next to the walks) -------
+
+		// Public link: same three cases as link(), but returns the edge id.
+		// Manual edges carry the current tracking version, so they age out on
+		// re-track exactly like read-discovered edges (upstream parity).
+		function linkNode(dep: number, sub: number): number {
+			if (retired) {
+				return inner!.link(dep, sub);
+			}
+			const prevDep = M[sub + C.DEPS_TAIL];
+			if (prevDep !== 0 && M[prevDep + C.DEP] === dep) {
+				return prevDep;
+			}
+			const nextDep = prevDep !== 0 ? M[prevDep + C.NEXT_DEP] : M[sub + C.DEPS];
+			if (nextDep !== 0 && M[nextDep + C.DEP] === dep) {
+				M[nextDep + C.VERSION] = cycle;
+				M[sub + C.DEPS_TAIL] = nextDep;
+				return nextDep;
+			}
+			linkInsert(dep, sub, cycle, prevDep, nextDep);
+			// Insert and its dedup fast path both leave the edge as the dep's
+			// subscriber tail.
+			return M[dep + C.SUBS_TAIL];
+		}
+
+		function unlinkEdge(linkId: number): void {
+			if (retired) {
+				inner!.unlink(linkId);
+				return;
+			}
+			unlink(linkId);
+		}
+
+		function propagateNode(id: number): void {
+			if (retired) {
+				inner!.propagate(id);
+				return;
+			}
+			const subs = M[id + C.SUBS];
+			if (subs !== 0) {
+				bumpEpoch();
+				propagate(subs, runDepth !== 0);
+				if (!batchDepth) {
+					flush();
+				}
+			}
+		}
+
+		function shallowPropagateNode(id: number): void {
+			if (retired) {
+				inner!.shallowPropagate(id);
+				return;
+			}
+			const subs = M[id + C.SUBS];
+			if (subs !== 0) {
+				bumpEpoch();
+				shallowPropagate(subs);
+				if (!batchDepth) {
+					flush();
+				}
+			}
+		}
+
+		// ---- watched lifecycle (ReactiveSystemOptions.start/stop) -------------
+
+		// Inline delivery, like upstream's unwatched: callbacks run inside
+		// graph operations and are treated like effect-cleanup code.
+		function hostStartNode(id: number): void {
+			const flags = M[id + C.FLAGS];
+			if (flags & C.HOST_STARTED) {
+				return;
+			}
+			M[id + C.FLAGS] = flags | C.HOST_STARTED;
+			hostState[id >> 3] = hostStart!(
+				id,
+				flags & C.K_SIGNAL ? vals[id >> 2] : fnTab[id >> 3],
+			);
+		}
+
+		function hostStopNode(id: number): void {
+			const flags = M[id + C.FLAGS] & ~C.HOST_STARTED;
+			M[id + C.FLAGS] = flags;
+			const state = hostState[id >> 3];
+			hostState[id >> 3] = undefined;
+			if (hostStop !== undefined) {
+				hostStop(id, flags & C.K_SIGNAL ? vals[id >> 2] : fnTab[id >> 3], state);
+			}
 		}
 
 		function propagate(startLink: number, innerWrite: boolean): void {
@@ -1344,6 +1519,12 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		}
 
 		function unwatched(node: number): void {
+			if (M[node + C.FLAGS] & C.HOST_STARTED) {
+				hostStopNode(node);
+				if (M[node + C.SUBS] !== 0) {
+					return; // stop() re-subscribed the node; it is watched again
+				}
+			}
 			const flags = M[node + C.FLAGS];
 			if (flags & C.K_COMPUTED) {
 				// Alien recomputes an unwatched computed on its next read (it
@@ -2012,6 +2193,12 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			if (configureOptions?.notify !== undefined) {
 				hostNotify = configureOptions.notify;
 			}
+			if (configureOptions?.start !== undefined) {
+				hostStart = configureOptions.start;
+			}
+			if (configureOptions?.stop !== undefined) {
+				hostStop = configureOptions.stop;
+			}
 			materialize();
 		},
 		reset(): void {
@@ -2028,7 +2215,22 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			// calling one is undefined behavior (it reads whatever new node
 			// occupies its record). The engine closures (and their warmed-up
 			// JIT state) are reused; only the arena contents restart.
-			inner.buffer().fill(0, 0, recNext);
+			// Watched-lifecycle teardown: every started node gets its stop
+			// before the arena rewinds (newest records first, LIFO-ish). These
+			// callbacks must not touch reactive state mid-reset.
+			const M = inner.buffer();
+			for (let id = recNext - 8; id >= 8; id -= 8) {
+				const flags = M[id + C.FLAGS];
+				if (flags & C.HOST_STARTED) {
+					const state = hostState[id >> 3];
+					hostState[id >> 3] = undefined;
+					if (hostStop !== undefined) {
+						hostStop(id, flags & C.K_SIGNAL ? values[id >> 2] : fns[id >> 3], state);
+					}
+				}
+			}
+			hostState.length = 0;
+			M.fill(0, 0, recNext);
 			recNext = 8;
 			nodeFreeHead = 0;
 			linkFreeHead = 0;
@@ -2073,6 +2275,20 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		},
 		runEffect(id: number, gen: number): void {
 			ensureEngine().runEffect(id, gen);
+		},
+		link(depId: NodeId, subId: NodeId): LinkId {
+			const engine = ensureEngine();
+			maybeBoundary(); // link allocates a record
+			return engine.link(depId, subId);
+		},
+		unlink(linkId: LinkId): void {
+			ensureEngine().unlink(linkId);
+		},
+		propagate(id: NodeId): void {
+			ensureEngine().propagate(id);
+		},
+		shallowPropagate(id: NodeId): void {
+			ensureEngine().shallowPropagate(id);
 		},
 		gen(id: number): number {
 			return ensureEngine().buffer()[id + C.GEN];

@@ -311,6 +311,20 @@ Whenever a write could invalidate cached work, the engine increments a global wr
 - The lower-level engine's `reset()` method clears the whole arena at once. Functions and numeric IDs created before the reset become invalid.
 - `tests/bytecode.spec.ts` enforces V8's 460-bytecode inline limit for hot functions. Large functions are split so the JIT can inline them into callers.
 
+## Build your own framework
+
+`createReactiveSystem` returns a complete, composable kit. `src/index.ts` is one example client — a typed signal framework built strictly from this public surface (`tests/policyBoundary.spec.ts` enforces that); a host can build its own instead:
+
+- `signal(v)` / `computed(fn)` / `effect(fn)` / `effectScope(fn)` — allocate nodes, returning numeric IDs
+- `signalRead` / `signalWrite` / `computedRead` — operate on IDs; `dispose(id, gen)` tears down
+- `link(depId, subId): LinkId` — add a dependency edge by hand; `unlink(linkId)` removes it. Manual edges age out if the subscriber re-tracks without re-establishing them, exactly like read-discovered edges
+- `propagate(id)` — mark everything downstream possibly-stale, queue effects, invalidate epoch stamps, flush unless batched; `shallowPropagate(id)` — promote direct subscribers to dirty. Use both after changing something out of band
+- `notify: (effectId, gen) => void` (option) — take over effect scheduling; the engine reports each affected effect once per wave and runs nothing until you call `runEffect(effectId, gen)`. Stale IDs are no-ops via the `gen` check — buffer to an animation frame with `notify: (id, gen) => queue.push([id, gen])` + one `runEffect` loop per frame
+- `start: (id, js) => state` / `stop: (id, js, state)` (options) — watched lifecycle: `start` runs when a node gains its first subscriber, `stop` when the last leaves (and on `reset()`). Connect an external resource on first watch, disconnect on last, keep its handle in `state`
+- `setActiveSub` / `getActiveSub`, `nodeFlags` / `setNodeFlags`, `gen`, `stats`, `buffer` — tracking control and introspection
+
+IDs are integers; using one after its node is disposed or reclaimed is undefined behavior, except through the gen-guarded entry points (`dispose`, `runEffect`).
+
 ## Constraints
 
 - The arena grows between operations. Once 3/4 full, the engine is rebuilt over an arena twice the size; every record is copied and IDs survive, so functions created before a growth keep working. Measured cost: benchmark totals within noise, and reads that hit the epoch fast path pay nothing.
