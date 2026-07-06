@@ -271,6 +271,11 @@ export interface ReactiveEngine {
 	computedRead(id: number): unknown;
 	/** Dispose an effect/scope if `gen` still matches (stale ids are no-ops). */
 	dispose(id: number, gen: number): void;
+	/**
+	 * Run a host-notified effect if `gen` still matches (stale ids are
+	 * no-ops). Only meaningful with a `notify` host scheduler installed.
+	 */
+	runEffect(id: number, gen: number): void;
 	makeSignal(initialValue?: unknown): SignalHandle;
 	makeComputed(getter: (previousValue?: unknown) => unknown): () => unknown;
 	makeEffect(fn: () => (() => void) | void): () => void;
@@ -332,6 +337,11 @@ export interface ReactiveSystem {
 	effectScope(fn: () => void): number;
 	/** Dispose an effect/scope if `gen` still matches (stale ids are no-ops). */
 	dispose(id: number, gen: number): void;
+	/**
+	 * Run a host-notified effect if `gen` still matches (stale ids are
+	 * no-ops). Only meaningful with a `notify` host scheduler installed.
+	 */
+	runEffect(id: number, gen: number): void;
 	/** Current generation counter of a record (capture at creation). */
 	gen(id: number): number;
 	signalRead(id: number): unknown;
@@ -364,8 +374,24 @@ export interface ReactiveSystem {
 }
 
 export interface ReactiveSystemOptions {
-	/** Arena CAPACITY in 32-byte records (fixed; default 2^23). */
+	/** Arena STARTING capacity in 32-byte records (default 2^23; grows). */
 	initialRecords?: number;
+	/**
+	 * Host effect scheduler (upstream's `notify` seam, id-shaped). When set,
+	 * the engine never runs effects itself: each effect that would have been
+	 * queued is reported here exactly once — in the order the built-in queue
+	 * would run them (outer effects before their children) — and stays
+	 * silent until the host runs it via `runEffect(effectId, gen)`.
+	 *
+	 * Contract:
+	 * - run every notified effect eventually, or it never re-notifies (the
+	 *   dedup that prevents double-queueing is only reset by running it);
+	 * - `gen` makes stale ids harmless: a disposed-and-recycled record makes
+	 *   `runEffect` a no-op, so the host queue needs no cleanup on dispose;
+	 * - notifications fire at write time even inside batches — with a host
+	 *   scheduler, startBatch/endBatch no longer defer anything.
+	 */
+	notify?: (effectId: number, gen: number) => void;
 }
 
 /**
@@ -465,6 +491,10 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 	let configuredRecords = options?.initialRecords !== undefined
 		? normalizeRecords(options.initialRecords)
 		: DEFAULT_RECORDS;
+	// Host effect scheduler (see ReactiveSystemOptions.notify). Settable via
+	// createReactiveSystem or configure() — i.e. only before materialization,
+	// so effect scheduling cannot change shape mid-run.
+	let hostNotify = options?.notify;
 	let inner: Engine | undefined;
 	// Reclaims signal/computed records whose handles were garbage collected
 	// (upstream reclaims them implicitly: its whole graph is GC-visible).
@@ -755,6 +785,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			write,
 			computedRead,
 			run,
+			runEffect,
 			requeueAbort,
 			dispose,
 			trigger,
@@ -1291,6 +1322,25 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 				queue[left++] = queue[insertIndex];
 				queue[insertIndex] = tmp;
 			}
+
+			// Host scheduler: hand over the ordered segment instead of keeping
+			// it queued. Out of line to keep notify (called from the propagate
+			// ladder) inside its bytecode budget.
+			if (hostNotify !== undefined) {
+				notifyHost(firstInsertedIndex);
+			}
+		}
+
+		// The flags bookkeeping notify already did (WATCHING cleared) is the
+		// same dedup the built-in queue relies on; run() restores it.
+		function notifyHost(first: number): void {
+			const host = hostNotify!;
+			for (let i = first; i < queuedLength; ++i) {
+				const id = queue[i];
+				queue[i] = 0;
+				host(id, M[id + C.GEN]);
+			}
+			queuedLength = first;
 		}
 
 		function unwatched(node: number): void {
@@ -1425,6 +1475,22 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		}
 
 		// flush() abort path: re-arm effects still queued after a throw.
+		// Host-scheduler counterpart of dispose(id, gen): run a notified
+		// effect if its record generation still matches. A stale id (the
+		// effect was disposed, its record possibly recycled) is a no-op, so
+		// host queues need no cleanup when effects die.
+		function runEffect(e: number, gen: number): void {
+			maybeBoundary(); // growth-safe point between host-scheduled runs
+			if (retired) {
+				inner!.runEffect(e, gen);
+				return;
+			}
+			if (M[e + C.GEN] !== gen) {
+				return;
+			}
+			run(e);
+		}
+
 		function requeueAbort(e: number): void {
 			if (M[e + C.FLAGS] & C.KIND_MASK) {
 				M[e + C.FLAGS] |= C.WATCHING | C.RECURSED;
@@ -1943,6 +2009,9 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			if (configureOptions?.initialRecords !== undefined) {
 				configuredRecords = normalizeRecords(configureOptions.initialRecords);
 			}
+			if (configureOptions?.notify !== undefined) {
+				hostNotify = configureOptions.notify;
+			}
 			materialize();
 		},
 		reset(): void {
@@ -2001,6 +2070,9 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		},
 		dispose(id: number, gen: number): void {
 			ensureEngine().dispose(id, gen);
+		},
+		runEffect(id: number, gen: number): void {
+			ensureEngine().runEffect(id, gen);
 		},
 		gen(id: number): number {
 			return ensureEngine().buffer()[id + C.GEN];
