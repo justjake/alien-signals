@@ -1,6 +1,6 @@
 <p align="center">
 	<img src="assets/logo.png" width="250"><br>
-<p>
+</p>
 
 <p align="center">
 	<a href="https://npmjs.com/package/dalien-signals"><img src="https://badgen.net/npm/v/dalien-signals" alt="npm package"></a>
@@ -9,144 +9,183 @@
 
 # dalien-signals
 
-*d*alien-signals is a *d*ata-oriented fork of [alien-signals](https://github.com/stackblitz/alien-signals), a signals reactivity engine. It stores the alien-signals graph in a single `Int32Array` memory arena as contiguous structs, with associated JavaScript values and callbacks in side arrays. Here's a diagram of the data layout of structs in the graph, and their offsets:
+`dalien-signals` keeps calculations and callbacks in sync with changing values. It provides three main primitives:
+
+- A `signal` stores a value. Call it with no argument to read it, or with an argument to write it.
+- A `computed` derives and caches a value from signals or other computeds.
+- An `effect` runs a function now, then again when a value it read changes.
+
+Dependencies are automatic. While a computed or effect runs, the library records every signal and computed it reads.
+
+```ts
+import { computed, effect, signal } from 'dalien-signals';
+
+const count = signal(1);
+const doubled = computed(() => count() * 2);
+const isEven = computed(() => count() % 2 === 0);
+
+effect(() => console.log(doubled(), isEven())); // 2 false
+count(2); // 4 true
+```
+
+```mermaid
+flowchart LR
+    count["signal: count"] -->|read by| doubled["computed: doubled"]
+    count -->|read by| even["computed: isEven"]
+    doubled -->|read by| log["effect: console.log both"]
+    even -->|read by| log
+```
+
+Arrows point from a value to the work that depends on it. Changing `count` reaches the effect through two paths, but queues it once. Each computed returns its current value when the effect reads it.
+
+`dalien-signals` is based on [alien-signals](https://github.com/stackblitz/alien-signals) 3.2.1. It implements the same operations with a different storage engine; alien-signals is not a dependency.
+
+## How updates work
+
+Recalculating everything on every write would waste work. Recalculating dependents immediately could also run the same effect more than once or before all of its inputs are current. Updates therefore have two phases:
+
+1. **Mark:** a write marks dependent computeds and effects as possibly stale—their cached values may no longer match their inputs. Effects are queued, but no user callback runs yet.
+2. **Update:** a computed updates its inputs before returning a value. A queued effect reruns, and every computed it reads updates before returning. An unchanged computed value stops the update from spreading farther.
+
+```mermaid
+sequenceDiagram
+    participant S as signal: count
+    participant D as computed: doubled
+    participant V as computed: isEven
+    participant E as effect: console.log
+
+    S->>D: push: mark possibly stale
+    D->>E: push: queue effect
+    S->>V: push: mark possibly stale
+    V->>E: push: effect already queued
+    E->>D: pull: effect reads doubled
+    D->>S: pull: read count
+    S-->>D: 2
+    D-->>E: 4
+    E->>V: pull: effect reads isEven
+    V->>S: pull: read count
+    S-->>V: 2
+    V-->>E: true
+    Note over D,V: both values are current
+    E->>E: console.log(4, true)
+```
+
+This is a push-pull algorithm: writes push stale markers through the graph; reads and effects pull the values they need up to date.
+
+## API
+
+Most code needs four functions:
+
+- `signal(initialValue)` returns a function. Call it as `value()` to read or `value(next)` to write.
+- `computed(getter)` returns a read function. It runs `getter` when needed and caches the result.
+- `effect(callback)` runs `callback` immediately and when a value it reads changes. The callback may return cleanup work, which runs before the next execution. `effect` returns a function that stops the effect and runs its cleanup.
+- `effectScope(callback)` runs `callback` and groups the effects it creates. It returns a function that stops the whole group.
+
+The remaining root exports cover less common cases:
+
+- `startBatch()` delays queued effects; `endBatch()` flushes them after the outermost batch ends. `getBatchDepth()` reports the current nesting depth.
+- `trigger(readSources)` notifies dependents after mutating a stored object in place. `readSources` reads each signal whose contents changed.
+- `configure({ initialRecords })` sets storage capacity. Call it before creating any signal, computed, effect, or effect scope.
+- `isSignal()`, `isComputed()`, `isEffect()`, and `isEffectScope()` classify functions returned by this package. Returned functions are anonymous, so do not inspect `function.name`.
+- `getActiveSub()` returns a live object representing the computed getter, effect callback, or effect-scope callback currently recording dependencies, or `undefined`. Its `.flags` property uses the update states described below. `setActiveSub()` changes which object records subsequent reads and returns the previous one so an integration can restore it later. Application code normally does not need these hooks.
+
+`createReactiveSystem()` from `dalien-signals/system` creates an independent graph and storage area. Methods such as `makeSignal()` and `makeComputed()` return the same callable functions as the root API; lower-level methods use numbers that identify the records described below. The module also exposes debugging and bulk-reset operations.
+
+## Storage
+
+Internally, each signal, computed, effect, or scope is a node. Each dependency is a link. Both use eight-slot, 32-byte records in one fixed-capacity `Int32Array`, JavaScript's typed array of 32-bit integers:
 
 ```mermaid
 classDiagram
     direction LR
     class Node["node record — 8 int32 slots, 32 bytes"] {
-        0 FLAGS : state bits + kind bits
-        1 DEPS : first dependency link
-        2 DEPS_TAIL : last dependency link
-        3 SUBS : first subscriber link
-        4 SUBS_TAIL : last subscriber link
-        5 GEN : generation counter
-        6 VSTAMP_HI : write-epoch stamp, high
-        7 VSTAMP_LO : write-epoch stamp, low
+        0 FLAGS : update state and node type
+        1 DEPS : first input link
+        2 DEPS_TAIL : last input link
+        3 SUBS : first dependent link
+        4 SUBS_TAIL : last dependent link
+        5 GEN : counter changed when reused
+        6 VSTAMP_HI : write counter, high half
+        7 VSTAMP_LO : write counter, low half
     }
-    class Link["link record, one graph edge — same plane, same 32 bytes"] {
-        0 VERSION : re-track marker
-        1 DEP : node id being read
-        2 SUB : node id doing the reading
-        3 PREV_SUB : subscriber list of DEP
-        4 NEXT_SUB : subscriber list of DEP
-        5 PREV_DEP : dependency list of SUB
-        6 NEXT_DEP : dependency list of SUB
-        7 FREE_NEXT : free-list pointer
+    class Link["link record — 8 int32 slots, 32 bytes"] {
+        0 VERSION : latest dependency scan
+        1 DEP : node being read
+        2 SUB : node doing the reading
+        3 PREV_SUB : previous dependent link
+        4 NEXT_SUB : next dependent link
+        5 PREV_DEP : previous input link
+        6 NEXT_DEP : next input link
+        7 FREE_NEXT : next recycled link
     }
-    class SideArrays["side arrays — plain JS, indexed by the same id"] {
-        values : 2 slots per record
-        fns : 1 slot per record
+    class SideArrays["JavaScript side arrays"] {
+        values : current, staged, cleanup
+        fns : getters, callbacks
     }
-    Node --> Link : DEPS, SUBS
-    Link --> Node : DEP, SUB
-    Node ..> SideArrays : id
+    Node --> Link : DEPS / SUBS
+    Link --> Node : DEP / SUB
+    Node ..> SideArrays : same ID
 ```
 
-- Node records (signals, computeds, effects, scopes) and link records (edges) interleave in one plane: one bump pointer, free lists for recycling
-- `id = recordIndex × 8` — field access is one indexed load, `M[id + SLOT]`
-- record 0 is burned as *null* — every "is there a link?" check is `x !== 0`
-- side arrays hold the only GC-visible data: `values` (current value + staged value or effect cleanup), `fns` (getter or callback); the graph itself is invisible to the GC
+- This array is the **arena**. An ID is a record's starting offset within it; ID `0` means “no record.”
+- A free list chains unused records together so they can be recycled without allocating new edge objects.
+- Side arrays hold values, cleanup functions, getters, and callbacks.
 
-The `FLAGS` slot packs state and type into one bitfield:
-
-```mermaid
----
-config:
-  packet:
-    bitsPerRow: 4
-    bitWidth: 150
----
-packet-beta
-0: "MUTABLE"
-1: "WATCHING"
-2: "RECURSED_CHECK"
-3: "RECURSED"
-4: "DIRTY"
-5: "PENDING"
-6: "HAS_CHILD_EFFECT"
-7: "K_SIGNAL"
-8: "K_COMPUTED"
-9: "K_EFFECT"
-10: "K_SCOPE"
-11: "ORPHANED"
-12: "FN_INSTALLED"
-13-15: "unused"
-```
-
-- bits 0–5 — upstream's `ReactiveFlags`, values unchanged; push-pull runs on `DIRTY` and `PENDING`
-- `HAS_CHILD_EFFECT` — effect contains child effects
-- `K_*` kind bits — type dispatch is a bit test on the already-loaded word, not upstream's `'getter' in node` property check
-- `ORPHANED` — handle was garbage-collected while subscribers remain; record reclaimed at last unlink
-- `FN_INSTALLED` — handle-owned getter currently installed in `fns`
-- bits 0–6 (`PUBLIC_MASK`) — exposed by `getActiveSub()`; everything above is engine-owned
-
-Here's how our modified algorithm works:
-
-**The primitives.** A **signal** is a box holding a value: `s()` reads it, `s(1)` writes it. A **computed** derives a new value from whatever it reads, and caches the result. An **effect** is a callback that does something visible — render, log, write — and must re-run when a value it read changes. While a computed or effect runs, the engine records an edge from everything it reads: dependencies are discovered, never declared. The records above are these nodes and edges:
-
-```mermaid
-flowchart LR
-    a((signal a)) --> b["computed b = a + 1"]
-    a --> c["computed c = a * 2"]
-    b --> e[["effect: render b and c"]]
-    c --> e
-```
-
-After `a(5)`, the library's whole job is to bring `b`, `c`, and the effect up to date — each recomputed **at most once**, never letting the effect observe a half-updated world (`b` new but `c` stale), and recomputing nothing that nobody watches.
-
-**Push, pull, push-pull.** The two obvious strategies each break one of those guarantees. *Eager push* — recompute everything downstream at write time — does work nobody may ever read, and in the diamond above naively runs the effect twice per write, once per path; the first of those runs sees the half-updated world (this is called a *glitch*). *Lazy pull* — recompute on read, re-checking dependencies every time — wastes nothing but makes every read walk the graph, and effects never find out they're stale. alien-signals, and therefore this fork, is **push-pull**: a write *pushes* only cheap flags down the graph, and then reads and queued effects *pull* real values up it, recomputing only what verifiably changed.
-
-**The push half.** Writing a signal (with a value that differs — equal writes are no-ops) stages the value, marks the signal **dirty** ("definitely changed"), then walks downstream setting one flag on every reachable node: **pending** ("something above you *may* have changed"). Effects passed along the way are appended to a queue. No user code runs; the walk touches one 4-byte flags word per node and stops early wherever a branch is already marked.
-
-**The pull half.** After the write — or at the end of a `startBatch()`/`endBatch()` group — the queue flushes. Each queued effect, and any computed you read, resolves its own flag first. *Pending* means: check your dependencies, in order. A pending dependency recurses first; a dirty one is recomputed on the spot — and only if its new value actually differs are its immediate subscribers promoted from pending to **dirty**. A recompute that produces an equal value stops the wave right there: subscribers are verified back to clean, and an effect whose inputs all settle back to equal values never runs at all. In the diamond, the effect runs once, after both `b` and `c` have settled — glitch-free by construction. A derived node's life:
+`FLAGS` stores the node type and update state. A computed moves through three states:
 
 ```mermaid
 stateDiagram-v2
-    Clean --> Pending : a write landed somewhere upstream
-    Pending --> Dirty : an immediate input recomputed to a different value
-    Pending --> Clean : all inputs verified unchanged
-    Dirty --> Clean : recompute, compare, stamp
+    Clean --> Pending : an earlier dependency was written
+    Pending --> Dirty : a direct input changed value
+    Pending --> Clean : all input values stayed equal
+    Dirty --> Clean : recalculate and cache
 ```
 
-**Our addition: the write epoch.** Upstream's pull still starts with a per-read flag protocol. This fork adds one global counter — the **write epoch**, bumped by every write anything observes — and stamps it into a node's `vstamp` slots whenever that node is verified or recomputed. A read whose stamp equals the current epoch has proof that *nothing anywhere* has been written since the node was last verified, and returns the cached value after one integer compare — no graph walk, no flags. Between writes, an app can re-read its entire derived state at array-index cost; the first read of each node after a write re-verifies and re-stamps it. The stamp is captured *before* verification begins, so a write fired from user code mid-verification can only make stamps miss, never lie.
+- **Clean:** the cached value is current. This state has no `ReactiveFlags.Dirty` or `ReactiveFlags.Pending` bit.
+- **Pending:** an input may have changed, so the node must check its inputs before deciding whether to recalculate.
+- **Dirty:** a direct input changed, so the node must recalculate before returning its value.
 
-## Optimizations
+Effects use the same pending-versus-dirty distinction to decide whether their callbacks need to rerun. The live `.flags` object returned by `getActiveSub()` exposes these bits:
 
-**The arena is the big one.** Storing the graph as integer records in one `Int32Array` instead of linked JavaScript objects is faster for three compounding reasons:
+| bit | name | meaning |
+| ---: | --- | --- |
+| 0 | `ReactiveFlags.Mutable` | Changes can continue through this node to its dependents. |
+| 1 | `ReactiveFlags.Watching` | This node is an effect that should be queued when reached. |
+| 2 | `ReactiveFlags.RecursedCheck` | The engine is watching for a write that loops back into the callback now running. |
+| 3 | `ReactiveFlags.Recursed` | Such a recursive write reached this node. |
+| 4 | `ReactiveFlags.Dirty` | This node is known to need an update. |
+| 5 | `ReactiveFlags.Pending` | An earlier dependency may require this node to update. |
+| 6 | `HAS_CHILD_EFFECT` (internal) | This node owns nested effects that require ordered cleanup. |
 
-- **Cache locality.** Records are 32 bytes, packed side by side, so a propagation wave reads memory the CPU can prefetch. An object graph chases pointers to wherever the collector happened to place each node, and every hop is a potential cache miss.
-- **Nothing to collect.** Linking and unlinking edges recycles integer records through free lists — steady-state graph maintenance allocates zero objects. The plane is one opaque array the garbage collector never traces into, so a large graph adds nothing to marking pauses; upstream's per-edge link objects are all individually visible to the GC.
-- **Simple, stable machine code.** `M[id + FIELD]` compiles to shift-add-load — no hidden-class checks, no polymorphic property lookups. Kind bits live in the same flags word as state bits, so "is this a computed?" is a bit test on a value already in a register. And because the plane never grows or moves, every handle closure captures `const M` directly and reaches the graph with zero indirection.
+Bits identifying the node type or tracking record recycling are engine-only and are hidden from that object. `ReactiveFlags`, exported by `dalien-signals/system`, names bits 0–5 so integrations do not need to hard-code their numeric values.
 
-The rest, each individually measured:
+Whenever a write could invalidate cached work, the engine increments a global write counter, called the **epoch**. After checking or recalculating a computed, it saves the epoch in `VSTAMP_HI` and `VSTAMP_LO`. If the saved and current epochs match on the next read, no write that could affect the cache occurred in between, so the value can be returned without walking the graph. If a callback writes another signal during the check, the current epoch advances and the saved value no longer matches.
 
-- **Quiet reads cost one compare** — the write-epoch stamps described above. A single clean read is about a nanosecond slower than upstream's flag check, but when many derived reads follow each write (the shape of the dynamic suite below), the stamps carry the win.
-- **One- and two-hop updates skip the general machinery.** The most common real-app shapes — write one signal, one computed or one computed-feeding-an-effect recomputes — resolve through shallow fast paths in the dirty check, no traversal stacks. This is what moved the crossover against upstream to about two recomputed nodes (see Tradeoffs).
-- **Call sites are pre-seeded past the JIT's speculation threshold.** Engines aggressively specialize a call site that only ever sees one function, then tear that code down when a second shape shows up — and a signals library funnels *your* getters and callbacks through a few internal call sites, so a growing app triggers that teardown repeatedly. When the graph reaches 33 nodes, this engine warms those call sites with assorted function shapes once, so performance stays flat as the app's callbacks diversify; tiny hot-loop programs never reach the threshold and keep full specialization. The number is measured, not chosen: everything in roughly [20, 45] performs identically, earlier taxes small programs, later exposes growing apps (`benchs/seedThreshold.mjs`, `benchs/phaseTransition.mjs`).
-- **Leak-free by construction.** Dropped signal/computed handles reclaim their records through a required `FinalizationRegistry` (ES2021); getters are owned by their handles and only borrowed by the engine while subscribed, so no internal table can pin user closures. 10,000 live effects retain ~47% less heap than upstream, and computeds join the registry only at first evaluation — created-but-never-read computeds cost nothing.
-- **Fixed capacity, allocated lazily.** `configure({ initialRecords })` sizes the plane before first use (default 2^23 records ≈ 256 MB of lazily-mapped virtual pages — physical memory tracks records actually touched). Importing the library allocates nothing.
-- **`system.reset()` frees a whole generation at once**: rewind the plane, replace the registry. A dead graph costs the collector a few large objects instead of one weak cell per handle — exactly what request-scoped graphs, worker pools, and benchmark harnesses want. Every handle minted before a reset is invalid afterwards.
-- **Inline budgets are load-bearing and tested.** V8 only inlines functions below a bytecode size limit, and several hot paths are split specifically to stay below it; `tests/bytecode.spec.ts` fails the build if a hot function outgrows its budget.
+Other performance details:
 
-### Tradeoffs
+- Updates only one or two links away use dedicated code instead of a general graph walk.
+- When the graph reaches 33 nodes, the engine briefly exercises its shared callback paths with several different functions. This prevents the V8 JavaScript engine from repeatedly discarding and rebuilding optimized machine code as an application adds getters and effects. See `benchs/seedThreshold.mjs` and `benchs/phaseTransition.mjs`.
+- JavaScript's `FinalizationRegistry` reports signal and computed functions that the application can no longer reach. Their records are then returned to the free lists.
+- The lower-level engine's `reset()` method clears the whole arena at once. Functions and numeric IDs created before the reset become invalid.
+- `tests/bytecode.spec.ts` keeps performance-critical functions small enough for V8 to insert their bodies directly at call sites.
 
-What the data-oriented layout costs, relative to upstream's classic object graph:
+## Constraints
 
-- **You size it up front.** The plane is fixed capacity — that immovability is what the zero-indirection reads are built on. The default (256 MB of virtual, lazily-mapped pages) is effectively free until touched, and freed records recycle through free lists, but capacity must cover your peak count of *live* nodes and edges; exhausting it throws.
-- **`FinalizationRegistry` is required** (ES2021). Reclamation of dropped signal/computed handles rides the garbage collector; there is no fallback mode.
-- **Dedicated tiny hot loops favor upstream.** A benchmark-style loop over one small graph is the JIT's best case for upstream's objects: sustained small-update writes run 1.15–1.45× upstream's time there (`benchs/propagateSustained.mjs`, ~9% behind averaged over nine shapes). Part of that is the call-site seeding — deliberately trading peak single-shape speed for flatness. For scale, on the suite's most app-like test the gap is ~20 nanoseconds per update.
-- **Deep chains favor upstream.** Nodes strung in a line are a pointer chase for both sides (upstream allocates in chain order too), and its fused pipeline stays ~15–35% cheaper until a chain passes about a thousand nodes.
-- **Everything wider favors the arena.** The governing variable is **how many nodes one write recomputes** — not writes per batch, not graph size. The crossover sits at about **two recomputed nodes**: one-to-three-node waves land within noise of upstream (ratios 0.9–1.2 across shape families), and the advantage deepens past 2× at the largest measured cones. Beyond throughput, the arena's wins are the tails: burst updates, heap size, and GC churn over a long session.
-- **`dalien-signals/system` is a new, incompatible interface** (a self-contained engine over integer handles). The package root is drop-in, except `getActiveSub()` returns a flags view object and handle functions are anonymous (`isSignal` and friends still work).
+- The arena does not grow. Call `configure({ initialRecords })` before creating reactive values to change its capacity. By default, it asks the operating system for a 256 MB address range holding 8,388,608 records; physical memory is consumed only for records that are touched. Running out of records throws.
+- The JavaScript runtime must support `FinalizationRegistry`, which is part of ES2021.
+- The original `alien-signals` can be faster when repeatedly updating one tiny graph or a long single chain. This arena performs better when one write updates many dependents, and it allocates fewer graph objects for the garbage collector. See `benchs/propagateSustained.mjs`, `benchs/crossover.mjs`, and `benchs/memoryUsage.mjs`.
 
-<img width="1080" alt="Sustained write cost ratio (dalien over alien) against nodes recomputed per write, five shape families: broad and grid cross below 1.0 near 300-1000 nodes; batch and islands stay flat above 1.0; deep dips at 1000 then recovers" src="assets/crossover.png" />
+<img width="1080" alt="Sustained write cost ratio (dalien over alien) by recomputed nodes per write" src="assets/crossover.png" />
+
+The chart divides dalien-signals time by alien-signals time. Values below `1.0` mean dalien-signals was faster; values above `1.0` mean alien-signals was faster.
 
 ## Benchmarks
 
-Below is the [js-reactivity-benchmark](https://github.com/milomg/js-reactivity-benchmark) suite (sbench, kairo, cellx, dynamic). The numbers are from CI and anyone can reproduce them: the [benchmark workflow](https://github.com/justjake/dalien-signals/actions/workflows/benchmark.yml) runs a pinned harness against this repo — dispatch it with `frameworks: ALL` for the full chart (these charts: run [28762874098](https://github.com/justjake/dalien-signals/actions/runs/28762874098) at c47c607). Methodology: each framework runs in its own process; each test reports the median of its runs (not the fastest, which hides amortized costs); frameworks run interleaved round-robin, four complete rounds each on its own runner, with per-test medians across rounds (`benchs/ci/` documents why that keeps ratios honest). The dalien adapter uses `reset()` between tests — the arena equivalent of the wholesale collection a dead GC-managed graph gets automatically.
+These charts compare JavaScript reactivity libraries with the `sbench`, `kairo`, `cellx`, and `dynamic` workload groups from [js-reactivity-benchmark](https://github.com/milomg/js-reactivity-benchmark). Each table reports elapsed milliseconds; lower is better, and `total` is the sum of those workload groups.
 
-**Node (V8)** — dalien-signals finishes first overall; upstream takes 7% longer:
+The first two charts run each library in a fresh process, so one library cannot leave compiled code or uncollected objects behind for the next. Each number is the median of four CI rounds; the libraries take turns each round instead of completing all runs in a fixed order. See [run 28762874098](https://github.com/justjake/dalien-signals/actions/runs/28762874098) at `c47c607`; `benchs/ci/` contains the harness and method.
+
+### Node (V8)
 
 <!-- benchmark:node:begin — generated by benchs/ci/pull-run.mjs; edits inside are overwritten -->
 <img width="1080" alt="Total benchmark time by framework, Node (V8): Dalien Signals 3,989 ms; Reactively 4,104 ms; Alien Signals 4,273 ms; Preact Signals 4,793 ms; s-js 5,704 ms; Vue 6,264 ms; Svelte v5 7,656 ms; Pota 8,277 ms; amadeus-it-group/tansu 8,445 ms; Angular Signals 9,279 ms; SolidJS 10,414 ms; x-reactivity 13,418 ms; MobX 18,946 ms; Compostate 20,368 ms" src="assets/benchmark.png" />
@@ -176,7 +215,7 @@ Below is the [js-reactivity-benchmark](https://github.com/milomg/js-reactivity-b
 </details>
 <!-- benchmark:node:end -->
 
-**Bun (JavaScriptCore)** — first overall again; upstream takes 39% longer:
+### Bun (JavaScriptCore)
 
 <!-- benchmark:bun:begin — generated by benchs/ci/pull-run.mjs; edits inside are overwritten -->
 <img width="1080" alt="Total benchmark time by framework, Bun (JavaScriptCore): Dalien Signals 3,073 ms; Reactively 3,638 ms; Alien Signals 4,267 ms; Preact Signals 4,270 ms; s-js 4,973 ms; Vue 5,467 ms; Angular Signals 6,191 ms; Svelte v5 6,391 ms; Pota 8,516 ms; amadeus-it-group/tansu 9,312 ms; SolidJS 9,558 ms; x-reactivity 10,219 ms; MobX 13,900 ms; Compostate 31,312 ms" src="assets/benchmark-bun.png" />
@@ -206,7 +245,7 @@ Below is the [js-reactivity-benchmark](https://github.com/milomg/js-reactivity-b
 </details>
 <!-- benchmark:bun:end -->
 
-The [transitive-bullshit fork](https://github.com/transitive-bullshit/js-reactivity-benchmark) of the same suite runs every framework in one shared Node process — the methodology behind the upstream alien-signals chart further down. `alien-signals` here is the 1.0.0-alpha.1 that repo pins; `alien-signals-v3` is the v3.2.1 this fork tracks. Read it with two caveats: shared-process totals are order-sensitive (each framework inherits the JIT and heap state of whatever ran before it — in our testing, reordering frameworks changed relative results materially), and its creation tests end their timed region with a forced full GC over ~100k just-abandoned nodes, which bills dalien-signals' `FinalizationRegistry` cells inside the timing while upstream's dead nodes are ordinary garbage. That one suite accounts for most of the gap to upstream below. Node 24, Apple M4 Max, 2026-07-06; raw data in `benchs/results/`.
+The final chart uses another [js-reactivity-benchmark fork](https://github.com/transitive-bullshit/js-reactivity-benchmark) that runs every library in one Node process. Its result depends on run order because each library inherits compiled code and allocated objects left by earlier libraries. Its graph-creation tests also force JavaScript garbage collection (GC) inside the timed region. Treat it as a different workload, not a direct comparison with the isolated charts. Here, `alien-signals` means the old `1.0.0-alpha.1` version pinned by that benchmark; `alien-signals v3.2.1` is the version dalien-signals follows. Node 24, Apple M4 Max, 2026-07-06; raw data is in `benchs/results/`.
 
 <!-- benchmark:tb:begin — generated by benchs/ci/pull-run.mjs; edits inside are overwritten -->
 <img width="1080" alt="Total benchmark time by framework, shared process: alien-signals 1.0.0-alpha.1 1,674 ms; alien-signals v3.2.1 1,906 ms; dalien-signals 2,598 ms; @reactively 3,007 ms; Svelte v5 3,325 ms; s-js 3,788 ms; @amadeus-it-group/tansu 3,998 ms; Oby 4,125 ms; $mol_wire 4,232 ms; uSignal 4,990 ms; Preact Signals 5,074 ms; SolidJS 5,497 ms; MobX 7,165 ms; Signia 7,409 ms; @vue/reactivity 8,145 ms; TC39 Signals Polyfill 17,597 ms; @angular/signals 21,544 ms" src="assets/benchmark-tb.png" />
@@ -239,284 +278,6 @@ The [transitive-bullshit fork](https://github.com/transitive-bullshit/js-reactiv
 </details>
 <!-- benchmark:tb:end -->
 
----
+## Origin
 
-# About alien-signals upstream
-
-`alien-signals` explores a push-pull based signal algorithm. The implementation is related to the following frontend projects:
-
-- Propagation algorithm of Vue 3
-- Preact’s double-linked-list approach (https://preactjs.com/blog/signal-boosting/)
-- Inner effects scheduling of Svelte
-- Graph-coloring approach of Reactively (https://milomg.dev/2022-12-01/reactivity)
-
-We impose some constraints (such as not using Array/Set/Map and disallowing function recursion in [the algorithmic core](https://github.com/stackblitz/alien-signals/blob/master/src/system.ts)) to ensure performance. We found that under these conditions, maintaining algorithmic simplicity offers more significant improvements than complex scheduling strategies.
-
-I wrote the reactivity code for both Vue and alien-signals. Below is a benchmark comparison against Vue 3.4 and other frameworks. The core algorithm has since been [ported back to Vue 3.6](https://github.com/vuejs/core/pull/12349).
-
-<img width="1210" alt="Image" src="https://github.com/user-attachments/assets/88448f6d-4034-4389-89aa-9edf3da77254" />
-
-> Benchmark repo: https://github.com/transitive-bullshit/js-reactivity-benchmark
-
-## Background
-
-I spent considerable time [optimizing Vue 3.4’s reactivity system](https://github.com/vuejs/core/pull/5912), gaining experience along the way. Since Vue 3.5 [switched to a pull-based algorithm similar to Preact](https://github.com/vuejs/core/pull/10397), I decided to continue researching a push-pull based implementation in a separate project. The algorithm is used in Vue language tools for incremental AST parsing and virtual code generation.
-
-## Other Language Implementations
-
-- **Dart:** [medz/alien-signals-dart](https://github.com/medz/alien-signals-dart)
-- **Dart:** [void-signals/void_signals](https://github.com/void-signals/void_signals)
-- **Lua:** [YanqingXu/alien-signals-in-lua](https://github.com/YanqingXu/alien-signals-in-lua)
-- **Lua 5.4:** [xuhuanzy/alien-signals-lua](https://github.com/xuhuanzy/alien-signals-lua)
-- **Luau:** [Nicell/alien-signals-luau](https://github.com/Nicell/alien-signals-luau)
-- **Java:** [CTRL-Neo-Studios/java-alien-signals](https://github.com/CTRL-Neo-Studios/java-alien-signals)
-- **C#:** [CTRL-Neo-Studios/csharp-alien-signals](https://github.com/CTRL-Neo-Studios/csharp-alien-signals)
-- **Go:** [delaneyj/alien-signals-go](https://github.com/delaneyj/alien-signals-go)
-- **Rust:** [wuzekang/samara-signals](https://github.com/wuzekang/samara/tree/main/crates/signals)
-- **Rust:** [ohkami-rs/alien-signals-rs](https://github.com/ohkami-rs/alien-signals-rs)
-
-## Derived Projects
-
-- [Rajaniraiyn/react-alien-signals](https://github.com/Rajaniraiyn/react-alien-signals): React bindings for the alien-signals API
-- [CCherry07/alien-deepsignals](https://github.com/CCherry07/alien-deepsignals): Use alien-signals with the interface of a plain JavaScript object
-- [hunghg255/reactjs-signal](https://github.com/hunghg255/reactjs-signal): Share Store State with Signal Pattern
-- [gn8-ai/universe-alien-signals](https://github.com/gn8-ai/universe-alien-signals): Enables simple use of the Alien Signals state management system in modern frontend frameworks
-- [WebReflection/alien-signals](https://github.com/WebReflection/alien-signals): Preact signals like API and a class based approach for easy brand check
-- [@lift-html/alien](https://github.com/JLarky/lift-html/tree/main/packages/alien): Integrating alien-signals into lift-html
-- [ilha](https://github.com/ilhajs/ilha): A tiny web UI library built around the islands architecture
-- [@sigrea/core](https://github.com/sigrea/core): Signals, deep reactivity, and molecule lifecycles built on alien-signals
-- [@lazy-promise/alien-signals](https://github.com/lazy-promise/lazy-promise/tree/main/packages/alien-signals): Async signals built on top of alien-signals and LazyPromise
-
-## Adoption
-
-- [vuejs/core](https://github.com/vuejs/core): The core algorithm has been ported to v3.6 (PR: https://github.com/vuejs/core/pull/12349)
-- [statelyai/xstate](https://github.com/statelyai/xstate): The core algorithm has been ported to implement the atom architecture (PR: https://github.com/statelyai/xstate/pull/5250)
-- [flamrdevs/xignal](https://github.com/flamrdevs/xignal): Infrastructure for the reactive system
-- [vuejs/language-tools](https://github.com/vuejs/language-tools): Used in the language-core package for virtual code generation
-- [unuse](https://github.com/un-ts/unuse): A framework-agnostic `use` library inspired by `VueUse`
-
-## Usage
-
-#### Basic APIs
-
-```ts
-import { signal, computed, effect } from "alien-signals";
-
-const count = signal(1);
-const doubleCount = computed(() => count() * 2);
-
-effect(() => {
-  console.log(`Count is: ${count()}`);
-}); // Console: Count is: 1
-
-console.log(doubleCount()); // 2
-
-count(2); // Console: Count is: 2
-
-console.log(doubleCount()); // 4
-```
-
-#### Effect Scope
-
-```ts
-import { signal, effect, effectScope } from "alien-signals";
-
-const count = signal(1);
-
-const stopScope = effectScope(() => {
-  effect(() => {
-    console.log(`Count in scope: ${count()}`);
-  }); // Console: Count in scope: 1
-});
-
-count(2); // Console: Count in scope: 2
-
-stopScope();
-
-count(3); // No console output
-```
-
-#### Nested Effects
-
-Effects can be nested inside other effects. When the outer effect re-runs, inner effects from the previous run are automatically cleaned up, and new inner effects are created if needed. The system ensures proper execution order — outer effects always run before their inner effects:
-
-```ts
-import { signal, effect } from "alien-signals";
-
-const show = signal(true);
-const count = signal(1);
-
-effect(() => {
-  if (show()) {
-    // This inner effect is created when show() is true
-    effect(() => {
-      console.log(`Count is: ${count()}`);
-    });
-  }
-}); // Console: Count is: 1
-
-count(2); // Console: Count is: 2
-
-// When show becomes false, the inner effect is cleaned up
-show(false); // No output
-
-count(3); // No output (inner effect no longer exists)
-```
-
-#### Manual Triggering
-
-The `trigger()` function allows you to manually trigger updates for downstream dependencies when you've directly mutated a signal's value without using the signal setter:
-
-```ts
-import { signal, computed, trigger } from "alien-signals";
-
-const arr = signal<number[]>([]);
-const length = computed(() => arr().length);
-
-console.log(length()); // 0
-
-// Direct mutation doesn't automatically trigger updates
-arr().push(1);
-console.log(length()); // Still 0
-
-// Manually trigger updates
-trigger(arr);
-console.log(length()); // 1
-```
-
-You can also trigger multiple signals at once:
-
-```ts
-import { signal, computed, trigger } from "alien-signals";
-
-const src1 = signal<number[]>([]);
-const src2 = signal<number[]>([]);
-const total = computed(() => src1().length + src2().length);
-
-src1().push(1);
-src2().push(2);
-
-trigger(() => {
-  src1();
-  src2();
-});
-
-console.log(total()); // 2
-```
-
-#### Creating Your Own Surface API
-
-You can reuse alien-signals’ core algorithm via `createReactiveSystem()` to build your own signal API. For implementation examples, see:
-
-- [Starter template](https://github.com/johnsoncodehk/alien-signals-starter) (implements `.get()` & `.set()` methods like the [Signals proposal](https://github.com/tc39/proposal-signals))
-- [stackblitz/alien-signals/src/index.ts](https://github.com/stackblitz/alien-signals/blob/master/src/index.ts)
-- [proposal-signals/signal-polyfill#44](https://github.com/proposal-signals/signal-polyfill/pull/44)
-
-## About `propagate` and `checkDirty` functions
-
-The actual implementations of `propagate` and `checkDirty` in [system.ts](https://github.com/stackblitz/alien-signals/blob/master/src/system.ts) replace recursive calls with iterative stack-based traversal for performance. The recursive versions below are equivalent and easier to follow — useful as a reference when porting to other languages where the iterative optimization may not help.
-
-<details>
-<summary><code>propagate</code></summary>
-
-```ts
-function propagate(link: Link, innerWrite: boolean): void {
-  do {
-    const sub = link.sub;
-
-    let flags = sub.flags;
-
-    if (
-      !(
-        flags &
-        (ReactiveFlags.RecursedCheck |
-          ReactiveFlags.Recursed |
-          ReactiveFlags.Dirty |
-          ReactiveFlags.Pending)
-      )
-    ) {
-      sub.flags = flags | ReactiveFlags.Pending;
-      if (innerWrite) {
-        sub.flags |= ReactiveFlags.Recursed;
-      }
-    } else if (
-      !(flags & (ReactiveFlags.RecursedCheck | ReactiveFlags.Recursed))
-    ) {
-      flags = ReactiveFlags.None;
-    } else if (!(flags & ReactiveFlags.RecursedCheck)) {
-      sub.flags = (flags & ~ReactiveFlags.Recursed) | ReactiveFlags.Pending;
-    } else if (
-      !(flags & (ReactiveFlags.Dirty | ReactiveFlags.Pending)) &&
-      isValidLink(link, sub)
-    ) {
-      sub.flags = flags | ReactiveFlags.Recursed | ReactiveFlags.Pending;
-      flags &= ReactiveFlags.Mutable;
-    } else {
-      flags = ReactiveFlags.None;
-    }
-
-    if (flags & ReactiveFlags.Watching) {
-      notify(sub);
-    }
-
-    if (flags & ReactiveFlags.Mutable) {
-      const subSubs = sub.subs;
-      if (subSubs !== undefined) {
-        propagate(subSubs, innerWrite);
-      }
-    }
-
-    link = link.nextSub!;
-  } while (link !== undefined);
-}
-```
-
-</details>
-
-<details>
-<summary><code>checkDirty</code></summary>
-
-```ts
-function checkDirty(link: Link, sub: ReactiveNode): boolean {
-  do {
-    const dep = link.dep;
-    const depFlags = dep.flags;
-
-    if (sub.flags & ReactiveFlags.Dirty) {
-      return true;
-    } else if (
-      (depFlags & (ReactiveFlags.Mutable | ReactiveFlags.Dirty)) ===
-      (ReactiveFlags.Mutable | ReactiveFlags.Dirty)
-    ) {
-      if (update(dep)) {
-        const subs = dep.subs!;
-        if (subs.nextSub !== undefined) {
-          shallowPropagate(subs);
-        }
-        return true;
-      }
-    } else if (
-      (depFlags & (ReactiveFlags.Mutable | ReactiveFlags.Pending)) ===
-      (ReactiveFlags.Mutable | ReactiveFlags.Pending)
-    ) {
-      if (checkDirty(dep.deps!, dep)) {
-        if (update(dep)) {
-          const subs = dep.subs!;
-          if (subs.nextSub !== undefined) {
-            shallowPropagate(subs);
-          }
-          return true;
-        }
-      } else {
-        dep.flags = depFlags & ~ReactiveFlags.Pending;
-      }
-    }
-
-    link = link.nextDep!;
-  } while (link !== undefined);
-
-  return false;
-}
-```
-
-</details>
+This package is a data-oriented fork of [alien-signals](https://github.com/stackblitz/alien-signals). Its repository contains the original algorithm history, ports, and related projects.
