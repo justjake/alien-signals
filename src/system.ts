@@ -406,6 +406,13 @@ export interface ReactiveSystem {
 	 */
 	createNode(owner: WeakKey, hostBits?: number): SignalId;
 	/**
+	 * MANUAL memory management with the growth boundary check: like
+	 * arena.allocNode, but grows the arena first when it is running out of
+	 * space (the safe default for mint paths). No owner, no watch — pair
+	 * with disposeNode/freeNode, or the record lives until reset().
+	 */
+	allocNode(hostBits?: number): SignalId;
+	/**
 	 * Free a node made by createNode. Gen-guarded when `gen` is given;
 	 * without it the record's CURRENT generation is used — only omit it for
 	 * an id you know is live. Stale generations and already-freed nodes are
@@ -877,6 +884,11 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 			const id = engine.allocNode(hostBits ?? 0);
 			shared.registry!.register(owner, id);
 			return id;
+		},
+		allocNode(hostBits?: number): SignalId {
+			const engine = shared.inner!;
+			engine.maybeBoundary();
+			return engine.allocNode(hostBits ?? 0);
 		},
 		disposeNode(id: SignalId, gen?: SignalGen): void {
 			const engine = shared.inner!;

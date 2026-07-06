@@ -1,5 +1,6 @@
 import { expect, test } from 'vitest';
-import { computed, effect, growCapacity, signal } from '../src';
+import { growCapacity } from '../src';
+import { computedFn as computed, effectFn as effect, signalFn as signal } from './helpers/closures';
 import { createReactiveSystem } from '../src/system';
 import { makeMiniLib } from './helpers/miniLib';
 

@@ -1,5 +1,6 @@
 import { expect, test } from 'vitest';
-import { computed, effect, getActiveSub, getFlags, setFlags, signal } from '../src';
+import { getActiveSub, getFlags, setFlags } from '../src';
+import { computedFn as computed, effectFn as effect, signalFn as signal } from './helpers/closures';
 import { ReactiveFlags } from '../src/system';
 
 test('should support custom recurse effect', () => {

@@ -3,11 +3,14 @@
 // Used by tests/bytecode.spec.ts via `node --print-bytecode`.
 import {
 	computed,
+	dispose,
 	effect,
 	effectScope,
 	endBatch,
+	get,
 	getActiveSub,
 	getFlags,
+	set,
 	setFlags,
 	signal,
 	startBatch,
@@ -18,48 +21,48 @@ import { ReactiveFlags, createReactiveSystem } from '../../esm/system.mjs';
 const a = signal(1);
 const b = signal(2);
 const toggle = signal(false);
-const c1 = computed(() => a() + 1);
-const c2 = computed(() => c1() + (toggle() ? a() : b())); // dynamic deps: unlink/purgeDeps
-const c3 = computed(() => c1() + c2()); // multi-sub: shallowPropagate
-const d1 = effect(() => { c3(); });
-const d2 = effect(() => { c2(); });
+const c1 = computed(() => get(a) + 1);
+const c2 = computed(() => get(c1) + (get(toggle) ? get(a) : get(b))); // dynamic deps: unlink/purgeDeps
+const c3 = computed(() => get(c1) + get(c2)); // multi-sub: shallowPropagate
+const d1 = effect(() => { get(c3); });
+const d2 = effect(() => { get(c2); });
 // Recursive write inside an effect: exercises isValidLink + the recurse arms.
 let recursed = 0;
 effect(() => {
 	setFlags(getActiveSub(), getFlags(getActiveSub()) & ~ReactiveFlags.RecursedCheck);
 	recursed = Math.min(recursed + 1, 3);
-	a(Math.min(a() + 1, 5));
+	set(a, Math.min(get(a) + 1, 5));
 });
 // Inner write with RecursedCheck still set: propagate's isValidLink arm.
 const r = signal(0);
 effect(() => {
-	const v = r();
+	const v = get(r);
 	if (v > 0 && v < 3) {
-		r(v + 1);
+		set(r, v + 1);
 	}
 });
-r(1);
+set(r, 1);
 // Parent effect re-runs with a child effect: run()'s unlinkChildEffects arm.
 const p = signal(0);
 effect(() => {
-	p();
-	effect(() => { b(); });
+	get(p);
+	effect(() => { get(b); });
 });
-p(1);
+set(p, 1);
 for (let i = 0; i < 200; i++) {
-	a(i);
-	toggle(i % 2 === 0);
-	b(i * 2);
+	set(a, i);
+	set(toggle, i % 2 === 0);
+	set(b, i * 2);
 }
 startBatch();
-a(999);
-b(998);
+set(a, 999);
+set(b, 998);
 endBatch();
-trigger(() => { a(); });
-const scope = effectScope(() => { effect(() => { c1(); }); });
-scope();
-d1();
-d2();
+trigger(() => { get(a); });
+const scope = effectScope(() => { effect(() => { get(c1); }); });
+dispose(scope);
+dispose(d1);
+dispose(d2);
 // Exercise the kindless seam + the raw graph ops directly.
 const nodes = [];
 const sys = createReactiveSystem({
@@ -84,4 +87,4 @@ sys.arena.propagate(rawEdge, false);
 sys.arena.checkDirty(M[watcherId + 1], watcherId); // slot 1 = deps head
 sys.arena.unlink(rawEdge, watcherId);
 
-console.log('smoke ok', c3());
+console.log('smoke ok', get(c3));

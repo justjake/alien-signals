@@ -1,38 +1,23 @@
 import { expect, test } from 'vitest';
-import { computed, effect, effectScope, isComputed, isEffect, isEffectScope, isSignal, signal } from '../src';
-import { createReactiveSystem } from '../src/system';
+import { computed, dispose, effect, effectScope, isComputed, isEffect, isEffectScope, isSignal, signal } from '../src';
 
-test('is* identify handles of every kind, at zero creation cost', () => {
-	const s = signal(1);
-	const c = computed(() => s() + 1);
-	const e = effect(() => { c(); });
-	const sc = effectScope(() => {});
+// Kind checks on numeric handles: the kind tag lives in the node's flags
+// word, so is* is a flags load + mask — and a freed id is no kind at all.
 
-	expect(isSignal(s)).toBe(true);
-	expect(isComputed(c)).toBe(true);
-	expect(isEffect(e)).toBe(true);
-	expect(isEffectScope(sc)).toBe(true);
-
-	// no cross-kind confusion
-	expect(isSignal(c) || isSignal(e) || isSignal(sc)).toBe(false);
-	expect(isComputed(s) || isComputed(e) || isComputed(sc)).toBe(false);
-	expect(isEffect(s) || isEffect(c) || isEffect(sc)).toBe(false);
-	expect(isEffectScope(s) || isEffectScope(c) || isEffectScope(e)).toBe(false);
-
-	// arbitrary functions are none of them
-	const stranger = (): number => 1;
-	expect(isSignal(stranger)).toBe(false);
-	expect(isComputed(stranger)).toBe(false);
-	expect(isEffect(stranger)).toBe(false);
-	expect(isEffectScope(stranger)).toBe(false);
-
-	e();
-	sc();
+test('each kind identifies as itself and nothing else', () => {
+	const s = signal(0);
+	const c = computed(() => 1);
+	const e = effect(() => {});
+	const scope = effectScope(() => {});
+	expect([isSignal(s), isComputed(s), isEffect(s), isEffectScope(s)]).toEqual([true, false, false, false]);
+	expect([isSignal(c), isComputed(c), isEffect(c), isEffectScope(c)]).toEqual([false, true, false, false]);
+	expect([isSignal(e), isComputed(e), isEffect(e), isEffectScope(e)]).toEqual([false, false, true, false]);
+	expect([isSignal(scope), isComputed(scope), isEffect(scope), isEffectScope(scope)]).toEqual([false, false, false, true]);
 });
 
-test('is* reject minilib handles from other libraries', async () => {
-	const { makeMiniLib } = await import('./helpers/miniLib');
-	const lib = makeMiniLib({ capacityRecords: 4096 });
-	const foreign = lib.signal(1);
-	expect(isSignal(foreign as unknown as () => void)).toBe(false);
+test('a disposed id is no kind', () => {
+	const e = effect(() => {});
+	expect(isEffect(e)).toBe(true);
+	dispose(e);
+	expect(isEffect(e)).toBe(false);
 });

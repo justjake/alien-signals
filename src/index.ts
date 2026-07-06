@@ -1,14 +1,22 @@
 /**
- * The default signal library: signal, computed, effect, and effectScope,
- * implemented ENTIRELY in userspace with the same division of labor as
- * upstream alien-signals — this module owns all tracking state (the active
- * subscriber, run depth, the batch counter, the pass cycle, the global
- * version, the effect queue) and manipulates node records directly in the
- * shared arena, while the core supplies the five graph algorithms
- * (link/unlink/propagate/checkDirty/shallowPropagate), allocation, and
- * growth. Each function here is a transliteration of its upstream
- * counterpart from `node.field` to `M[id + Slot]`; values and callbacks live
- * on the node-state objects in the `nodes` table.
+ * The default signal library: signal, computed, effect, and effectScope over
+ * NUMERIC HANDLES — `signal()` returns a SignalId and `get(id)`/`set(id, v)`
+ * are module functions, so minting a node allocates NO JavaScript object at
+ * all (an arena record plus a value-column store), and reads dispatch
+ * through one monomorphic function instead of per-node closures.
+ *
+ * This module owns all tracking state (the active subscriber, run depth,
+ * the batch counter, the pass cycle, the global version, the effect queue)
+ * with the same division of labor as upstream alien-signals — the core
+ * supplies the five graph algorithms (link/unlink/propagate/checkDirty/
+ * shallowPropagate), allocation, and growth, and this module manipulates
+ * node records directly in the shared arena. Values and callbacks live in
+ * side columns indexed by record number.
+ *
+ * Lifetime is scope- or caller-managed: dispose() effects and scopes (a
+ * scope disposal cascades to the effects it owns), and reset() tears down
+ * the whole graph. Signals and computeds otherwise live until reset — there
+ * is no per-node garbage collection for numeric handles.
  */
 import {
 	Arena,
@@ -41,40 +49,26 @@ const enum Host {
 	KindMask = 7 << Flag.HostShift,
 }
 
+/**
+ * A signal or computed handle: the node's arena id, with a phantom type
+ * parameter carrying the value type through get/set. It is just a number.
+ */
+declare const ValueOf: unique symbol;
+export type Signal<T> = SignalId & { [ValueOf]?: (value: T) => T };
+
 // ---- node state ----------------------------------------------------------------
-// Plain per-kind state objects, looked up by record number: the record holds
-// the graph, these hold the JavaScript (values, callbacks). The handle a
-// user receives closes over the node id and its state.
+// Structure-of-arrays side columns, indexed by record number: the record
+// holds the graph, these hold the JavaScript. currentVals is a signal's
+// committed value or a computed's cached value; pendingVals is a signal's
+// staged write; fns is a computed's getter or an effect's body (undefined =
+// no callback lives here, which doubles as the liveness guard); cleanups is
+// an effect's returned cleanup. No per-node state object exists at all.
 
-class SignalState {
-	current: unknown;
-	pending: unknown;
-	constructor(value: unknown) {
-		this.current = value;
-		this.pending = value;
-	}
-}
-
-class ComputedState {
-	value: unknown = undefined;
-	getter: (previousValue?: unknown) => unknown;
-	constructor(getter: (previousValue?: unknown) => unknown) {
-		this.getter = getter;
-	}
-}
-
-class EffectState {
-	fn: () => (() => void) | void;
-	cleanup: (() => void) | void = undefined;
-	constructor(fn: () => (() => void) | void) {
-		this.fn = fn;
-	}
-}
-
-// Dense id -> state map, indexed by record number. Slots are cleared by the
-// same code paths that free records, so the map's lifecycle mirrors the
-// arena's exactly.
-const nodes: (SignalState | ComputedState | EffectState | undefined)[] = [];
+type NodeFn = (previousValue?: unknown) => unknown;
+const currentVals: unknown[] = [];
+const pendingVals: unknown[] = [];
+const fns: (NodeFn | undefined)[] = [];
+const cleanups: ((() => void) | void)[] = [];
 
 // ---- host-owned tracking state (upstream's module lets) ---------------------
 
@@ -100,8 +94,8 @@ const queued: SignalId[] = [];
 const queuedGens: SignalGen[] = [];
 
 // ---- the shared arena and the five graph ops --------------------------------
-// Bound by the `allocated` callback below — once at materialization, again
-// after every growth (the arena object is replaced; ids and link ids survive
+// Bound by the `allocated` callback below — once at creation, again after
+// every growth (the arena object is replaced; ids and link ids survive
 // verbatim). Host code never caches any of these in a local across a call
 // that can allocate.
 
@@ -133,14 +127,10 @@ const system = createReactiveSystem({
 		freeNode = arena.freeNode;
 	},
 	update: function updateNode(id, flags): boolean {
-		const st = nodes[id >> Arena.NodeIndexShift];
-		if (st === undefined) {
-			return true; // freed mid-walk: treat as changed, the walk moves on
-		}
 		if ((flags & Host.KindMask) === Host.Signal) {
-			return updateSignal(id, flags, st as SignalState);
+			return updateSignal(id, flags);
 		}
-		return updateComputed(id, st as ComputedState, flags);
+		return updateComputed(id, flags);
 	},
 	// Upstream's notify: queue the effect, then hoist queued ancestors above
 	// it (clearing Watching as the dedup) and reverse the run so outer
@@ -154,7 +144,7 @@ const system = createReactiveSystem({
 		while (true) {
 			queued[insertIndex] = e;
 			queuedGens[insertIndex++] = eGen;
-			const subsLink = M[e + NodeSlot.Subs];
+			const subsLink: LinkId = M[e + NodeSlot.Subs];
 			if (!subsLink) {
 				break;
 			}
@@ -196,15 +186,20 @@ const system = createReactiveSystem({
 
 // ---- update behaviors (upstream index.ts, transliterated) -------------------
 
-function updateSignal(id: SignalId, flags: number, st: SignalState): boolean {
+function updateSignal(id: SignalId, flags: number): boolean {
 	M[id + NodeSlot.Flags] = (flags & Host.Hidden) | Flag.Mutable;
-	return st.current !== (st.current = st.pending);
+	const idx = id >> Arena.NodeIndexShift;
+	return currentVals[idx] !== (currentVals[idx] = pendingVals[idx]);
 }
 
 // `flags` is the caller's already-loaded word: both call sites (the update
-// seam and computedOper's read ladder) have it in hand, and the bits this
-// function keeps (Hidden, HasChildEffect) cannot change under checkDirty.
-function updateComputed(id: SignalId, st: ComputedState, flags: number): boolean {
+// seam and get's read ladder) have it in hand, and the bits this function
+// keeps (Hidden, HasChildEffect) cannot change under checkDirty.
+function updateComputed(id: SignalId, flags: number): boolean {
+	const getter = fns[id >> Arena.NodeIndexShift];
+	if (getter === undefined) {
+		return true; // freed mid-walk: treat as changed, the walk moves on
+	}
 	if (flags & Host.HasChildEffect) {
 		disposeChildEffects(id);
 	}
@@ -216,8 +211,9 @@ function updateComputed(id: SignalId, st: ComputedState, flags: number): boolean
 	++M[SysSlot.EnterDepth];
 	const entryVersion = globalVersion;
 	try {
-		const oldValue = st.value;
-		const changed = oldValue !== (st.value = st.getter(oldValue));
+		const idx = id >> Arena.NodeIndexShift;
+		const oldValue = currentVals[idx];
+		const changed = oldValue !== (currentVals[idx] = getter(oldValue));
 		// Snapshot the version captured BEFORE the getter ran: a write from
 		// inside it moved globalVersion past entryVersion, so the snapshot
 		// can only miss, never lie. Skipped when the getter throws.
@@ -232,7 +228,7 @@ function updateComputed(id: SignalId, st: ComputedState, flags: number): boolean
 }
 
 // Re-run an effect the queue delivered (upstream's run).
-function run(id: SignalId, st: EffectState): void {
+function run(id: SignalId, fn: NodeFn): void {
 	const flags = M[id + NodeSlot.Flags];
 	if (
 		flags & Flag.Dirty
@@ -244,9 +240,10 @@ function run(id: SignalId, st: EffectState): void {
 		if (flags & Host.HasChildEffect) {
 			disposeChildEffects(id);
 		}
-		if (st.cleanup) {
-			runCleanup(st);
-			if (nodes[id >> Arena.NodeIndexShift] !== st) {
+		const idx = id >> Arena.NodeIndexShift;
+		if (cleanups[idx]) {
+			runCleanup(idx);
+			if (!(M[id + NodeSlot.Flags] & Flag.Live)) {
 				return; // the cleanup disposed this effect
 			}
 		}
@@ -258,7 +255,7 @@ function run(id: SignalId, st: EffectState): void {
 		++M[SysSlot.EnterDepth];
 		++runDepth;
 		try {
-			st.cleanup = st.fn();
+			cleanups[idx] = fn() as (() => void) | void;
 		} finally {
 			--runDepth;
 			--M[SysSlot.EnterDepth];
@@ -279,9 +276,9 @@ function flush(): void {
 			const gen = queuedGens[notifyIndex];
 			queued[notifyIndex++] = 0;
 			if (M[id + NodeSlot.Gen] === gen) {
-				const st = nodes[id >> Arena.NodeIndexShift] as EffectState | undefined;
-				if (st !== undefined) {
-					run(id, st);
+				const fn = fns[id >> Arena.NodeIndexShift];
+				if (fn !== undefined) {
+					run(id, fn);
 				}
 			}
 		}
@@ -293,7 +290,7 @@ function flush(): void {
 			const id = queued[notifyIndex];
 			const gen = queuedGens[notifyIndex];
 			queued[notifyIndex++] = 0;
-			if (M[id + NodeSlot.Gen] === gen && nodes[id >> Arena.NodeIndexShift] !== undefined) {
+			if (M[id + NodeSlot.Gen] === gen && fns[id >> Arena.NodeIndexShift] !== undefined) {
 				M[id + NodeSlot.Flags] |= Flag.Watching | Flag.Recursed;
 			}
 		}
@@ -304,9 +301,9 @@ function flush(): void {
 
 // ---- teardown helpers --------------------------------------------------------
 
-function runCleanup(st: EffectState): void {
-	const cleanup = st.cleanup as () => void;
-	st.cleanup = undefined;
+function runCleanup(idx: number): void {
+	const cleanup = cleanups[idx] as () => void;
+	cleanups[idx] = undefined;
 	const prevSub = activeSub;
 	activeSub = 0;
 	++M[SysSlot.EnterDepth];
@@ -323,9 +320,9 @@ function runCleanup(st: EffectState): void {
 // unwatched(), which disposes it. Values and computeds in the walk are left
 // alone.
 function disposeChildEffects(sub: SignalId): void {
-	let l = M[sub + NodeSlot.DepsTail];
+	let l: LinkId = M[sub + NodeSlot.DepsTail];
 	while (l !== 0) {
-		const prev = M[l + LinkSlot.PrevDep];
+		const prev: LinkId = M[l + LinkSlot.PrevDep];
 		if ((M[M[l + LinkSlot.Dep] + NodeSlot.Flags] & Host.KindMask) >= Host.Effect) {
 			unlink(l, sub);
 		}
@@ -334,9 +331,9 @@ function disposeChildEffects(sub: SignalId): void {
 }
 
 function disposeAllDepsInReverse(sub: SignalId): void {
-	let l = M[sub + NodeSlot.DepsTail];
+	let l: LinkId = M[sub + NodeSlot.DepsTail];
 	while (l !== 0) {
-		const prev = M[l + LinkSlot.PrevDep];
+		const prev: LinkId = M[l + LinkSlot.PrevDep];
 		unlink(l, sub);
 		l = prev;
 	}
@@ -345,61 +342,31 @@ function disposeAllDepsInReverse(sub: SignalId): void {
 // Drop the dependency edges a tracking pass did not re-establish (upstream's
 // purgeDeps): everything after the pass's depsTail ages out.
 function purgeDeps(sub: SignalId): void {
-	const depsTail = M[sub + NodeSlot.DepsTail];
-	let l = depsTail !== 0 ? M[depsTail + LinkSlot.NextDep] : M[sub + NodeSlot.Deps];
+	const depsTail: LinkId = M[sub + NodeSlot.DepsTail];
+	let l: LinkId = depsTail !== 0 ? M[depsTail + LinkSlot.NextDep] : M[sub + NodeSlot.Deps];
 	while (l !== 0) {
 		l = unlink(l, sub);
 	}
 }
 
 // The effect/scope teardown (upstream's effectOper + effectScopeOper), shared
-// by user disposers and unwatched() delivery. The graph teardown itself —
-// deps unlinked in reverse, subscribers unlinked, child stops delivered — is
-// free()'s job, and ONLY free's: doing any of it here too would unlink the
-// same edges twice (a self-dispose mid-run leaves DepsTail mid-chain, so a
-// second reverse walk re-frees links and corrupts the free list). Clearing
-// the nodes slot FIRST makes the reentrant unwatched() that free delivers
-// for this very node a no-op. Callers have already validated the id, so the
-// record's CURRENT generation is the right one to free.
+// by dispose() and unwatched() delivery. The graph teardown itself — deps
+// unlinked in reverse, subscribers unlinked, child stops delivered — is
+// freeNode's job, and ONLY freeNode's: doing any of it here too would unlink
+// the same edges twice (a self-dispose mid-run leaves DepsTail mid-chain, so
+// a second reverse walk re-frees links and corrupts the free list). Clearing
+// the fns slot FIRST makes the reentrant unwatched() that freeNode delivers
+// for this very node a no-op.
 function disposeEffect(id: SignalId): void {
-	const st = nodes[id >> Arena.NodeIndexShift] as EffectState | undefined;
-	if (st === undefined) {
+	const idx = id >> Arena.NodeIndexShift;
+	if (fns[idx] === undefined) {
 		return; // already disposed
 	}
-	nodes[id >> Arena.NodeIndexShift] = undefined;
+	fns[idx] = undefined;
 	freeNode(id, M[id + NodeSlot.Gen]);
-	if (st.cleanup) {
-		runCleanup(st);
+	if (cleanups[idx]) {
+		runCleanup(idx);
 	}
-}
-
-// Distinctly-named twin of disposeEffect's caller: keeps the scope disposer
-// literal's source text different from the effect disposer's, so the is*
-// brand checks (cold string compares) can tell them apart.
-function disposeScopeNode(id: SignalId): void {
-	disposeEffect(id);
-}
-
-// ---- brands ------------------------------------------------------------------
-// Every handle of a kind is an instantiation of the SAME closure literal, so
-// Function.prototype.toString() is identical across all of them: kind checks
-// are a cold string compare.
-
-let signalSrc: string | undefined;
-let computedSrc: string | undefined;
-let effectSrc: string | undefined;
-let scopeSrc: string | undefined;
-
-/**
- * Identity helper that keeps a closure literal ANONYMOUS. Passed in argument
- * position, a function expression gets no inferred name, so every instance
- * of the literal has an empty `.name` and byte-identical source text for the
- * String(fn) brand checks above — and name-preserving build pipelines
- * (keepNames-style) have no name to re-attach, which would otherwise wrap
- * the literal differently per site.
- */
-function anonymous<T>(f: T): T {
-	return f;
 }
 
 // ---- public API ---------------------------------------------------------------
@@ -453,14 +420,33 @@ export function setFlags(id: SignalId, flags: number): void {
  * call this before a bulk load to pay for one migration instead of several.
  * Safe to call at any time: a request made inside an effect or getter is
  * applied at the next operation boundary.
- *
- * @example
- * ```ts
- * growCapacity(1 << 22);
- * ```
  */
 export function growCapacity(records: number): void {
 	system.growCapacity(records);
+}
+
+/**
+ * Tear down the whole default graph: every id is invalid afterwards, and
+ * the arena rewinds for reuse at its grown capacity. Cleanups of watched
+ * effects run; version counters keep counting.
+ */
+export function reset(): void {
+	system.reset();
+	currentVals.length = 0;
+	pendingVals.length = 0;
+	fns.length = 0;
+	cleanups.length = 0;
+	queued.length = 0;
+	queuedGens.length = 0;
+	notifyIndex = 0;
+	queuedLength = 0;
+	activeSub = 0;
+	batchDepth = 0;
+	runDepth = 0;
+	triggerScratch = 0;
+	triggerScratchBusy = false;
+	// globalVersion and cycle keep counting: fresh records hold zeroed
+	// snapshots/versions, which can never equal them.
 }
 
 /** Return the number of currently open batches. */
@@ -475,11 +461,11 @@ export function getBatchDepth(): number {
  * @example
  * ```ts
  * const count = signal(0);
- * effect(() => console.log(count())); // 0
+ * effect(() => console.log(get(count))); // 0
  * startBatch();
  * try {
- *   count(1);
- *   count(2);
+ *   set(count, 1);
+ *   set(count, 2);
  * } finally {
  *   endBatch(); // 2; the effect runs once.
  * }
@@ -496,171 +482,162 @@ export function endBatch(): void {
 	}
 }
 
-/** Return whether `fn` is a signal created by this package. */
-export function isSignal(fn: () => void): boolean {
-	return String(fn) === signalSrc;
+/** Return whether `id` is a live signal. */
+export function isSignal(id: SignalId): boolean {
+	return (M[id + NodeSlot.Flags] & (Host.KindMask | Flag.Live)) === (Host.Signal | Flag.Live);
 }
 
-/** Return whether `fn` is a computed created by this package. */
-export function isComputed(fn: () => void): boolean {
-	return String(fn) === computedSrc;
+/** Return whether `id` is a live computed. */
+export function isComputed(id: SignalId): boolean {
+	return (M[id + NodeSlot.Flags] & (Host.KindMask | Flag.Live)) === (Host.Computed | Flag.Live);
 }
 
-/** Return whether `fn` is an effect disposer created by this package. */
-export function isEffect(fn: () => void): boolean {
-	return String(fn) === effectSrc;
+/** Return whether `id` is a live effect. */
+export function isEffect(id: SignalId): boolean {
+	return (M[id + NodeSlot.Flags] & (Host.KindMask | Flag.Live)) === (Host.Effect | Flag.Live);
 }
 
-/** Return whether `fn` is an effect-scope disposer created by this package. */
-export function isEffectScope(fn: () => void): boolean {
-	return String(fn) === scopeSrc;
+/** Return whether `id` is a live effect scope. */
+export function isEffectScope(id: SignalId): boolean {
+	return (M[id + NodeSlot.Flags] & (Host.KindMask | Flag.Live)) === (Host.Scope | Flag.Live);
 }
 
 /**
- * Create a reactive value. Call the returned function with no argument to
- * read the value, or with an argument to write it.
+ * Create a reactive value and return its handle (a number). Read it with
+ * {@link get}, write it with {@link set}.
  *
  * @example
  * ```ts
  * const count = signal(0);
- * count();  // 0
- * count(1);
- * count();  // 1
+ * get(count);     // 0
+ * set(count, 1);
+ * get(count);     // 1
  * ```
  */
-export function signal<T>(): {
-	(): T | undefined;
-	(value: T | undefined): void;
-};
-export function signal<T>(initialValue: T): {
-	(): T;
-	(value: T): void;
-};
-export function signal<T>(initialValue?: T): {
-	(): T | undefined;
-	(value: T | undefined): void;
-} {
-	const st = new SignalState(initialValue);
-	const oper = anonymous(((...value: [T?]): T | undefined | void => {
-		if (value.length) {
-			if (st.pending !== (st.pending = value[0])) {
-				M[id + NodeSlot.Flags] = (M[id + NodeSlot.Flags] & Host.Hidden) | Flag.Mutable | Flag.Dirty;
-				// Every committed write invalidates the version snapshots.
-				++globalVersion;
-				const subs = M[id + NodeSlot.Subs];
-				if (subs !== 0) {
-					propagate(subs, runDepth !== 0);
-					if (!batchDepth) {
-						flush();
-					}
-				}
-			}
-		} else {
-			const flags = M[id + NodeSlot.Flags];
-			if (flags & Flag.Dirty) {
-				// Commit-on-read: a staged write inside an open batch.
-				if (updateSignal(id, flags, st)) {
-					const subs = M[id + NodeSlot.Subs];
-					if (subs !== 0) {
-						shallowPropagate(subs);
-					}
-				}
-			}
-			if (activeSub !== 0) {
-				link(id, activeSub, cycle);
-			}
-			return st.current as T | undefined;
-		}
-	}) as { (): T | undefined; (value: T | undefined): void });
-	// The handle is the node's owner: the record reclaims when the last
-	// reference to `oper` is dropped.
-	const id = system.createNode(oper, Host.Signal | Flag.Mutable);
-	nodes[id >> Arena.NodeIndexShift] = st;
-	signalSrc ??= String(oper);
-	return oper;
+export function signal<T>(): Signal<T | undefined>;
+export function signal<T>(initialValue: T): Signal<T>;
+export function signal<T>(initialValue?: T): Signal<T | undefined> {
+	const id = system.allocNode(Host.Signal | Flag.Mutable);
+	const idx = id >> Arena.NodeIndexShift;
+	currentVals[idx] = initialValue;
+	pendingVals[idx] = initialValue;
+	return id;
 }
 
 /**
- * Create a cached value derived from the signals and computeds read by
- * `getter`. Its argument is the previous value, or `undefined` initially.
- *
- * @example
- * ```ts
- * const count = signal(2);
- * const doubled = computed(() => count() * 2);
- * doubled(); // 4
- * ```
+ * Read a signal or computed by handle, tracking it as a dependency of the
+ * active subscriber.
  */
-export function computed<T>(getter: (previousValue?: T) => T): () => T {
-	const st = new ComputedState(getter as (previousValue?: unknown) => unknown);
-	const oper = anonymous((): T => {
-		// The version gate: a snapshot equal to the current globalVersion
-		// proves nothing observed has been written since the last
-		// verification.
-		if (D[(id >> Arena.VersionShift) + Arena.VersionOffset] === globalVersion) {
-			if (activeSub !== 0) {
-				link(id, activeSub, cycle);
-			}
-			return st.value as T;
+export function get<T>(id: Signal<T>): T {
+	// The version gate: a snapshot equal to the current globalVersion proves
+	// nothing observed has been written since this node was last verified.
+	if (D[(id >> Arena.VersionShift) + Arena.VersionOffset] === globalVersion) {
+		if (activeSub !== 0) {
+			link(id, activeSub, cycle);
 		}
-		const flags = M[id + NodeSlot.Flags];
+		return currentVals[id >> Arena.NodeIndexShift] as T;
+	}
+	return getSlow(id) as T;
+}
+
+function getSlow(id: SignalId): unknown {
+	const flags = M[id + NodeSlot.Flags];
+	if ((flags & Host.KindMask) === Host.Signal) {
 		if (flags & Flag.Dirty) {
-			if (updateComputed(id, st, flags)) {
-				const subs = M[id + NodeSlot.Subs];
+			// Commit-on-read: a staged write inside an open batch.
+			if (updateSignal(id, flags)) {
+				const subs: LinkId = M[id + NodeSlot.Subs];
 				if (subs !== 0) {
 					shallowPropagate(subs);
 				}
 			}
-		} else if (flags & Flag.Pending) {
-			const entryVersion = globalVersion;
-			if (checkDirty(M[id + NodeSlot.Deps], id)) {
-				if (updateComputed(id, st, M[id + NodeSlot.Flags])) {
-					const subs = M[id + NodeSlot.Subs];
-					if (subs !== 0) {
-						shallowPropagate(subs);
-					}
-				}
-			} else {
-				M[id + NodeSlot.Flags] = flags & ~Flag.Pending;
-				D[(id >> Arena.VersionShift) + Arena.VersionOffset] = entryVersion;
+		}
+		// A committed signal is current by definition: snapshot so reads hit
+		// the version gate until the next write anywhere.
+		D[(id >> Arena.VersionShift) + Arena.VersionOffset] = globalVersion;
+	} else if (flags & Flag.Dirty) {
+		if (updateComputed(id, flags)) {
+			const subs: LinkId = M[id + NodeSlot.Subs];
+			if (subs !== 0) {
+				shallowPropagate(subs);
 			}
 		}
-		// A reentrant self-read lands here with neither bit set (the update
-		// in progress already cleared them): stale read by contract.
-		if (activeSub !== 0) {
-			link(id, activeSub, cycle);
+	} else if (flags & Flag.Pending) {
+		const entryVersion = globalVersion;
+		if (checkDirty(M[id + NodeSlot.Deps], id)) {
+			if (updateComputed(id, M[id + NodeSlot.Flags])) {
+				const subs: LinkId = M[id + NodeSlot.Subs];
+				if (subs !== 0) {
+					shallowPropagate(subs);
+				}
+			}
+		} else {
+			M[id + NodeSlot.Flags] = flags & ~Flag.Pending;
+			D[(id >> Arena.VersionShift) + Arena.VersionOffset] = entryVersion;
 		}
-		return st.value as T;
-	});
+	}
+	// A reentrant self-read of a mid-update computed lands here with neither
+	// bit set (the update in progress already cleared them): stale read by
+	// contract.
+	if (activeSub !== 0) {
+		link(id, activeSub, cycle);
+	}
+	return currentVals[id >> Arena.NodeIndexShift];
+}
+
+/** Write a signal by handle. Equal values (Object.is-style ===) are ignored. */
+export function set<T>(id: Signal<T>, value: T): void {
+	const idx = id >> Arena.NodeIndexShift;
+	if (pendingVals[idx] !== (pendingVals[idx] = value)) {
+		M[id + NodeSlot.Flags] = (M[id + NodeSlot.Flags] & Host.Hidden) | Flag.Mutable | Flag.Dirty;
+		// Every committed write invalidates the version snapshots.
+		++globalVersion;
+		const subs: LinkId = M[id + NodeSlot.Subs];
+		if (subs !== 0) {
+			propagate(subs, runDepth !== 0);
+			if (!batchDepth) {
+				flush();
+			}
+		}
+	}
+}
+
+/**
+ * Create a cached value derived from the signals and computeds read by
+ * `getter`, and return its handle. Its argument is the previous value, or
+ * `undefined` initially.
+ *
+ * @example
+ * ```ts
+ * const count = signal(2);
+ * const doubled = computed(() => get(count) * 2);
+ * get(doubled); // 4
+ * ```
+ */
+export function computed<T>(getter: (previousValue?: T) => T): Signal<T> {
 	// Minted DIRTY: the first read takes the update path (upstream's cold
-	// first evaluation), against an empty subscriber list. The handle owns
-	// the record.
-	const id = system.createNode(oper, Host.Computed | Flag.Mutable | Flag.Dirty);
-	nodes[id >> Arena.NodeIndexShift] = st;
-	computedSrc ??= String(oper);
-	return oper;
+	// first evaluation), against an empty subscriber list.
+	const id = system.allocNode(Host.Computed | Flag.Mutable | Flag.Dirty);
+	fns[id >> Arena.NodeIndexShift] = getter as NodeFn;
+	return id;
 }
 
 /**
  * Run `fn` immediately, then rerun it when a value it read changes.
- * `fn` may return cleanup work. The returned function stops the effect.
+ * `fn` may return cleanup work. Stop the effect with {@link dispose}.
  *
  * @example
  * ```ts
  * const count = signal(0);
- * const stop = effect(() => console.log(count())); // 0
- * count(1); // 1
- * stop();
+ * const e = effect(() => console.log(get(count))); // 0
+ * set(count, 1); // 1
+ * dispose(e);
  * ```
  */
-export function effect(fn: () => void | (() => void)): () => void {
-	// The state object is the owner; the nodes table holds it until
-	// disposal, so effects are never garbage-collected out from under the
-	// graph — they run until stopped.
-	const st = new EffectState(fn);
-	const id = system.createNode(st, Host.Effect | Flag.Watching | Flag.RecursedCheck);
-	const gen = M[id + NodeSlot.Gen];
-	nodes[id >> Arena.NodeIndexShift] = st;
+export function effect(fn: () => void | (() => void)): SignalId {
+	const id = system.allocNode(Host.Effect | Flag.Watching | Flag.RecursedCheck);
+	const idx = id >> Arena.NodeIndexShift;
+	fns[idx] = fn as NodeFn;
 	const prevSub = activeSub;
 	activeSub = id;
 	if (prevSub !== 0) {
@@ -672,41 +649,33 @@ export function effect(fn: () => void | (() => void)): () => void {
 	++M[SysSlot.EnterDepth];
 	++runDepth;
 	try {
-		st.cleanup = fn();
+		cleanups[idx] = fn() as (() => void) | void;
 	} finally {
 		--runDepth;
 		--M[SysSlot.EnterDepth];
 		activeSub = prevSub;
 		M[id + NodeSlot.Flags] &= ~Flag.RecursedCheck;
 	}
-	const dispose = anonymous((): void => {
-		if (M[id + NodeSlot.Gen] === gen) {
-			disposeEffect(id);
-		}
-	});
-	effectSrc ??= String(dispose);
-	return dispose;
+	return id;
 }
 
 /**
- * Run `fn` and group every nested effect it creates.
- * The returned function stops the group and runs its cleanup work.
+ * Run `fn` and group every nested effect it creates; dispose() of the scope
+ * stops the group and runs its cleanup work.
  *
  * @example
  * ```ts
  * const count = signal(0);
- * const stop = effectScope(() => {
- *   effect(() => console.log(count()));
+ * const scope = effectScope(() => {
+ *   effect(() => console.log(get(count)));
  * });
- * stop();
- * count(1); // No log; the scope is stopped.
+ * dispose(scope);
+ * set(count, 1); // No log; the scope is stopped.
  * ```
  */
-export function effectScope(fn: () => void): () => void {
-	const st = new EffectState(fn as () => void);
-	const id = system.createNode(st, Host.Scope | Flag.Mutable);
-	const gen = M[id + NodeSlot.Gen];
-	nodes[id >> Arena.NodeIndexShift] = st;
+export function effectScope(fn: () => void): SignalId {
+	const id = system.allocNode(Host.Scope | Flag.Mutable);
+	fns[id >> Arena.NodeIndexShift] = fn as NodeFn;
 	const prevSub = activeSub;
 	activeSub = id;
 	if (prevSub !== 0) {
@@ -720,22 +689,34 @@ export function effectScope(fn: () => void): () => void {
 		--M[SysSlot.EnterDepth];
 		activeSub = prevSub;
 	}
-	const disposeScope = anonymous((): void => {
-		if (M[id + NodeSlot.Gen] === gen) {
-			disposeScopeNode(id);
-		}
-	});
-	scopeSrc ??= String(disposeScope);
-	return disposeScope;
+	return id;
+}
+
+/**
+ * Free a node by handle. Effects and scopes tear down (cleanups run, child
+ * effects cascade); signals and computeds release their record. Repeat
+ * disposals are harmless no-ops.
+ */
+export function dispose(id: SignalId): void {
+	const flags = M[id + NodeSlot.Flags];
+	if (!(flags & Flag.Live)) {
+		return; // already freed
+	}
+	if ((flags & Host.KindMask) >= Host.Effect) {
+		disposeEffect(id);
+	} else {
+		fns[id >> Arena.NodeIndexShift] = undefined;
+		freeNode(id, M[id + NodeSlot.Gen]);
+	}
 }
 
 function noopEffectBody(): void {}
 
 // One persistent scratch subscriber for trigger(), minted on first use and
-// reused ever after: its record is never freed (this module never resets the
-// default system, so the id stays valid), and Watching|RecursedCheck
-// together keep the propagation ladder from ever notifying it. A reentrant
-// trigger — rare — falls back to a throwaway node.
+// reused ever after (its record is only released by reset(), which also
+// clears this cache). Watching|RecursedCheck together keep the propagation
+// ladder from ever notifying it. A reentrant trigger — rare — falls back to
+// a throwaway node.
 let triggerScratch: SignalId = 0;
 let triggerScratchBusy = false;
 
@@ -753,9 +734,8 @@ export function trigger(fn: () => void): void {
 		persistent = true;
 		M[id + NodeSlot.Flags] = (M[id + NodeSlot.Flags] & Host.Hidden) | Flag.Watching | Flag.RecursedCheck;
 	} else {
-		const st = new EffectState(noopEffectBody);
-		id = system.createNode(st, Flag.Watching | Flag.RecursedCheck);
-		nodes[id >> Arena.NodeIndexShift] = st;
+		id = system.allocNode(Flag.Watching | Flag.RecursedCheck);
+		fns[id >> Arena.NodeIndexShift] = noopEffectBody as NodeFn;
 		if (triggerScratch === 0 && !triggerScratchBusy) {
 			triggerScratch = id;
 			persistent = true;
@@ -774,11 +754,11 @@ export function trigger(fn: () => void): void {
 		activeSub = prevSub;
 		M[id + NodeSlot.Flags] &= Host.Hidden;
 		++globalVersion;
-		let l = M[id + NodeSlot.Deps];
+		let l: LinkId = M[id + NodeSlot.Deps];
 		while (l !== 0) {
-			const dep = M[l + LinkSlot.Dep];
+			const dep: SignalId = M[l + LinkSlot.Dep];
 			l = unlink(l, id);
-			const subs = M[dep + NodeSlot.Subs];
+			const subs: LinkId = M[dep + NodeSlot.Subs];
 			if (subs !== 0) {
 				propagate(subs, runDepth !== 0);
 				shallowPropagate(subs);
@@ -788,7 +768,7 @@ export function trigger(fn: () => void): void {
 		if (persistent) {
 			triggerScratchBusy = false;
 		} else {
-			nodes[id >> Arena.NodeIndexShift] = undefined;
+			fns[id >> Arena.NodeIndexShift] = undefined;
 			freeNode(id, M[id + NodeSlot.Gen]);
 		}
 		if (!--batchDepth) {

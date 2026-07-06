@@ -1,24 +1,25 @@
 import { describe, expect, test } from 'vitest';
 import { testSuite, SkipTest, setExpect, type ReactiveFramework } from 'reactive-framework-test-suite';
-import { signal, computed, effect, effectScope, startBatch, endBatch, setActiveSub } from '../src';
+import { computed, dispose, effect, effectScope, endBatch, get, set, setActiveSub, signal, startBatch } from '../src';
 
 const framework: ReactiveFramework = {
 	signal(initialValue) {
 		const s = signal(initialValue);
 		return {
-			read: () => s(),
-			write: (v) => s(v),
+			read: () => get(s),
+			write: (v) => set(s, v),
 		};
 	},
 	computed(fn) {
 		const c = computed(fn);
-		return { read: () => c() };
+		return { read: () => get(c) };
 	},
 	effect(fn) {
-		return effect(fn);
+		const e = effect(fn);
+		return () => dispose(e);
 	},
 	run(fn) {
-		effectScope(fn)();
+		dispose(effectScope(fn));
 	},
 	batch(fn) {
 		startBatch();

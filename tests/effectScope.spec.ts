@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { effect, effectScope, signal } from '../src';
+import { effectFn as effect, effectScopeFn as effectScope, signalFn as signal } from './helpers/closures';
 
 test('scope dispose runs child effect cleanup', () => {
 	const log: string[] = [];
