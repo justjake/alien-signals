@@ -313,17 +313,101 @@ Whenever a write could invalidate cached work, the engine increments a global wr
 
 ## Build your own framework
 
-`createReactiveSystem` returns a complete, composable kit. `src/index.ts` is one example client — a typed signal framework built strictly from this public surface (`tests/policyBoundary.spec.ts` enforces that); a host can build its own instead:
+`createReactiveSystem` returns a complete, composable kit of id-based operations. `src/index.ts` is one example client — a typed signal framework built strictly from this public surface (`tests/policyBoundary.spec.ts` enforces that). A host can build its own instead:
 
-- `signal(v)` / `computed(fn)` / `effect(fn)` / `effectScope(fn)` — allocate nodes, returning numeric IDs
-- `signalRead` / `signalWrite` / `computedRead` — operate on IDs; `dispose(id, gen)` tears down
-- `link(depId, subId): LinkId` — add a dependency edge by hand; `unlink(linkId)` removes it. Manual edges age out if the subscriber re-tracks without re-establishing them, exactly like read-discovered edges
-- `propagate(id)` — mark everything downstream possibly-stale, queue effects, invalidate epoch stamps, flush unless batched; `shallowPropagate(id)` — promote direct subscribers to dirty. Use both after changing something out of band
-- `notify: (effectId, gen) => void` (option) — take over effect scheduling; the engine reports each affected effect once per wave and runs nothing until you call `runEffect(effectId, gen)`. Stale IDs are no-ops via the `gen` check — buffer to an animation frame with `notify: (id, gen) => queue.push([id, gen])` + one `runEffect` loop per frame
-- `start: (id, js) => state` / `stop: (id, js, state)` (options) — watched lifecycle: `start` runs when a node gains its first subscriber, `stop` when the last leaves (and on `reset()`). Connect an external resource on first watch, disconnect on last, keep its handle in `state`
-- `setActiveSub` / `getActiveSub`, `nodeFlags` / `setNodeFlags`, `gen`, `stats`, `buffer` — tracking control and introspection
+````ts
+import { createReactiveSystem } from 'dalien-signals/system';
+import type {
+  ComputedId,
+  EffectId,
+  EffectScopeId,
+  LinkId,
+  NodeId,
+  SignalId,
+} from 'dalien-signals/system';
 
-IDs are integers; using one after its node is disposed or reclaimed is undefined behavior, except through the gen-guarded entry points (`dispose`, `runEffect`).
+export declare function createReactiveSystem(options?: {
+  /** Arena starting capacity in 32-byte records. Default 8,388,608. */
+  initialRecords?: number;
+  /**
+   * Take over effect scheduling. The engine reports each affected effect
+   * once per wave and runs nothing until you call `runEffect(id, gen)`.
+   *
+   * @example Buffer all effects to the end of the animation frame:
+   * ```ts
+   * const queue: Array<[number, number]> = [];
+   * const sys = createReactiveSystem({
+   *   notify: (id, gen) => {
+   *     if (queue.push([id, gen]) === 1) {
+   *       requestAnimationFrame(() => {
+   *         for (const [e, g] of queue.splice(0)) sys.runEffect(e, g);
+   *       });
+   *     }
+   *   },
+   * });
+   * ```
+   */
+  notify?: (effectId: number, gen: number) => void;
+  /**
+   * Runs when a node gains its first subscriber. Whatever it returns is
+   * stored and passed to `stop`. Connect external resources here.
+   * `js` is a signal's current value, or the node's installed function.
+   */
+  start?: (id: NodeId, js: unknown) => unknown;
+  /**
+   * Runs when the node's last subscriber unlinks, and for every started
+   * node during `reset()`. Disconnect the resource `start` connected.
+   */
+  stop?: (id: NodeId, js: unknown, state: unknown) => void;
+}): ReactiveSystem;
+
+export declare interface ReactiveSystem {
+  /** Allocate a node record. IDs are integers into this system's arena. */
+  signal(initialValue?: unknown): SignalId;
+  computed(getter: (previousValue?: unknown) => unknown): ComputedId;
+  effect(fn: () => (() => void) | void): EffectId;
+  effectScope(fn: () => void): EffectScopeId;
+
+  /** Read or stage a value; pull a computed up to date. */
+  signalRead(id: SignalId): unknown;
+  signalWrite(id: SignalId, value: unknown): void;
+  computedRead(id: ComputedId): unknown;
+
+  /** Generation counter for an id — capture at creation, pass to the
+   * gen-guarded operations so stale ids become no-ops. */
+  gen(id: NodeId): number;
+  dispose(id: EffectId | EffectScopeId, gen: number): void;
+  runEffect(id: EffectId, gen: number): void;
+
+  /**
+   * Add a dependency edge by hand: `sub` re-verifies when `dep` changes.
+   * Returns the edge id (the existing one if already linked). Manual edges
+   * age out if the subscriber re-tracks without re-establishing them,
+   * exactly like read-discovered edges.
+   */
+  link(depId: NodeId, subId: NodeId): LinkId;
+  unlink(linkId: LinkId): void;
+
+  /**
+   * Out-of-band invalidation: mark everything downstream of `id` possibly
+   * stale, queue affected effects, invalidate epoch stamps, and flush
+   * unless a batch is open. Follow with `shallowPropagate(id)` to promote
+   * direct subscribers to dirty so they actually recompute.
+   */
+  propagate(id: NodeId): void;
+  shallowPropagate(id: NodeId): void;
+
+  /** Tracking control and introspection. */
+  setActiveSub(id: NodeId): NodeId;
+  getActiveSub(): NodeId;
+  nodeFlags(id: NodeId): number;
+  setNodeFlags(id: NodeId, flags: number): void;
+  stats(): object;
+  buffer(): Int32Array;
+}
+````
+
+Using an ID after its node is disposed or reclaimed is undefined behavior, except through the gen-guarded operations (`dispose`, `runEffect`).
 
 ## Constraints
 
