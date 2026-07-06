@@ -112,6 +112,7 @@ let unlink!: (linkId: LinkId, sub?: SignalId) => LinkId;
 let propagate!: (subsLink: LinkId, innerWrite: boolean) => void;
 let checkDirty!: (depsLink: LinkId, sub: SignalId) => boolean;
 let shallowPropagate!: (subsLink: LinkId) => void;
+let freeNode!: (id: SignalId, gen: SignalGen) => void;
 
 // ---- the system, driven by this library's update/notify/unwatched seams -----
 
@@ -129,6 +130,7 @@ const system = createReactiveSystem({
 		propagate = arena.propagate;
 		checkDirty = arena.checkDirty;
 		shallowPropagate = arena.shallowPropagate;
+		freeNode = arena.freeNode;
 	},
 	update: function updateNode(id, flags): boolean {
 		const st = nodes[id >> Arena.NodeIndexShift];
@@ -365,7 +367,7 @@ function disposeEffect(id: SignalId): void {
 		return; // already disposed
 	}
 	nodes[id >> Arena.NodeIndexShift] = undefined;
-	system.free(id, M[id + NodeSlot.Gen]);
+	freeNode(id, M[id + NodeSlot.Gen]);
 	if (st.cleanup) {
 		runCleanup(st);
 	}
@@ -572,7 +574,7 @@ export function signal<T>(initialValue?: T): {
 	}) as { (): T | undefined; (value: T | undefined): void });
 	// The handle is the node's owner: the record reclaims when the last
 	// reference to `oper` is dropped.
-	const id = system.createReactiveNode(oper, Host.Signal | Flag.Mutable);
+	const id = system.createNode(oper, Host.Signal | Flag.Mutable);
 	nodes[id >> Arena.NodeIndexShift] = st;
 	signalSrc ??= String(oper);
 	return oper;
@@ -633,7 +635,7 @@ export function computed<T>(getter: (previousValue?: T) => T): () => T {
 	// Minted DIRTY: the first read takes the update path (upstream's cold
 	// first evaluation), against an empty subscriber list. The handle owns
 	// the record.
-	const id = system.createReactiveNode(oper, Host.Computed | Flag.Mutable | Flag.Dirty);
+	const id = system.createNode(oper, Host.Computed | Flag.Mutable | Flag.Dirty);
 	nodes[id >> Arena.NodeIndexShift] = st;
 	computedSrc ??= String(oper);
 	return oper;
@@ -656,7 +658,7 @@ export function effect(fn: () => void | (() => void)): () => void {
 	// disposal, so effects are never garbage-collected out from under the
 	// graph — they run until stopped.
 	const st = new EffectState(fn);
-	const id = system.createReactiveNode(st, Host.Effect | Flag.Watching | Flag.RecursedCheck);
+	const id = system.createNode(st, Host.Effect | Flag.Watching | Flag.RecursedCheck);
 	const gen = M[id + NodeSlot.Gen];
 	nodes[id >> Arena.NodeIndexShift] = st;
 	const prevSub = activeSub;
@@ -702,7 +704,7 @@ export function effect(fn: () => void | (() => void)): () => void {
  */
 export function effectScope(fn: () => void): () => void {
 	const st = new EffectState(fn as () => void);
-	const id = system.createReactiveNode(st, Host.Scope | Flag.Mutable);
+	const id = system.createNode(st, Host.Scope | Flag.Mutable);
 	const gen = M[id + NodeSlot.Gen];
 	nodes[id >> Arena.NodeIndexShift] = st;
 	const prevSub = activeSub;
@@ -752,7 +754,7 @@ export function trigger(fn: () => void): void {
 		M[id + NodeSlot.Flags] = (M[id + NodeSlot.Flags] & Host.Hidden) | Flag.Watching | Flag.RecursedCheck;
 	} else {
 		const st = new EffectState(noopEffectBody);
-		id = system.createReactiveNode(st, Flag.Watching | Flag.RecursedCheck);
+		id = system.createNode(st, Flag.Watching | Flag.RecursedCheck);
 		nodes[id >> Arena.NodeIndexShift] = st;
 		if (triggerScratch === 0 && !triggerScratchBusy) {
 			triggerScratch = id;
@@ -787,7 +789,7 @@ export function trigger(fn: () => void): void {
 			triggerScratchBusy = false;
 		} else {
 			nodes[id >> Arena.NodeIndexShift] = undefined;
-			system.free(id, M[id + NodeSlot.Gen]);
+			freeNode(id, M[id + NodeSlot.Gen]);
 		}
 		if (!--batchDepth) {
 			flush();

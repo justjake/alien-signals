@@ -10,7 +10,7 @@ function minter(sys: ReactiveSystem): (hostBits?: number) => SignalId {
 	return (hostBits?: number) => {
 		const owner = {};
 		owners.push(owner);
-		return sys.createReactiveNode(owner, hostBits);
+		return sys.createNode(owner, hostBits);
 	};
 }
 
@@ -191,16 +191,33 @@ test('unwatched is delivered even when watched is not defined', () => {
 	expect(stops).toEqual([dep]);
 });
 
-test('free(id, gen): explicit lifetime; stale gens are no-ops', () => {
+test('arena.freeNode(id, gen): manual lifetime; stale gens are no-ops', () => {
 	const sys = createReactiveSystem({
 		capacityRecords: 4096,
 		update: () => true,
 		notify: () => {},
 	});
-	const mint = minter(sys);
-	const id = mint(1 << 16 | ReactiveFlags.Mutable);
-	const gen = sys.gen(id);
-	sys.free(id, gen);
-	sys.free(id, gen); // double free: gen/live checks make it harmless
-	expect(() => sys.free(id, gen)).not.toThrow();
+	const id = sys.arena.allocNode(1 << 16 | ReactiveFlags.Mutable);
+	const gen = sys.generationOf(id);
+	sys.arena.freeNode(id, gen);
+	sys.arena.freeNode(id, gen); // double free: gen/live checks make it harmless
+	expect(() => sys.arena.freeNode(id, gen)).not.toThrow();
+});
+
+test('disposeNode frees by owner (cancelling the GC watch) or by live id', () => {
+	const sys = createReactiveSystem({
+		capacityRecords: 4096,
+		update: () => true,
+		notify: () => {},
+	});
+	const owner = {};
+	const id = sys.createNode(owner, 1 << 16 | ReactiveFlags.Mutable);
+	const gen = sys.generationOf(id);
+	sys.disposeNode(owner);
+	sys.disposeNode(owner); // unknown-after-dispose: no-op
+	expect(sys.arena.memory[id + NodeSlot.Flags]).toBe(0); // freed
+	const id2 = sys.createNode({}, 1 << 16 | ReactiveFlags.Mutable);
+	sys.disposeNode(id2);
+	expect(() => sys.disposeNode(id2)).not.toThrow(); // already freed: no-op
+	void gen;
 });

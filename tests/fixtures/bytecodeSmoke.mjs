@@ -72,10 +72,10 @@ const sys = createReactiveSystem({
 	notify() {},
 });
 const nsOwner = { current: 1, pending: 1 };
-const nsId = sys.createReactiveNode(nsOwner, 1 << 16 | ReactiveFlags.Mutable);
+const nsId = sys.createNode(nsOwner, 1 << 16 | ReactiveFlags.Mutable);
 nodes[nsId >> 3] = nsOwner;
 const watcherOwner = {};
-const watcherId = sys.createReactiveNode(watcherOwner, 2 << 16 | ReactiveFlags.Watching);
+const watcherId = sys.createNode(watcherOwner, 2 << 16 | ReactiveFlags.Watching);
 const M = sys.arena.memory;
 const rawEdge = sys.arena.link(nsId, watcherId, 1);
 nodes[nsId >> 3].pending = 2;

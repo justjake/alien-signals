@@ -61,8 +61,8 @@ test('without a notify option, watching nodes are silently skipped', () => {
 		capacityRecords: 4096,
 		update: () => true,
 	});
-	const src = sys.createReactiveNode({}, 1 << 16 | ReactiveFlags.Mutable);
-	const watcher = sys.createReactiveNode({}, 3 << 16 | ReactiveFlags.Watching);
+	const src = sys.createNode({}, 1 << 16 | ReactiveFlags.Mutable);
+	const watcher = sys.createNode({}, 3 << 16 | ReactiveFlags.Watching);
 	const M = sys.arena.memory;
 	const edge = sys.arena.link(src, watcher, 1);
 	M[src] |= ReactiveFlags.Dirty; // slot 0 = flags

@@ -302,10 +302,22 @@ export interface ReactiveArena {
 	 * with the current globalVersion proves the node is current.
 	 */
 	readonly versions: Float64Array;
-	/** Mint a node record; `owner`'s collection frees it (see ReactiveSystem.createReactiveNode). */
-	newCustom(hostBits: number): SignalId;
-	/** Explicitly free any node id if `gen` still matches. */
-	free(id: SignalId, gen: number): void;
+	/**
+	 * MANUAL memory management: allocate a node record and return its id.
+	 * Nothing watches it — pair every allocNode with a freeNode, or the
+	 * record lives until reset(). `hostBits` (masked to the host-tag and
+	 * public flag ranges) seed the node's flags word. Passing 3/4 capacity
+	 * schedules a background growth; allocating from a completely full
+	 * arena (mid-operation, or capped by maxCapacity) throws.
+	 */
+	allocNode(hostBits: number): SignalId;
+	/**
+	 * MANUAL memory management: free a node record. Its edges unlink (with
+	 * unwatched delivery for subscribers that empty), and the record is
+	 * recycled at the next operation boundary. Gen-guarded: a stale
+	 * (id, gen) pair is a harmless no-op, so double-frees are safe.
+	 */
+	freeNode(id: SignalId, gen: SignalGen): void;
 
 	// ---- the five graph ops -----------------------------------------------
 	// The same algorithms upstream alien-signals' index.ts builds on, with
@@ -380,29 +392,27 @@ export interface ReactiveSystem {
 	reset(): void;
 	/**
 	 * Mint a host-kind node. `hostBits` (masked to HOST_MASK) are your
-	 * dispatch tags, preserved by the engine across every state rewrite and
-	 * visible in the flags handed to the `update` callback. If `owner` is
-	 * given it is weak-registered: the record reclaims when the owner is
-	 * garbage collected. Without an owner the caller MUST `free`, or the
-	 * record lives until reset().
+	 * AUTOMATIC memory management: allocate a node record whose lifetime is
+	 * tied to `owner` — the record frees itself when `owner` is garbage
+	 * collected, so pass the object whose reachability should keep the node
+	 * alive (a handle closure, a state object). Grows the arena first when
+	 * it is running out of space. `hostBits` seeds the node's flags word as
+	 * in arena.allocNode.
 	 */
+	createNode(owner: WeakKey, hostBits?: number): SignalId;
 	/**
-	 * Mint a node record and return its id. `owner` is the node's lifetime
-	 * token: the record is freed when `owner` is garbage collected, so pass
-	 * the object whose reachability should keep the node alive (a handle
-	 * closure, a state object) — or hold it and free() explicitly.
-	 * `hostBits` (masked to the host-tag and public ranges) seed the node's
-	 * flags word.
+	 * Free a node made by createNode, by its owner or by its id (the owner
+	 * form also cancels the garbage-collection watch). Freeing by id uses
+	 * the record's CURRENT generation — only pass an id you know is live.
+	 * Unknown owners and already-freed nodes are harmless no-ops.
 	 */
-	createReactiveNode(owner: WeakKey, hostBits?: number): SignalId;
-	/** Explicitly free any node id if `gen` still matches. */
-	free(id: SignalId, gen: SignalGen): void;
+	disposeNode(node: WeakKey | SignalId): void;
 	/**
-	 * The node's current generation (M[id + NodeSlot.Gen]): capture at mint,
-	 * pass to free(), and compare before acting on a queued id — a mismatch
-	 * means the record was freed (and possibly reused) in the meantime.
+	 * The node's current generation (memory[id + NodeSlot.Gen]): capture at
+	 * mint and compare before acting on a stored id — a mismatch means the
+	 * record was freed (and possibly reused) in the meantime.
 	 */
-	gen(id: SignalId): SignalGen;
+	generationOf(id: SignalId): SignalGen;
 	/** Allocation accounting (debugging/tests): walks the free lists, O(free). */
 	stats(): {
 		capacityRecords: number;
@@ -557,8 +567,8 @@ function cloneWorks(): boolean {
 		dummy.inner = probe;
 		// Exercise mint, flags, edges, staleness resolution: any unresolved
 		// identifier in the cloned source throws here, not later.
-		const a = probe.newCustom(1 << 16 | 1); // host tag + Mutable
-		const b = probe.newCustom(2 << 16 | 1);
+		const a = probe.allocNode(1 << 16 | 1); // host tag + Mutable
+		const b = probe.allocNode(2 << 16 | 1);
 		const edge = probe.link(a, b, 1);
 		const M = probe.memory;
 		M[a + NodeSlot.Flags] |= Flag.Dirty;
@@ -736,6 +746,10 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 	// minted before the growth keep working at one extra hop. Only runs at
 	// operation boundaries (the engine is not busy): no live frame holds the
 	// old arena, so nothing can write through it afterwards.
+	// Owner -> id for disposeNode(owner); replaced at reset() with the
+	// registry (post-reset owners must not free the new generation's records).
+	let ownerIds = new WeakMap<WeakKey, SignalId>();
+
 	const allocatedCallbacks: Array<(arena: ReactiveArena) => void> = [];
 	if (options?.allocated !== undefined) {
 		allocatedCallbacks.push(options.allocated);
@@ -853,18 +867,33 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 			shared.boundaryPending = false;
 			shared.growPending = false; // capacity stays at its grown size
 			shared.registry = mintRegistry();
+			ownerIds = new WeakMap();
 		},
-		createReactiveNode(owner: WeakKey, hostBits?: number): SignalId {
+		createNode(owner: WeakKey, hostBits?: number): SignalId {
 			const engine = shared.inner!;
 			engine.maybeBoundary();
-			const id = engine.newCustom(hostBits ?? 0);
-			shared.registry!.register(owner, id);
+			const id = engine.allocNode(hostBits ?? 0);
+			ownerIds.set(owner, id);
+			shared.registry!.register(owner, id, owner);
 			return id;
 		},
-		free(id: SignalId, gen: number): void {
-			shared.inner!.free(id, gen);
+		disposeNode(node: WeakKey | SignalId): void {
+			const engine = shared.inner!;
+			let id: SignalId;
+			if (typeof node === 'number') {
+				id = node;
+			} else {
+				const mapped = ownerIds.get(node);
+				if (mapped === undefined) {
+					return; // not an owner we know (or already disposed)
+				}
+				id = mapped;
+				ownerIds.delete(node);
+				shared.registry!.unregister(node);
+			}
+			engine.freeNode(id, engine.memory[id + NodeSlot.Gen]);
 		},
-		gen(id: SignalId): SignalGen {
+		generationOf(id: SignalId): SignalGen {
 			return shared.inner!.memory[id + NodeSlot.Gen];
 		},
 		stats() {
@@ -969,8 +998,8 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		resetState,
 		freeRecordCounts,
 		orphan,
-		newCustom,
-		free: freeNodeId,
+		allocNode: newCustom,
+		freeNode: freeNodeId,
 		link,
 		unlink,
 		propagate,
@@ -1022,7 +1051,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 
 		function newCustom(hostBits: number): SignalId {
 			if (retired) {
-				return shared.inner!.newCustom(hostBits);
+				return shared.inner!.allocNode(hostBits);
 			}
 			// Host tags plus initial PUBLIC state: the kind declares its own
 			// nature (MUTABLE for value nodes so walks update them and waves
@@ -1036,7 +1065,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		// through their kind-correct teardown (cleanup, children).
 		function freeNodeId(id: number, gen: number): void {
 			if (retired) {
-				shared.inner!.free(id, gen);
+				shared.inner!.freeNode(id, gen);
 				return;
 			}
 			if (M[id + NodeSlot.Gen] !== gen) {

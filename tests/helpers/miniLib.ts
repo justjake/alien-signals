@@ -189,7 +189,7 @@ export function makeMiniLib(options?: Omit<ReactiveSystemOptions, 'update' | 'no
 				return st.current;
 			}
 		};
-		const id = sys.createReactiveNode(oper, SIG | Flag.Mutable);
+		const id = sys.createNode(oper, SIG | Flag.Mutable);
 		nodes[id >> Arena.NodeIndexShift] = st;
 		return oper as { (): T; (v: T): void };
 	}
@@ -228,14 +228,14 @@ export function makeMiniLib(options?: Omit<ReactiveSystemOptions, 'update' | 'no
 			return st.value;
 		};
 		// Minted Dirty: the first read takes the update path.
-		const id = sys.createReactiveNode(oper, COMP | Flag.Mutable | Flag.Dirty);
+		const id = sys.createNode(oper, COMP | Flag.Mutable | Flag.Dirty);
 		nodes[id >> Arena.NodeIndexShift] = st;
 		return oper;
 	}
 
 	function effect(fn: () => void | (() => void)): () => void {
 		const st = { fn, cleanup: undefined as (() => void) | void };
-		const id = sys.createReactiveNode(st, EFF | Flag.Watching | Flag.RecursedCheck);
+		const id = sys.createNode(st, EFF | Flag.Watching | Flag.RecursedCheck);
 		const gen = M[id + NodeSlot.Gen];
 		nodes[id >> Arena.NodeIndexShift] = st;
 		const prevSub = activeSub;
@@ -255,7 +255,7 @@ export function makeMiniLib(options?: Omit<ReactiveSystemOptions, 'update' | 'no
 			}
 			// Graph teardown is free()'s job ALONE (see src/index.ts).
 			nodes[id >> Arena.NodeIndexShift] = undefined;
-			sys.free(id, gen);
+			sys.arena.freeNode(id, gen);
 			live.cleanup?.();
 		};
 	}
