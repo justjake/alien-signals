@@ -284,9 +284,9 @@ function uninitialized(): never {
  */
 export interface ReactiveEngine {
 	/** Mint a host-kind node (see ReactiveSystem.custom). */
-	newCustom(hostBits: number): NodeId;
+	newCustom(hostBits: number): SignalId;
 	/** Explicitly free any node id if `gen` still matches. */
-	free(id: NodeId, gen: number): void;
+	free(id: SignalId, gen: number): void;
 
 	// ---- the five graph ops -----------------------------------------------
 	// The same algorithms upstream alien-signals' index.ts builds on, with
@@ -302,14 +302,14 @@ export interface ReactiveEngine {
 	 * Edge insert/refresh between `dep` and `sub` with the caller's
 	 * tracking-pass `version` (the host's cycle counter). Returns the edge id.
 	 */
-	link(depId: NodeId, subId: NodeId, version: number): LinkId;
+	link(depId: SignalId, subId: SignalId, version: number): LinkId;
 	/**
 	 * Edge removal. `subId` defaults to the link's recorded subscriber;
 	 * passing it saves the load when the caller already knows it (dependency
 	 * purges). Returns the link's nextDep, so a purge loop is
 	 * `while (l !== 0) l = unlink(l, sub)`.
 	 */
-	unlink(linkId: LinkId, subId?: NodeId): LinkId;
+	unlink(linkId: LinkId, subId?: SignalId): LinkId;
 	/**
 	 * The invalidation wave over a SUBS list: marks the transitive
 	 * subscriber closure Pending/Dirty and notifies Watching nodes. The
@@ -322,7 +322,7 @@ export interface ReactiveEngine {
 	 * `sub` must recompute (some dependency's value actually changed —
 	 * updates run through the `update` seam during the walk).
 	 */
-	checkDirty(depsLinkId: LinkId, subId: NodeId): boolean;
+	checkDirty(depsLinkId: LinkId, subId: SignalId): boolean;
 	/**
 	 * One-level promotion over a SUBS list: Pending subscribers become
 	 * Dirty, Watching ones are notified. Call after an in-place value
@@ -372,20 +372,20 @@ export interface ReactiveSystem {
 	 */
 	/**
 	 * Turn `owner` into a reactive node: assigns the arena id and generation
-	 * onto it ([NodeIdKey]/[NodeGenKey]) and returns it. `hostBits` (masked
+	 * onto it ([SignalIdKey]/[SignalGenKey]) and returns it. `hostBits` (masked
 	 * to the host-tag and public ranges) seed the node's flags word. The
 	 * node record is freed when `owner` is garbage collected — hold the
 	 * owner (or free() explicitly) to keep it alive.
 	 */
 	createReactiveNode<T extends ReactiveNode = ReactiveNode>(owner: Omit<T, keyof ReactiveNode> & Partial<ReactiveNode>, hostBits?: number): T;
 	/** Explicitly free any node id if `gen` still matches. */
-	free(id: NodeId, gen: NodeGen): void;
+	free(id: SignalId, gen: SignalGen): void;
 	/**
 	 * The node's current generation (M[id + NodeSlot.Gen]): capture at mint,
 	 * pass to free(), and compare before acting on a queued id — a mismatch
 	 * means the record was freed (and possibly reused) in the meantime.
 	 */
-	gen(id: NodeId): NodeGen;
+	gen(id: SignalId): SignalGen;
 	/**
 	 * The live record arena. Trusted hosts address it directly through the
 	 * NodeSlot/LinkSlot/SysSlot layout; the identity changes on growth (see
@@ -426,7 +426,7 @@ export interface ReactiveSystemOptions {
 	 * - notifications fire at write time (propagate), batched or not — the
 	 *   host decides when to flush.
 	 */
-	notify?: (effectId: NodeId, gen: NodeGen) => void;
+	notify?: (effectId: SignalId, gen: SignalGen) => void;
 	/**
 	 * Resolve a node's update (upstream's `update` seam): the graph walks
 	 * hand over every Mutable node whose staleness resolved to Dirty, and
@@ -435,7 +435,7 @@ export interface ReactiveSystemOptions {
 	 * returns whether the value changed (the equality cut-off). `flags` is
 	 * the node's word at entry; dispatch on your host bits.
 	 */
-	update?: (id: NodeId, flags: number) => boolean;
+	update?: (id: SignalId, flags: number) => boolean;
 	/**
 	 * Watched-lifecycle callbacks (upstream's `unwatched`, split in two).
 	 * `watched` runs when a node gains its FIRST subscriber; whatever it
@@ -451,8 +451,8 @@ export interface ReactiveSystemOptions {
 	 * - `reset()` delivers `unwatched` for every watched node (newest
 	 *   first); those callbacks must not touch reactive state mid-reset.
 	 */
-	watched?: (id: NodeId) => unknown;
-	unwatched?: (id: NodeId, state: unknown) => void;
+	watched?: (id: SignalId) => unknown;
+	unwatched?: (id: SignalId, state: unknown) => void;
 	/**
 	 * Runs whenever the arena grows (a new engine generation over a bigger
 	 * arena): re-capture buffer(), stampView(), and `e` here. Fires at the
@@ -461,24 +461,24 @@ export interface ReactiveSystemOptions {
 	onGrow?: () => void;
 }
 
-// Branded number types: a NodeId is not a LinkId is not a generation, and
+// Branded number types: a SignalId is not a LinkId is not a generation, and
 // the compiler enforces it. Values read back out of the arena are plain
 // numbers — cast at the read site, which doubles as documentation of what
 // the slot holds.
-declare const NodeIdBrand: unique symbol;
+declare const SignalIdBrand: unique symbol;
 /** A node record's id: its starting slot offset in the arena (record * 8). */
-export type NodeId = number & { readonly [NodeIdBrand]: true };
+export type SignalId = number & { readonly [SignalIdBrand]: true };
 declare const LinkIdBrand: unique symbol;
 /** An edge record's id, returned by `link`; pass to `unlink`. */
 export type LinkId = number & { readonly [LinkIdBrand]: true };
-declare const NodeGenBrand: unique symbol;
+declare const SignalGenBrand: unique symbol;
 /** A node record's generation; stale (id, gen) pairs are harmless no-ops. */
-export type NodeGen = number & { readonly [NodeGenBrand]: true };
+export type SignalGen = number & { readonly [SignalGenBrand]: true };
 
 /** Property key carrying a {@link ReactiveNode}'s arena id. */
-export const NodeIdKey: unique symbol = Symbol('dalien-signals.nodeId');
+export const SignalIdKey: unique symbol = Symbol('dalien-signals.nodeId');
 /** Property key carrying a {@link ReactiveNode}'s mint-time generation. */
-export const NodeGenKey: unique symbol = Symbol('dalien-signals.nodeGen');
+export const SignalGenKey: unique symbol = Symbol('dalien-signals.nodeGen');
 
 /**
  * Any host object that IS a reactive node: createReactiveNode assigns the
@@ -488,8 +488,8 @@ export const NodeGenKey: unique symbol = Symbol('dalien-signals.nodeGen');
  * object is garbage collected, or explicitly via free().
  */
 export interface ReactiveNode {
-	readonly [NodeIdKey]: NodeId;
-	readonly [NodeGenKey]: NodeGen;
+	readonly [SignalIdKey]: SignalId;
+	readonly [SignalGenKey]: SignalGen;
 }
 
 // ---- engine generations and codegen cloning -------------------------------
@@ -613,10 +613,10 @@ interface EngineShared {
 	hostState: unknown[];
 	inner: Engine | undefined;
 	registry: FinalizationRegistry<number> | undefined;
-	hostNotify: ((effectId: NodeId, gen: NodeGen) => void) | undefined;
-	hostUpdate: ((id: NodeId, flags: number) => boolean) | undefined;
-	hostWatched: ((id: NodeId) => unknown) | undefined;
-	hostUnwatched: ((id: NodeId, state: unknown) => void) | undefined;
+	hostNotify: ((effectId: SignalId, gen: SignalGen) => void) | undefined;
+	hostUpdate: ((id: SignalId, flags: number) => boolean) | undefined;
+	hostWatched: ((id: SignalId) => unknown) | undefined;
+	hostUnwatched: ((id: SignalId, state: unknown) => void) | undefined;
 	growPending: boolean;
 	boundaryPending: boolean;
 	grow(): void;
@@ -850,7 +850,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 					const state = hostState[id >> Arena.NodeIndexShift];
 					hostState[id >> Arena.NodeIndexShift] = undefined;
 					if (shared.hostUnwatched !== undefined) {
-						shared.hostUnwatched(id as NodeId, state);
+						shared.hostUnwatched(id as SignalId, state);
 					}
 				}
 			}
@@ -864,17 +864,17 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			const engine = ensureEngine();
 			engine.maybeBoundary();
 			const id = engine.newCustom(hostBits ?? 0);
-			const node = owner as { [NodeIdKey]: NodeId; [NodeGenKey]: NodeGen };
-			node[NodeIdKey] = id;
-			node[NodeGenKey] = engine.buffer()[id + NodeSlot.Gen] as NodeGen;
+			const node = owner as { [SignalIdKey]: SignalId; [SignalGenKey]: SignalGen };
+			node[SignalIdKey] = id;
+			node[SignalGenKey] = engine.buffer()[id + NodeSlot.Gen] as SignalGen;
 			shared.registry!.register(owner as WeakKey, id);
 			return owner as T;
 		},
-		free(id: NodeId, gen: number): void {
+		free(id: SignalId, gen: number): void {
 			ensureEngine().free(id, gen);
 		},
-		gen(id: NodeId): NodeGen {
-			return ensureEngine().buffer()[id + NodeSlot.Gen] as NodeGen;
+		gen(id: SignalId): SignalGen {
+			return ensureEngine().buffer()[id + NodeSlot.Gen] as SignalGen;
 		},
 		buffer(): Int32Array {
 			return ensureEngine().buffer();
@@ -1033,7 +1033,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 
 		// ---- minting and freeing (see ReactiveSystemOptions.update) -----------
 
-		function newCustom(hostBits: number): NodeId {
+		function newCustom(hostBits: number): SignalId {
 			if (retired) {
 				return shared.inner!.newCustom(hostBits);
 			}
@@ -1041,7 +1041,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			// nature (MUTABLE for value nodes so walks update them and waves
 			// traverse them; WATCHING for effect-likes so notify fires;
 			// neither for wave-opaque bookkeeping nodes).
-			return allocNode(hostBits & (Flag.HostMask | Flag.PublicMask)) as NodeId;
+			return allocNode(hostBits & (Flag.HostMask | Flag.PublicMask)) as SignalId;
 		}
 
 		// Generic, gen-guarded free for ANY node id: the explicit-lifetime
@@ -1049,7 +1049,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		// through their kind-correct teardown (cleanup, children).
 		function freeNodeId(id: number, gen: number): void {
 			if (retired) {
-				shared.inner!.free(id as NodeId, gen as NodeGen);
+				shared.inner!.free(id as SignalId, gen as SignalGen);
 				return;
 			}
 			if (M[id + NodeSlot.Gen] !== gen) {
@@ -1250,7 +1250,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			}
 			M[id + NodeSlot.Flags] = flags | Flag.HostStarted;
 			const hostWatched = shared.hostWatched;
-			hostState[id >> Arena.NodeIndexShift] = hostWatched !== undefined ? hostWatched(id as NodeId) : undefined;
+			hostState[id >> Arena.NodeIndexShift] = hostWatched !== undefined ? hostWatched(id as SignalId) : undefined;
 		}
 
 		function hostUnwatchedNode(id: number): void {
@@ -1259,7 +1259,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			const state = hostState[id >> Arena.NodeIndexShift];
 			hostState[id >> Arena.NodeIndexShift] = undefined;
 			if (shared.hostUnwatched !== undefined) {
-				shared.hostUnwatched(id as NodeId, state);
+				shared.hostUnwatched(id as SignalId, state);
 			}
 		}
 
@@ -1559,7 +1559,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			const flags = M[node + NodeSlot.Flags];
 			const hostUpdate = shared.hostUpdate;
 			if (hostUpdate !== undefined) {
-				return hostUpdate(node as NodeId, flags);
+				return hostUpdate(node as SignalId, flags);
 			}
 			M[node + NodeSlot.Flags] = flags & ~(Flag.Dirty | Flag.Pending);
 			return true;
@@ -1572,7 +1572,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			M[e + NodeSlot.Flags] &= ~Flag.Watching;
 			const hostNotify = shared.hostNotify;
 			if (hostNotify !== undefined) {
-				hostNotify(e as NodeId, M[e + NodeSlot.Gen] as NodeGen);
+				hostNotify(e as SignalId, M[e + NodeSlot.Gen] as SignalGen);
 			}
 		}
 

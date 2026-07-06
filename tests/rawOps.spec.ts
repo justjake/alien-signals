@@ -1,16 +1,16 @@
 import { expect, test } from 'vitest';
-import { NodeIdKey, NodeSlot, ReactiveFlags, createReactiveSystem } from '../src/system';
-import type { LinkId, NodeId, ReactiveSystem } from '../src/system';
+import { SignalIdKey, NodeSlot, ReactiveFlags, createReactiveSystem } from '../src/system';
+import type { LinkId, SignalId, ReactiveSystem } from '../src/system';
 import { makeMiniLib } from './helpers/miniLib';
 
 // Raw tests deal in plain ids; each minted owner is pinned in `owners` so
 // garbage collection cannot reclaim records mid-test.
-function minter(sys: ReactiveSystem): (hostBits?: number) => NodeId {
+function minter(sys: ReactiveSystem): (hostBits?: number) => SignalId {
 	const owners: object[] = [];
 	return (hostBits?: number) => {
 		const owner = {};
 		owners.push(owner);
-		return sys.createReactiveNode(owner, hostBits)[NodeIdKey];
+		return sys.createReactiveNode(owner, hostBits)[SignalIdKey];
 	};
 }
 

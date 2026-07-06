@@ -1,5 +1,5 @@
-import { Arena, Flag, LinkSlot, NodeGenKey, NodeIdKey, NodeSlot, SysSlot, createReactiveSystem } from '../../src/system';
-import type { LinkId, NodeGen, NodeId, ReactiveNode, ReactiveSystemOptions } from '../../src/system';
+import { Arena, Flag, LinkSlot, SignalGenKey, SignalIdKey, NodeSlot, SysSlot, createReactiveSystem } from '../../src/system';
+import type { LinkId, SignalGen, SignalId, ReactiveNode, ReactiveSystemOptions } from '../../src/system';
 
 // A minimal userspace kind library for system-level tests: the smallest
 // signal/computed/effect built the way src/index.ts is built — host-owned
@@ -13,15 +13,15 @@ const KIND = 15 << Flag.HostShift;
 const HIDDEN = ~Flag.PublicMask;
 
 interface MiniNode extends ReactiveNode {
-	[NodeIdKey]: NodeId;
-	[NodeGenKey]: NodeGen;
+	[SignalIdKey]: SignalId;
+	[SignalGenKey]: SignalGen;
 }
 
 export function makeMiniLib(options?: Omit<ReactiveSystemOptions, 'update' | 'notify' | 'onGrow'>) {
 	const nodes: any[] = [];
-	const queue: Array<[NodeId, NodeGen]> = [];
+	const queue: Array<[SignalId, SignalGen]> = [];
 	const notified: number[] = [];
-	let activeSub: NodeId = 0 as NodeId;
+	let activeSub: SignalId = 0 as SignalId;
 	let batchDepth = 0;
 	let cycle = 0;
 	let epoch = 1;
@@ -78,7 +78,7 @@ export function makeMiniLib(options?: Omit<ReactiveSystemOptions, 'update' | 'no
 	let D = sys.stampView();
 	let { link, unlink, propagate, checkDirty, shallowPropagate } = sys.e;
 
-	function purgeDeps(sub: NodeId): void {
+	function purgeDeps(sub: SignalId): void {
 		const depsTail = M[sub + NodeSlot.DepsTail] as LinkId;
 		let l: LinkId = depsTail !== 0 ? (M[depsTail + LinkSlot.NextDep] as LinkId) : (M[sub + NodeSlot.Deps] as LinkId);
 		while (l !== 0) {
@@ -87,7 +87,7 @@ export function makeMiniLib(options?: Omit<ReactiveSystemOptions, 'update' | 'no
 	}
 
 	// The host-owned re-track bracket (upstream's updateComputed shape).
-	function recompute(id: NodeId, st: any): boolean {
+	function recompute(id: SignalId, st: any): boolean {
 		M[id + NodeSlot.DepsTail] = 0;
 		M[id + NodeSlot.Flags] = (M[id + NodeSlot.Flags] & HIDDEN) | Flag.Mutable | Flag.RecursedCheck;
 		const prevSub = activeSub;
@@ -193,7 +193,7 @@ export function makeMiniLib(options?: Omit<ReactiveSystemOptions, 'update' | 'no
 				return st.current;
 			}
 		};
-		const id = sys.createReactiveNode<MiniNode>(oper as object as MiniNode, SIG | Flag.Mutable)[NodeIdKey];
+		const id = sys.createReactiveNode<MiniNode>(oper as object as MiniNode, SIG | Flag.Mutable)[SignalIdKey];
 		nodes[id >> Arena.NodeIndexShift] = st;
 		return oper as { (): T; (v: T): void };
 	}
@@ -232,7 +232,7 @@ export function makeMiniLib(options?: Omit<ReactiveSystemOptions, 'update' | 'no
 			return st.value;
 		};
 		// Minted Dirty: the first read takes the update path.
-		const id = sys.createReactiveNode<MiniNode>(oper as object as MiniNode, COMP | Flag.Mutable | Flag.Dirty)[NodeIdKey];
+		const id = sys.createReactiveNode<MiniNode>(oper as object as MiniNode, COMP | Flag.Mutable | Flag.Dirty)[SignalIdKey];
 		nodes[id >> Arena.NodeIndexShift] = st;
 		return oper;
 	}
@@ -240,8 +240,8 @@ export function makeMiniLib(options?: Omit<ReactiveSystemOptions, 'update' | 'no
 	function effect(fn: () => void | (() => void)): () => void {
 		const st = { fn, cleanup: undefined as (() => void) | void };
 		const node = sys.createReactiveNode<MiniNode>(st as object as MiniNode, EFF | Flag.Watching | Flag.RecursedCheck);
-		const id = node[NodeIdKey];
-		const gen = node[NodeGenKey];
+		const id = node[SignalIdKey];
+		const gen = node[SignalGenKey];
 		nodes[id >> Arena.NodeIndexShift] = st;
 		const prevSub = activeSub;
 		activeSub = id;
