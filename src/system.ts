@@ -751,6 +751,13 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 	// drain only fires when a long fully-synchronous burst piles work past
 	// the caps, keeping memory bounded without taxing the common op.
 	let maintenanceScheduled = false;
+	// Deferred owner registrations as (owner, id) pairs: registering with
+	// the FinalizationRegistry creates a weak cell the garbage collector
+	// must trace, so mint paths queue here and the maintenance microtask
+	// registers after the operation completes — off the caller's clock.
+	// Owners are held strongly until then, so none can be collected before
+	// its registration lands.
+	let pendingRegister: unknown[] = [];
 
 	// Grow-by-migration: allocate an arena twice the current capacity, copy the
 	// live prefix (ids are arena-relative offsets, so every id survives
@@ -795,6 +802,13 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 
 	function runMaintenance(): void {
 		maintenanceScheduled = false;
+		if (pendingRegister.length !== 0) {
+			const registry = shared.registry!;
+			for (let i = 0; i < pendingRegister.length; i += 2) {
+				registry.register(pendingRegister[i] as WeakKey, pendingRegister[i + 1] as SignalId);
+			}
+			pendingRegister.length = 0;
+		}
 		const engine = shared.inner;
 		if (engine === undefined || engine.busy()) {
 			return;
@@ -877,12 +891,15 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 			shared.boundaryPending = false;
 			shared.growPending = false; // capacity stays at its grown size
 			shared.registry = mintRegistry();
+			// Pre-reset owners must not register against the new generation.
+			pendingRegister.length = 0;
 		},
 		createNode(owner: WeakKey, hostBits?: number): SignalId {
 			const engine = shared.inner!;
 			engine.maybeBoundary();
 			const id = engine.allocNode(hostBits ?? 0);
-			shared.registry!.register(owner, id);
+			pendingRegister.push(owner, id);
+			scheduleMaintenance();
 			return id;
 		},
 		allocNode(hostBits?: number): SignalId {
@@ -906,7 +923,7 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 				freeNodeRecords,
 				freeLinkRecords,
 				pendingFreeRecords: shared.pendingFree.length,
-				pendingRegistrations: 0,
+				pendingRegistrations: pendingRegister.length / 2,
 			};
 		},
 	};
