@@ -74,22 +74,158 @@ This is a push-pull algorithm: writes push stale markers through the graph; read
 
 ## API
 
-Most code needs four functions:
+````ts
+import type { ReactiveNode } from 'dalien-signals/system';
 
-- `signal(initialValue)` returns a function. Call it as `value()` to read or `value(next)` to write.
-- `computed(getter)` returns a read function. It runs `getter` when needed and caches the result.
-- `effect(callback)` runs `callback` immediately and when a value it reads changes. The callback may return cleanup work, which runs before the next execution. `effect` returns a function that stops the effect and runs its cleanup.
-- `effectScope(callback)` runs `callback` and groups the effects it creates. It returns a function that stops the whole group.
+/** Return the node currently recording signal reads, if there is one. */
+export declare function getActiveSub(): ReactiveNode | undefined;
 
-The remaining root exports cover less common cases:
+/**
+ * Set the node that records subsequent reads.
+ * Returns the previous node so it can be restored.
+ */
+export declare function setActiveSub(
+  sub?: ReactiveNode,
+): ReactiveNode | undefined;
 
-- `startBatch()` delays queued effects; `endBatch()` flushes them after the outermost batch ends. `getBatchDepth()` reports the current nesting depth.
-- `trigger(readSources)` notifies dependents after mutating a stored object in place. `readSources` reads each signal whose contents changed.
-- `configure({ initialRecords })` sets storage capacity. Call it before creating any signal, computed, effect, or effect scope.
-- `isSignal()`, `isComputed()`, `isEffect()`, and `isEffectScope()` classify functions returned by this package. Returned functions are anonymous, so do not inspect `function.name`.
-- `getActiveSub()` returns a live object representing the computed getter, effect callback, or effect-scope callback currently recording dependencies, or `undefined`. Its `.flags` property uses the update states described below. `setActiveSub()` changes which object records subsequent reads and returns the previous one so an integration can restore it later. Application code normally does not need these hooks.
+/**
+ * Set the fixed arena capacity before creating any reactive values.
+ * `initialRecords` defaults to 8,388,608 32-byte records.
+ *
+ * @example
+ * ```ts
+ * configure({ initialRecords: 1 << 20 });
+ * const count = signal(0);
+ * ```
+ */
+export declare function configure(options?: {
+  initialRecords?: number;
+}): void;
 
-`createReactiveSystem()` from `dalien-signals/system` creates an independent graph and storage area. Methods such as `makeSignal()` and `makeComputed()` return the same callable functions as the root API; lower-level methods use numbers that identify the records described below. The module also exposes debugging and bulk-reset operations.
+/** Return the number of currently open batches. */
+export declare function getBatchDepth(): number;
+
+/**
+ * Open a batch. Queued effects wait for the matching `endBatch()`.
+ *
+ * @example
+ * ```ts
+ * const count = signal(0);
+ * effect(() => console.log(count())); // 0
+ * startBatch();
+ * try {
+ *   count(1);
+ *   count(2);
+ * } finally {
+ *   endBatch(); // 2; the effect runs once.
+ * }
+ * ```
+ */
+export declare function startBatch(): void;
+
+/** Close a batch, flushing effects when the outermost batch closes. */
+export declare function endBatch(): void;
+
+/** Return whether `fn` is a signal created by this package. */
+export declare function isSignal(fn: () => void): boolean;
+
+/** Return whether `fn` is a computed created by this package. */
+export declare function isComputed(fn: () => void): boolean;
+
+/** Return whether `fn` is an effect disposer created by this package. */
+export declare function isEffect(fn: () => void): boolean;
+
+/** Return whether `fn` is an effect-scope disposer created by this package. */
+export declare function isEffectScope(fn: () => void): boolean;
+
+/**
+ * Create a reactive value. Call the returned function with no argument to
+ * read the value, or with an argument to write it.
+ *
+ * @example
+ * ```ts
+ * const count = signal(0);
+ * count();  // 0
+ * count(1);
+ * count();  // 1
+ * ```
+ */
+export declare function signal<T>(): {
+  (): T | undefined;
+  (value: T | undefined): void;
+};
+export declare function signal<T>(initialValue: T): {
+  (): T;
+  (value: T): void;
+};
+
+/**
+ * Create a cached value derived from the signals and computeds read by
+ * `getter`. Its argument is the previous value, or `undefined` initially.
+ *
+ * @example
+ * ```ts
+ * const count = signal(2);
+ * const doubled = computed(() => count() * 2);
+ * doubled(); // 4
+ * count(3);
+ * doubled(); // 6
+ * ```
+ */
+export declare function computed<T>(
+  getter: (previousValue?: T) => T,
+): () => T;
+
+/**
+ * Run `fn` immediately, then rerun it when a value it read changes.
+ * `fn` may return cleanup work. The returned function stops the effect.
+ *
+ * @example
+ * ```ts
+ * const count = signal(0);
+ * const stop = effect(() => console.log(count())); // 0
+ * count(1); // 1
+ * stop();
+ * ```
+ */
+export declare function effect(
+  fn: () => void | (() => void),
+): () => void;
+
+/**
+ * Run `fn` and group every nested effect it creates.
+ * The returned function stops the group and runs its cleanup work.
+ *
+ * @example
+ * ```ts
+ * const count = signal(0);
+ * const stop = effectScope(() => {
+ *   effect(() => console.log(count()));
+ * });
+ * stop();
+ * count(1); // No log; the scope is stopped.
+ * ```
+ */
+export declare function effectScope(fn: () => void): () => void;
+
+/**
+ * Notify dependents after mutating values stored inside signals in place.
+ * Read each changed signal inside `fn`.
+ *
+ * @example
+ * ```ts
+ * const items = signal<string[]>([]);
+ * const size = computed(() => items().length);
+ * size(); // 0
+ * items().push('one');
+ * trigger(items);
+ * size(); // 1
+ * ```
+ */
+export declare function trigger(fn: () => void): void;
+````
+
+The `dalien-signals/system` entry point exposes isolated engines, numeric record IDs, debugging, and bulk reset.
 
 ## Storage
 
