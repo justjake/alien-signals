@@ -303,13 +303,13 @@ Bits identifying the node type or tracking record recycling are engine-only and 
 
 Whenever a write could invalidate cached work, the engine increments a global write counter, called the **epoch**. After checking or recalculating a computed, it saves the epoch in `VSTAMP_HI` and `VSTAMP_LO`. If the saved and current epochs match on the next read, no write that could affect the cache occurred in between, so the value can be returned without walking the graph. If a callback writes another signal during the check, the current epoch advances and the saved value no longer matches.
 
-Other performance details:
+## Performance details
 
-- Updates only one or two links away use dedicated code instead of a general graph walk.
-- When the graph reaches 33 nodes, the engine briefly exercises its shared callback paths with several different functions. This prevents the V8 JavaScript engine from repeatedly discarding and rebuilding optimized machine code as an application adds getters and effects. See `benchs/seedThreshold.mjs` and `benchs/phaseTransition.mjs`.
+- One- and two-link updates use dedicated fast paths instead of the general graph traversal.
+- At 33 nodes, the engine seeds its user-callback call sites past V8's megamorphic threshold (>4 function shapes). Small graphs keep monomorphic JIT specialization; larger graphs avoid mid-run JIT deoptimization and reoptimization as getter and effect shapes diversify. See `benchs/seedThreshold.mjs` and `benchs/phaseTransition.mjs`.
 - JavaScript's `FinalizationRegistry` reports signal and computed functions that the application can no longer reach. Their records are then returned to the free lists.
 - The lower-level engine's `reset()` method clears the whole arena at once. Functions and numeric IDs created before the reset become invalid.
-- `tests/bytecode.spec.ts` keeps performance-critical functions small enough for V8 to insert their bodies directly at call sites.
+- `tests/bytecode.spec.ts` enforces V8's 460-bytecode inline limit for hot functions. Large functions are split so the JIT can inline them into callers.
 
 ## Constraints
 
