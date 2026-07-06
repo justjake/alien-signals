@@ -306,7 +306,7 @@ Whenever a write could invalidate cached work, the engine increments a global wr
 ## Performance details
 
 - One- and two-link updates use dedicated fast paths instead of the general graph traversal.
-- At 33 nodes, the engine seeds its user-callback call sites past V8's megamorphic threshold (>4 function shapes). Small graphs keep monomorphic JIT specialization; larger graphs avoid mid-run JIT deoptimization and reoptimization as getter and effect shapes diversify. See `benchs/seedThreshold.mjs` and `benchs/phaseTransition.mjs`.
+- The engine seeds its user-callback call sites past V8's megamorphic threshold (>4 function shapes) when minted callback shapes diversify — sampled per call-site family (getters vs effect callbacks) on a geometric cadence. Single-shape processes never seed and keep full monomorphic JIT speculation at any graph size (measured 1.15x on a hot chain); diverse processes converge to the seeded steady state (insurance ratio 1.01, `benchs/phaseTransition.mjs`). `configure({ seeding: 'eager' | 'off' })` overrides.
 - JavaScript's `FinalizationRegistry` reports signal and computed functions that the application can no longer reach. Their records are then returned to the free lists.
 - The lower-level engine's `reset()` method clears the whole arena at once. Functions and numeric IDs created before the reset become invalid.
 - `tests/bytecode.spec.ts` enforces V8's 460-bytecode inline limit for hot functions. Large functions are split so the JIT can inline them into callers.
@@ -411,7 +411,7 @@ Using an ID after its node is disposed or reclaimed is undefined behavior, excep
 
 ## Constraints
 
-- The arena grows between operations. Once 3/4 full, the engine is rebuilt over an arena twice the size; every record is copied and IDs survive, so functions created before a growth keep working. Measured cost: benchmark totals within noise, and reads that hit the epoch fast path pay nothing.
+- The arena grows between operations. Once 3/4 full, the engine is rebuilt over an arena twice the size; every record is copied and IDs survive, so functions created before a growth keep working. Before any growth there is no cost (totals within noise; epoch-fast-path reads pay nothing). After a growth, graph-walk-heavy operations run up to ~1.9x slower for the rest of the process: rebuilding instantiates the engine's functions a second time, and V8 then stops embedding the arena's address in optimized code (a one-way decision). Size `initialRecords` so hot processes never grow. Creating multiple systems in one process costs the same, for the same reason.
 - Growth cannot move the arena under a running callback. A single effect or computed callback that allocates past the remaining quarter of the arena throws; `configure({ initialRecords })` sets a larger starting capacity for allocation-heavy paths. By default the arena asks the operating system for a 256 MB address range holding 8,388,608 records; physical memory is consumed only for records that are touched.
 - The JavaScript runtime must support `FinalizationRegistry`, which is part of ES2021.
 - The original `alien-signals` can be faster when repeatedly updating one tiny graph or a long single chain. This arena performs better when one write updates many dependents, and it allocates fewer graph objects for the garbage collector. See `benchs/propagateSustained.mjs`, `benchs/crossover.mjs`, and `benchs/memoryUsage.mjs`.

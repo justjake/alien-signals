@@ -49,7 +49,15 @@
  * Capacity is virtual until touched (large typed arrays are lazily-mapped
  * zero pages), defaults to 8M records (256 MB virtual), and the STARTING
  * size is set per system with configure({ initialRecords }) BEFORE first
- * use. Exhausting the headroom quarter INSIDE one operation (a single
+ * use. KNOWN COST (measured): the first growth (or creating a SECOND
+ * system in the same process) instantiates the engine closures again,
+ * which permanently disables V8's function-context specialization — the
+ * const-M embedding — process-wide; walk-heavy steady state then runs up
+ * to ~1.9x slower. Resizable ArrayBuffers were re-measured as the
+ * alternative (identity-stable M, no rebuild) and cost ~1.9-2.3x on hot
+ * paths ALWAYS, so migration remains the right trade. A build-time
+ * second copy of createEngine (distinct SharedFunctionInfos per growth
+ * generation) is the known fix if post-growth speed becomes load-bearing. Exhausting the headroom quarter INSIDE one operation (a single
  * effect/computed body minting that many nodes mid-run) still throws: no
  * live frame may hold a retired arena. Buffers are allocated LAZILY:
  * importing the library costs nothing. Rejected growth alternatives
@@ -405,6 +413,8 @@ export interface ReactiveSystem {
 		freeLinkRecords: number;
 		pendingFreeRecords: number;
 		pendingRegistrations: number;
+		/** Whether call-site seeding has run (see ReactiveSystemOptions.seeding). */
+		seeded: boolean;
 	};
 }
 
@@ -445,6 +455,14 @@ export interface ReactiveSystemOptions {
 	 */
 	start?: (id: NodeId, js: unknown) => unknown;
 	stop?: (id: NodeId, js: unknown, state: unknown) => void;
+	/**
+	 * Call-site seeding policy. 'auto' (default) seeds when minted callback
+	 * shapes diversify — single-shape processes keep V8's full speculation;
+	 * 'eager' seeds at materialization (flat from the first callback, taxes
+	 * dedicated kernels); 'off' never seeds (fastest single-shape steady
+	 * state, exposed to deopt churn when shapes diversify).
+	 */
+	seeding?: 'auto' | 'eager' | 'off';
 }
 
 /** A record id: a node's (or link's) starting offset in the arena. */
@@ -567,6 +585,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 	// createReactiveSystem or configure() — i.e. only before materialization,
 	// so effect scheduling cannot change shape mid-run.
 	let hostNotify = options?.notify;
+	let seeding = options?.seeding ?? 'auto';
 	let hostStart = options?.start;
 	let hostStop = options?.stop;
 	// One slot per record: the state returned by hostStart, held until
@@ -623,6 +642,19 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			effectSrc = String(engine.makeEffect(noop));
 			scopeSrc = String(engine.makeScope(noop));
 		}
+		// The boot mints above are engine-internal (noop shapes): reset the
+		// seed sampler so they cannot count as the first observed shape and
+		// make every real first getter look like diversity.
+		seedMints[SEED_GETTER] = 0;
+		seedMints[SEED_CALLBACK] = 0;
+		seedSampleAt[SEED_GETTER] = 1;
+		seedSampleAt[SEED_CALLBACK] = 1;
+		seedSrcs[SEED_GETTER] = undefined;
+		seedSrcs[SEED_CALLBACK] = undefined;
+		if (seeding === 'eager' && !seeded && configuredRecords >= 4096) {
+			seeded = true;
+			seedEngine();
+		}
 		return engine;
 	}
 
@@ -635,29 +667,80 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 	// pays reoptimization cycles mid-run (measured at 20-35% on pull-heavy
 	// graphs when several distinct workloads share one process).
 	//
-	// Seeding is LAZY: it fires when the 33rd node is created rather than
-	// at engine startup. A tiny dedicated loop over a handful of nodes —
-	// the shape of a hot micro-kernel — never seeds and keeps V8's full
-	// single-target speculation (which is worth ~10% there); anything
-	// resembling an application crosses 33 nodes while still building its
-	// first graph, so the flat-behavior insurance is in place before any
-	// steady state forms. Also skipped on tiny configured arenas, where
-	// the ~30 transient records would be a real bite out of capacity.
+	// Seeding triggers on callback-shape DIVERSITY, not node count. The tax
+	// (generalized call sites instead of single-target speculation, ~10-25%
+	// in dedicated loops) only ever pays off when an application funnels
+	// MANY different callback shapes through the engine; a process whose
+	// getters all share one source shape — a microbenchmark, a dedicated
+	// kernel of any size — keeps V8's full speculation forever. Detection:
+	// sample the source text of minted computed/effect callbacks on a
+	// geometric cadence (mints 1, 2, 4, 7, 11, 17, ... — String(fn) costs
+	// ~0.2us, so sampling stays invisible even in create-heavy loops) and
+	// seed the moment a sampled shape differs from the first one. Source
+	// text is a proxy for V8's SharedFunctionInfo identity: it can
+	// undercount diversity (identical text in two modules), but any
+	// genuinely diverse app trips it within a few samples. Skipped on tiny
+	// configured arenas, where the ~30 transient records would be a real
+	// bite out of capacity (a later sample retries after growth).
 	//
-	// 33 sits in the middle of a measured zero-regret plateau, not on a
-	// point estimate (benchs/seedThreshold.mjs): thresholds at or below
-	// ~17 charge real micro-kernels the megamorphic premium for nothing,
-	// and thresholds at or above ~65 leave a 40-node first graph
-	// speculated when its callback shapes later diversify (a ~1.15x
-	// deopt-churn cliff). Any value between roughly 20 and 45 measures
-	// identically on both corpora.
-	let mintCount = 0;
+	// The old node-count trigger (33rd mint, zero-regret plateau [20, 45];
+	// benchs/seedThreshold.mjs) taxed single-shape processes at every size
+	// past the threshold — measured 1.09-1.26x on the crossover families at
+	// 10-100 recomputed nodes. benchs/phaseTransition.mjs still verifies
+	// the insurance: a second workload's shapes must not deoptimize the
+	// first's steady state.
+	// Diversity is tracked per call-site family: getters flow through the
+	// recompute/cold-eval sites, effect and scope callbacks through the run
+	// sites. A process with one getter shape AND one effect shape keeps
+	// speculation at both — each site only ever sees its own family.
+	const SEED_GETTER = 0;
+	const SEED_CALLBACK = 1;
+	const seedMints = [0, 0];
+	const seedSampleAt = [1, 1]; // next mint (per family) to sample
+	const seedSrcs: (string | undefined)[] = [undefined, undefined];
 	let seeded = false;
-	function maybeSeed(): void {
-		if (seeded || ++mintCount < 33 || configuredRecords < 4096) {
+	function maybeSeed(fn: Function, family: number): void {
+		if (seeded || ++seedMints[family] !== seedSampleAt[family]) {
+			return;
+		}
+		if (seeding === 'off') {
+			return;
+		}
+		seedSampleAt[family] += (seedSampleAt[family] >> 1) + 1;
+		const src = String(fn);
+		const seen = seedSrcs[family];
+		if (seen === undefined) {
+			seedSrcs[family] = src;
+			return;
+		}
+		if (src === seen || configuredRecords < 4096) {
 			return;
 		}
 		seeded = true;
+		// The warmup is engine-internal: its transient nodes and effect runs
+		// must not leak into host scheduling or lifecycle callbacks.
+		const savedNotify = hostNotify;
+		const savedStart = hostStart;
+		const savedStop = hostStop;
+		// The trigger can fire inside a running effect or getter (a mint is
+		// what samples shapes): detach tracking so warmup nodes cannot link
+		// themselves into the user's graph as children of the active sub.
+		const prevSub = activeSub;
+		activeSub = 0;
+		hostNotify = undefined;
+		hostStart = undefined;
+		hostStop = undefined;
+		try {
+			seedEngine();
+		} finally {
+			activeSub = prevSub;
+			hostNotify = savedNotify;
+			hostStart = savedStart;
+			hostStop = savedStop;
+		}
+	}
+
+	function seedEngine(): void {
 		const engine = inner!;
 		const s0 = engine.makeSignal(0);
 		const read = s0 as () => number;
@@ -884,7 +967,6 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		// channel for index.ts's isSignal/isComputed/isEffect/isEffectScope.
 
 		function makeSignal(initialValue: unknown): SignalHandle {
-			maybeSeed();
 			maybeBoundary(); // may grow, retiring this engine
 			if (retired) {
 				return inner!.makeSignal(initialValue);
@@ -910,7 +992,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		// -> handle), making the FinalizationRegistry unable to ever fire —
 		// upstream has no such anchor because its whole graph is GC-traceable.
 		function makeComputed(getter: (previousValue?: unknown) => unknown): () => unknown {
-			maybeSeed();
+			maybeSeed(getter, SEED_GETTER);
 			maybeBoundary(); // may grow, retiring this engine
 			if (retired) {
 				return inner!.makeComputed(getter);
@@ -926,7 +1008,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		}
 
 		function makeEffect(fn: () => (() => void) | void): () => void {
-			maybeSeed();
+			maybeSeed(fn, SEED_CALLBACK);
 			maybeBoundary(); // may grow, retiring this engine
 			if (retired) {
 				return inner!.makeEffect(fn);
@@ -939,7 +1021,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		}
 
 		function makeScope(fn: () => void): () => void {
-			maybeSeed();
+			maybeSeed(fn, SEED_CALLBACK);
 			maybeBoundary(); // may grow, retiring this engine
 			if (retired) {
 				return inner!.makeScope(fn);
@@ -1812,7 +1894,6 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			if (retired) {
 				return inner!.newSignal(value);
 			}
-			maybeSeed();
 			const id = allocNode(C.K_SIGNAL | C.MUTABLE);
 			const v = id >> 2;
 			vals[v] = value; // currentValue
@@ -1824,7 +1905,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			if (retired) {
 				return inner!.newComputed(getter);
 			}
-			maybeSeed();
+			maybeSeed(getter, SEED_GETTER);
 			const id = allocNode(C.K_COMPUTED);
 			fnTab[id >> 3] = getter;
 			return id;
@@ -1834,7 +1915,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			if (retired) {
 				return inner!.newEffect(fn);
 			}
-			maybeSeed();
+			maybeSeed(fn, SEED_CALLBACK);
 			const e = allocNode(C.K_EFFECT | C.WATCHING | C.RECURSED_CHECK);
 			fnTab[e >> 3] = fn;
 			const prevSub = activeSub;
@@ -1860,7 +1941,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			if (retired) {
 				return inner!.newScope(fn);
 			}
-			maybeSeed();
+			maybeSeed(fn, SEED_CALLBACK);
 			const e = allocNode(C.K_SCOPE | C.MUTABLE);
 			const prevSub = activeSub;
 			activeSub = e;
@@ -2198,6 +2279,9 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			if (configureOptions?.notify !== undefined) {
 				hostNotify = configureOptions.notify;
 			}
+			if (configureOptions?.seeding !== undefined) {
+				seeding = configureOptions.seeding;
+			}
 			if (configureOptions?.start !== undefined) {
 				hostStart = configureOptions.start;
 			}
@@ -2363,6 +2447,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 				freeLinkRecords,
 				pendingFreeRecords: pendingFree.length,
 				pendingRegistrations: 0,
+				seeded,
 			};
 		},
 	};

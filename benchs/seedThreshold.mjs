@@ -1,3 +1,8 @@
+// HISTORICAL: this probe derived the mint-count threshold (33, plateau
+// [20, 45]) for the old node-count seeding trigger. Seeding now triggers
+// on callback-shape diversity (see maybeSeed in src/system.ts); the
+// mint-count sweep is kept for re-deriving a fallback threshold if the
+// diversity trigger ever needs one.
 // Maps the zero-regret plateau for the lazy-seed threshold in
 // src/system.ts (maybeSeed). Build variants with the threshold constant
 // patched (5/9/17/33/65/129/never), then run this probe against each:
