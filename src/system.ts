@@ -127,37 +127,92 @@ export interface ReactiveNode {
 // constant-folding of these hot numbers — measured +15-21% on kairo workloads.
 // Same-file const enum members are inlined as numeric literals by esbuild
 // (transform AND bundle modes), tsx, vitest, and tsc alike.
-const enum C {
-	// Node fields (M arena, stride 8; ids are pre-multiplied: id = record * 8).
-	FLAGS = 0,
-	DEPS = 1, // doubles as the free-list next pointer for freed node records
-	DEPS_TAIL = 2,
-	SUBS = 3,
-	SUBS_TAIL = 4,
-	GEN = 5, // bumped on free; disposers capture it to defuse stale ids
-	// Quiet-read verification stamp: slots 6-7 hold ONE float64 (the write
-	// epoch; 53-bit integer range never wraps), read through the D
-	// Float64Array view over the same buffer — one load and one compare on
-	// the fast path instead of two of each. Same cache line as FLAGS. The
-	// f64 index of a node's stamp is (id >> 1) + 3 (records are 32 bytes,
-	// the stamp at byte offset 24, so 8-byte alignment holds).
-	VSTAMP_HI = 6,
-	VSTAMP_LO = 7,
+// ---- the record layout (public: trusted hosts address the arena directly) --
+// Records are 32 bytes: 8 int32 slots. Ids are pre-multiplied record offsets
+// (id = recordIndex * 8), so a field access is one indexed load:
+// M[id + NodeSlot.Flags]. Node and link records interleave in one arena.
 
-	// Link fields (M arena, stride 8; link records share the arena with nodes).
-	VERSION = 0,
-	DEP = 1,
-	SUB = 2,
-	PREV_SUB = 3,
-	NEXT_SUB = 4,
-	PREV_DEP = 5,
-	NEXT_DEP = 6,
-	// The free list threads through the SPARE field so a freed link keeps
-	// every real field intact: upstream's walks deliberately read stale
-	// nextDep/nextSub off links unlinked earlier in the same walk
-	// (conformance #203 exercises this), and those stale pointers must name
-	// former neighbors — never the free list.
-	FREE_NEXT = 7,
+/** Node record slots. */
+export const enum NodeSlot {
+	Flags = 0,
+	/** First dependency link; doubles as the free-list next for freed nodes. */
+	Deps = 1,
+	DepsTail = 2,
+	Subs = 3,
+	SubsTail = 4,
+	/** Generation counter: bumped on free; capture at mint to defuse stale ids. */
+	Gen = 5,
+	/**
+	 * Slots 6-7 hold ONE float64: the quiet-read verification stamp (the
+	 * write epoch at last verification), read through the Float64Array view
+	 * as D[(id >> 1) + 3]. A stamp equal to the current epoch proves nothing
+	 * observed has been written since — skip all verification.
+	 */
+	StampHi = 6,
+	StampLo = 7,
+}
+
+/** Link (edge) record slots. */
+export const enum LinkSlot {
+	/** Tracking-pass version (the host's cycle counter at link time). */
+	Version = 0,
+	/** The node being depended on. */
+	Dep = 1,
+	/** The node doing the depending. */
+	Sub = 2,
+	PrevSub = 3,
+	NextSub = 4,
+	PrevDep = 5,
+	NextDep = 6,
+	/**
+	 * Free-list thread. Freed links keep every REAL field intact: walks may
+	 * deliberately read stale nextDep/nextSub off links unlinked earlier in
+	 * the same pass, and those must name former neighbors, never the list.
+	 */
+	FreeNext = 7,
+}
+
+/**
+ * Well-known slots of record 0 (the burned null record): system scalars both
+ * core and trusted hosts touch directly, with zero call crossings.
+ */
+export const enum SysSlot {
+	/**
+	 * Live frames currently holding the arena in registers. Hosts MUST
+	 * increment before running user code that could allocate (getters,
+	 * effect bodies) and decrement after: arena growth only happens when
+	 * this is zero. M[SysSlot.EnterDepth]++ / -- (the engine's own
+	 * brackets use it identically).
+	 */
+	EnterDepth = 1,
+	/**
+	 * The write epoch lives in record 0's stamp slots as one float64:
+	 * D[SysSlot.EpochF64]. Bump it (D[SysSlot.EpochF64]++) whenever a
+	 * change could invalidate cached verifications; compare a node's stamp
+	 * against it to skip verification.
+	 */
+	EpochF64 = 3,
+}
+
+const enum C {
+	// Aliases of the public layout (single source of truth above); the
+	// engine keeps its short internal names.
+	FLAGS = NodeSlot.Flags,
+	DEPS = NodeSlot.Deps,
+	DEPS_TAIL = NodeSlot.DepsTail,
+	SUBS = NodeSlot.Subs,
+	SUBS_TAIL = NodeSlot.SubsTail,
+	GEN = NodeSlot.Gen,
+	VERSION = LinkSlot.Version,
+	DEP = LinkSlot.Dep,
+	SUB = LinkSlot.Sub,
+	PREV_SUB = LinkSlot.PrevSub,
+	NEXT_SUB = LinkSlot.NextSub,
+	PREV_DEP = LinkSlot.PrevDep,
+	NEXT_DEP = LinkSlot.NextDep,
+	FREE_NEXT = LinkSlot.FreeNext,
+	ENTER_DEPTH = SysSlot.EnterDepth,
+	EPOCH_F64 = SysSlot.EpochF64,
 
 	// Flags (upstream ReactiveFlags + HasChildEffect + kind bits).
 	MUTABLE = 1,
@@ -503,7 +558,6 @@ function cloneWorks(): boolean {
 			recNext: 8,
 			nodeFreeHead: 0,
 			linkFreeHead: 0,
-			epoch: 1,
 			cycle: 0,
 			batchDepth: 0,
 		}, dummy);
@@ -557,7 +611,6 @@ interface EngineState {
 	recNext: number;
 	nodeFreeHead: number;
 	linkFreeHead: number;
-	epoch: number;
 	cycle: number;
 	batchDepth: number;
 }
@@ -675,7 +728,6 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			recNext: 8,
 			nodeFreeHead: 0,
 			linkFreeHead: 0,
-			epoch: 1,
 			cycle: 0,
 			batchDepth: 0,
 		}, shared);
@@ -940,8 +992,12 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 	const D = new Float64Array(M.buffer);
 	if (from !== undefined) {
 		// Growth migration: ids are arena-relative offsets, so copying the
-		// live prefix preserves every id, edge, generation, and stamp.
+		// live prefix preserves every id, edge, generation, and stamp —
+		// including record 0's system slots (epoch, enter depth).
 		M.set(from.subarray(0, boot.recNext));
+	} else {
+		// The write epoch starts at 1 so a zeroed stamp can never equal it.
+		D[C.EPOCH_F64] = 1;
 	}
 	// Ask for growth once the bump pointer passes 3/4 of the arena
 	// (records * 8 slots * 3/4). The remaining quarter is headroom for
@@ -952,28 +1008,29 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 	let recNext = boot.recNext; // bump pointer, nodes and links (record 0 burned)
 	let nodeFreeHead = boot.nodeFreeHead; // free list threaded through M[id + C.DEPS]
 	let linkFreeHead = boot.linkFreeHead; // free list threaded through M[id + C.NEXT_DEP]
-	// Global write epoch (quiet-read fast path): bumped by every committed
-	// signal write and every trigger(). A computed whose verification stamp
-	// equals the current epoch is provably current — nothing anywhere has
-	// been written since it was last verified — so reads skip the flags
-	// ladder entirely. One float64 (2^53 never wraps).
-	let epoch = boot.epoch;
+	// The global write epoch (quiet-read fast path) lives in record 0 as
+	// D[C.EPOCH_F64] — an arena slot, not a local — so a trusted host bumps
+	// and compares it directly, zero crossings (see SysSlot.EpochF64). It is
+	// bumped by every committed write and trigger(); a node whose stamp
+	// equals it is provably current. One float64 (2^53 never wraps).
 	let cycle = boot.cycle;
 	let batchDepth = boot.batchDepth;
 	// Always neutral at a generation boundary:
 	let activeSub = 0;
 	let runDepth = 0;
-	let enterDepth = 0; // live engine frames that captured M; 0 = op boundary
+	// Enter depth (live engine frames holding the arena; 0 = op boundary)
+	// lives in record 0 as M[C.ENTER_DEPTH] so trusted hosts bracket their
+	// own user-code frames with it (see SysSlot.EnterDepth).
 
 	function snapshot(): EngineState {
-		return { recNext, nodeFreeHead, linkFreeHead, epoch, cycle, batchDepth };
+		return { recNext, nodeFreeHead, linkFreeHead, cycle, batchDepth };
 	}
 
 	// Invalidate every quiet-read stamp: any observed change MUST pass here
 	// (or use the inline twin in write()) or stamped computeds keep serving
 	// their cached values.
 	function bumpEpoch(): void {
-		++epoch;
+		++D[C.EPOCH_F64];
 	}
 
 	// Persistent scratch stacks (upstream's cons-cell Stack<T>). Re-entrant
@@ -1055,7 +1112,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 	// ---- allocation ----------------------------------------------------------
 
 		function busy(): boolean {
-			return enterDepth !== 0;
+			return M[C.ENTER_DEPTH] !== 0;
 		}
 
 		function startBatch(): void {
@@ -1099,7 +1156,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		// May grow — retiring THIS engine — so mint paths re-check `retired`
 		// right after calling it.
 		function maybeBoundary(): void {
-			if (enterDepth !== 0) {
+			if (M[C.ENTER_DEPTH] !== 0) {
 				return;
 			}
 			if (shared.growPending) {
@@ -1111,7 +1168,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		}
 
 		function resetGuard(): void {
-			if (enterDepth !== 0 || activeSub !== 0 || batchDepth !== 0 || runDepth !== 0) {
+			if (M[C.ENTER_DEPTH] !== 0 || activeSub !== 0 || batchDepth !== 0 || runDepth !== 0) {
 				throw new Error('dalien-signals: reset() called during an active operation (inside an effect, computed, batch, or trigger)');
 			}
 		}
@@ -1120,7 +1177,9 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		// this generation's counters. The factory handles the side columns,
 		// the registry, and host-lifecycle stops.
 		function resetState(): void {
+			const liveEpoch = D[C.EPOCH_F64];
 			M.fill(0, 0, recNext);
+			D[C.EPOCH_F64] = liveEpoch;
 			recNext = 8;
 			nodeFreeHead = 0;
 			linkFreeHead = 0;
@@ -1187,7 +1246,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			if (!(flags & C.PENDING)) {
 				return false;
 			}
-			const entryEpoch = epoch;
+			const entryEpoch = D[C.EPOCH_F64];
 			if (checkDirty(M[id + C.DEPS], id)) {
 				return true;
 			}
@@ -1198,7 +1257,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 
 		/** One f64 compare: may the caller skip verification entirely? */
 		function verified(id: number): boolean {
-			return D[(id >> 1) + 3] === epoch;
+			return D[(id >> 1) + 3] === D[C.EPOCH_F64];
 		}
 
 		// The re-track bracket (upstream's startTracking/endTracking): a
@@ -1209,7 +1268,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 				shared.inner!.beginTracking(id);
 				return;
 			}
-			++enterDepth;
+			++M[C.ENTER_DEPTH];
 			++cycle;
 			M[id + C.DEPS_TAIL] = 0;
 			M[id + C.FLAGS] = (M[id + C.FLAGS] & ~(C.DIRTY | C.PENDING | C.RECURSED)) | C.RECURSED_CHECK;
@@ -1222,7 +1281,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			}
 			M[id + C.FLAGS] &= ~C.RECURSED_CHECK;
 			purgeDeps(id);
-			--enterDepth;
+			--M[C.ENTER_DEPTH];
 		}
 
 		function nodeFlagsOf(id: number): number {
@@ -1248,7 +1307,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			}
 			const prevSub = activeSub;
 			activeSub = id;
-			++enterDepth;
+			++M[C.ENTER_DEPTH];
 			++cycle;
 			M[id + C.DEPS_TAIL] = 0;
 			M[id + C.FLAGS] = (M[id + C.FLAGS] & ~(C.DIRTY | C.PENDING | C.RECURSED)) | C.RECURSED_CHECK;
@@ -1257,7 +1316,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			} finally {
 				M[id + C.FLAGS] &= ~C.RECURSED_CHECK;
 				purgeDeps(id);
-				--enterDepth;
+				--M[C.ENTER_DEPTH];
 				activeSub = prevSub;
 			}
 		}
@@ -1291,7 +1350,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		// returned as-is; 1 when the caller must update (recompute, then
 		// shallowPropagate on change, then track).
 		function pull(id: number): number {
-			if (D[(id >> 1) + 3] === epoch) {
+			if (D[(id >> 1) + 3] === D[C.EPOCH_F64]) {
 				if (activeSub !== 0) {
 					link(id, activeSub, cycle);
 				}
@@ -1312,7 +1371,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 				return 1;
 			}
 			if (flags & C.PENDING) {
-				const entryEpoch = epoch;
+				const entryEpoch = D[C.EPOCH_F64];
 				if (checkDirty(M[id + C.DEPS], id)) {
 					return 1;
 				}
@@ -1866,7 +1925,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		// the epoch past entryEpoch, so the stamp can only miss, never lie.
 		function update(node: number): boolean {
 			const flags = M[node + C.FLAGS];
-			const entryEpoch = epoch;
+			const entryEpoch = D[C.EPOCH_F64];
 			M[node + C.FLAGS] = (flags & (C.WATCHING | C.STICKY | C.LIVE | C.PUBLIC_MASK & ~C.DIRTY & ~C.PENDING)) | C.MUTABLE;
 			const changed = shared.hostUpdate === undefined ? true : shared.hostUpdate(node, flags);
 			D[(node >> 1) + 3] = entryEpoch;
@@ -1975,12 +2034,12 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			const prevSub = activeSub;
 			activeSub = sub;
 			++batchDepth;
-			++enterDepth;
+			++M[C.ENTER_DEPTH];
 			try {
 				fn();
 			} finally {
 				activeSub = prevSub;
-				++epoch;
+				++D[C.EPOCH_F64];
 				M[sub + C.FLAGS] = 0;
 				let cur = M[sub + C.DEPS];
 				while (cur !== 0) {
@@ -1995,7 +2054,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 				pendingFree.push(sub);
 				shared.boundaryPending = true;
 				shared.scheduleMaintenance();
-				--enterDepth;
+				--M[C.ENTER_DEPTH];
 				if (!--batchDepth) {
 					const hostFlush = shared.hostFlush;
 					if (hostFlush !== undefined) {
