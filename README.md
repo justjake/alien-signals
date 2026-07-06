@@ -11,11 +11,9 @@
 
 `dalien-signals` is a data-oriented fork of [alien-signals][], a fast [signals][tc39] reactivity library. Its reactive dependency graph is stored in a single `Int32Array` memory [arena][arena-wikipedia], like a contiguous array of structs in C.
 
-The default arena's backing `ArrayBuffer` is 256 MB. Large zero-filled buffers are typically demand-paged, or lazily committed: allocation reserves virtual address space, but resident physical memory grows only as pages are touched. An untouched 256 MB arena therefore does not usually occupy 256 MB of RAM. Exact behavior depends on the JavaScript engine and operating system.
+The default arena's backing `ArrayBuffer` is 256 MB. Large zero-filled buffers are typically demand-paged, or lazily committed: allocation reserves virtual address space, but resident physical memory grows only as pages are touched, so this doesn't immediately use all 256 MB (exact behavior depends on the JS runtime engine and operating system).
 
-It implements the alien-signals 3.2.1 API directly; alien-signals is not a runtime dependency.
-
-## How signals work
+## How it works
 
 `dalien-signals` keeps calculations and callbacks in sync with changing values. It provides three main primitives:
 
@@ -26,7 +24,7 @@ It implements the alien-signals 3.2.1 API directly; alien-signals is not a runti
 Dependencies are automatic. While a computed or effect runs, the library records every signal and computed it reads.
 
 ```ts
-import { computed, effect, signal } from 'dalien-signals';
+import { computed, effect, signal } from "dalien-signals";
 
 const count = signal(1);
 const doubled = computed(() => count() * 2);
@@ -44,14 +42,12 @@ flowchart LR
     even -->|read by| log
 ```
 
-Arrows point from a value to the work that depends on it. Changing `count` reaches the effect through two paths, but queues it once. Each computed returns its current value when the effect reads it.
+Arrows point from a value to the work that depends on it. When `count` changes, the effect is reached through both computeds but queued only once.
 
-## How updates work
+Recalculating every downstream node on each write would waste work. Recalculating dependents immediately could also run an effect more than once or before all of its inputs are current. Updates instead use a push-pull algorithm:
 
-Recalculating everything on every write would waste work. Recalculating dependents immediately could also run the same effect more than once or before all of its inputs are current. Updates therefore have two phases:
-
-1. **Mark:** a write marks dependent computeds and effects as possibly stale—their cached values may no longer match their inputs. Effects are queued, but no user callback runs yet.
-2. **Update:** a computed updates its inputs before returning a value. A queued effect reruns, and every computed it reads updates before returning. An unchanged computed value stops the update from spreading farther.
+1. **Push:** a write marks downstream computeds and effects as possibly stale. Effects are queued, but no user callback runs during this graph walk.
+2. **Pull:** before a computed returns its value, it checks its dependencies and recalculates if necessary. A queued effect reruns and pulls each computed it reads up to date. If a computed's value has not changed, the update stops along that path.
 
 ```mermaid
 sequenceDiagram
@@ -76,12 +72,10 @@ sequenceDiagram
     E->>E: console.log(4, true)
 ```
 
-This is a push-pull algorithm: writes push stale markers through the graph; reads and effects pull the values they need up to date.
-
 ## API
 
 ````ts
-import type { ReactiveNode } from 'dalien-signals/system';
+import type { ReactiveNode } from "dalien-signals/system";
 
 /** Return the node currently recording signal reads, if there is one. */
 export declare function getActiveSub(): ReactiveNode | undefined;
@@ -104,9 +98,7 @@ export declare function setActiveSub(
  * const count = signal(0);
  * ```
  */
-export declare function configure(options?: {
-  initialRecords?: number;
-}): void;
+export declare function configure(options?: { initialRecords?: number }): void;
 
 /** Return the number of currently open batches. */
 export declare function getBatchDepth(): number;
@@ -178,9 +170,7 @@ export declare function signal<T>(initialValue: T): {
  * doubled(); // 6
  * ```
  */
-export declare function computed<T>(
-  getter: (previousValue?: T) => T,
-): () => T;
+export declare function computed<T>(getter: (previousValue?: T) => T): () => T;
 
 /**
  * Run `fn` immediately, then rerun it when a value it read changes.
@@ -194,9 +184,7 @@ export declare function computed<T>(
  * stop();
  * ```
  */
-export declare function effect(
-  fn: () => void | (() => void),
-): () => void;
+export declare function effect(fn: () => void | (() => void)): () => void;
 
 /**
  * Run `fn` and group every nested effect it creates.
@@ -289,15 +277,15 @@ stateDiagram-v2
 
 Effects use the same pending-versus-dirty distinction to decide whether their callbacks need to rerun. The live `.flags` object returned by `getActiveSub()` exposes these bits:
 
-| bit | name | meaning |
-| ---: | --- | --- |
-| 0 | `ReactiveFlags.Mutable` | Changes can continue through this node to its dependents. |
-| 1 | `ReactiveFlags.Watching` | This node is an effect that should be queued when reached. |
-| 2 | `ReactiveFlags.RecursedCheck` | The engine is watching for a write that loops back into the callback now running. |
-| 3 | `ReactiveFlags.Recursed` | Such a recursive write reached this node. |
-| 4 | `ReactiveFlags.Dirty` | This node is known to need an update. |
-| 5 | `ReactiveFlags.Pending` | An earlier dependency may require this node to update. |
-| 6 | `HAS_CHILD_EFFECT` (internal) | This node owns nested effects that require ordered cleanup. |
+| bit | name                          | meaning                                                                           |
+| --: | ----------------------------- | --------------------------------------------------------------------------------- |
+|   0 | `ReactiveFlags.Mutable`       | Changes can continue through this node to its dependents.                         |
+|   1 | `ReactiveFlags.Watching`      | This node is an effect that should be queued when reached.                        |
+|   2 | `ReactiveFlags.RecursedCheck` | The engine is watching for a write that loops back into the callback now running. |
+|   3 | `ReactiveFlags.Recursed`      | Such a recursive write reached this node.                                         |
+|   4 | `ReactiveFlags.Dirty`         | This node is known to need an update.                                             |
+|   5 | `ReactiveFlags.Pending`       | An earlier dependency may require this node to update.                            |
+|   6 | `HAS_CHILD_EFFECT` (internal) | This node owns nested effects that require ordered cleanup.                       |
 
 Bits identifying the node type or tracking record recycling are engine-only and are hidden from that object. `ReactiveFlags`, exported by `dalien-signals/system`, names bits 0–5 so integrations do not need to hard-code their numeric values.
 
@@ -307,7 +295,7 @@ Whenever a write could invalidate cached work, the engine increments a global wr
 
 - One- and two-link updates use dedicated fast paths instead of the general graph traversal. Runs of single-dependency, single-subscriber nodes — chains — walk without the traversal stack: the way back up is recoverable from each node's unique subscriber link.
 - The engine seeds its user-callback call sites past V8's megamorphic threshold (>4 function shapes) when minted callback shapes diversify — sampled per call-site family (getters vs effect callbacks) on a geometric cadence. Single-shape processes never seed and keep full monomorphic JIT speculation at any graph size (measured 1.15x on a hot chain); diverse processes converge to the seeded steady state (insurance ratio 1.01, `benchs/phaseTransition.mjs`). `configure({ seeding: 'eager' | 'off' })` overrides.
-- JavaScript's `FinalizationRegistry` reports signal and computed functions that the application can no longer reach. Their records are then returned to the free lists.
+- A `FinalizationRegistry` tracks when signal or computed functions are GC'd and returns their underlying record memory to a free-list for re-use.
 - The lower-level engine's `reset()` method clears the whole arena at once. Functions and numeric IDs created before the reset become invalid.
 - `tests/bytecode.spec.ts` enforces V8's 460-bytecode inline limit for hot functions. Large functions are split so the JIT can inline them into callers.
 
@@ -316,7 +304,7 @@ Whenever a write could invalidate cached work, the engine increments a global wr
 `createReactiveSystem` returns a complete, composable kit of id-based operations. `src/index.ts` is one example client — a typed signal framework built strictly from this public surface (`tests/policyBoundary.spec.ts` enforces that). A host can build its own instead:
 
 ````ts
-import { createReactiveSystem } from 'dalien-signals/system';
+import { createReactiveSystem } from "dalien-signals/system";
 import type {
   ComputedId,
   EffectId,
@@ -324,7 +312,7 @@ import type {
   LinkId,
   NodeId,
   SignalId,
-} from 'dalien-signals/system';
+} from "dalien-signals/system";
 
 export declare function createReactiveSystem(options?: {
   /** Arena starting capacity in 32-byte records. Default 8,388,608. */
