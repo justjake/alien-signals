@@ -977,6 +977,29 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		// plumbing plus the loop was 543 bytecodes, which barred checkDirty from
 		// inlining into run()/computedRead() (the bytecode budget test pins this).
 		function checkDirty(startLink: number, startSub: number): boolean {
+			// Shallow fast path mirroring checkDirtyLoop's first iteration:
+			// the sub is already dirty, or its first dep is a directly-dirty
+			// mutable — the shape of every effect sitting one link away from
+			// a written signal's computed. Resolving here skips the loop's
+			// stack machinery and the try/finally for the hottest walks;
+			// anything deeper (pending deps, more links) falls through to
+			// the general loop unchanged.
+			if (M[startSub + C.FLAGS] & C.DIRTY) {
+				return true;
+			}
+			const dep = M[startLink + C.DEP];
+			if ((M[dep + C.FLAGS] & (C.MUTABLE | C.DIRTY)) === (C.MUTABLE | C.DIRTY)) {
+				if (updateAndShallow(dep, M[dep + C.SUBS])) {
+					// Same disposed-sub guard as the loop's return: update()
+					// may run user code that disposes the sub mid-walk.
+					return M[startSub + C.FLAGS] !== 0;
+				}
+				const nextDep = M[startLink + C.NEXT_DEP];
+				if (nextDep === 0) {
+					return false;
+				}
+				startLink = nextDep;
+			}
 			const stackBase = checkSp;
 			try {
 				return checkDirtyLoop(startLink, startSub);
