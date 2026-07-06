@@ -9,7 +9,7 @@
 
 # dalien-signals
 
-*d*alien-signals is a *d*ata-oriented fork of [alien-signals][], a fast [signals][tc39] reactivity library. Its reactive dependency graph is stored in a single `Int32Array` memory [arena][arena-wikipedia], like a contiguous array of structs in C.
+**d**alien-signals is a **d**ata-oriented fork of [alien-signals][], a fast [signals][tc39] reactivity library. Its reactive dependency graph is stored in a single `Int32Array` memory [arena][arena-wikipedia], like a contiguous array of structs in C.
 
 The default arena's backing `ArrayBuffer` is 256 MB. Large zero-filled buffers are typically demand-paged, or lazily committed: allocation reserves virtual address space, but resident physical memory grows only as pages are touched, so this doesn't immediately use all 256 MB (exact behavior depends on the JS runtime engine and operating system).
 
