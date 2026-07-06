@@ -508,6 +508,14 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 	// first graph, so the flat-behavior insurance is in place before any
 	// steady state forms. Also skipped on tiny configured planes, where
 	// the ~30 transient records would be a real bite out of capacity.
+	//
+	// 33 sits in the middle of a measured zero-regret plateau, not on a
+	// point estimate (benchs/seedThreshold.mjs): thresholds at or below
+	// ~17 charge real micro-kernels the megamorphic premium for nothing,
+	// and thresholds at or above ~65 leave a 40-node first graph
+	// speculated when its callback shapes later diversify (a ~1.15x
+	// deopt-churn cliff). Any value between roughly 20 and 45 measures
+	// identically on both corpora.
 	let mintCount = 0;
 	let seeded = false;
 	function maybeSeed(): void {
