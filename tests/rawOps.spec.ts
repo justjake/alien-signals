@@ -221,3 +221,18 @@ test('disposeNode frees by owner (cancelling the GC watch) or by live id', () =>
 	expect(() => sys.disposeNode(id2)).not.toThrow(); // already freed: no-op
 	void gen;
 });
+
+test('disposeNode with a stale generation is a no-op', () => {
+	const sys = createReactiveSystem({
+		capacityRecords: 4096,
+		update: () => true,
+		notify: () => {},
+	});
+	const owner = {};
+	const id = sys.createNode(owner, 1 << 16 | ReactiveFlags.Mutable);
+	const gen = sys.generationOf(id);
+	sys.disposeNode(id, ((gen as number) + 1) as typeof gen); // wrong gen: no-op
+	expect(sys.arena.memory[id + NodeSlot.Flags]).not.toBe(0); // still live
+	sys.disposeNode(id, gen); // right gen: freed
+	expect(sys.arena.memory[id + NodeSlot.Flags]).toBe(0);
+});
