@@ -43,9 +43,12 @@ classDiagram
     Node ..> SideArrays : id
 ```
 
-Node records (signals, computeds, effects, scopes) and link records (the edges between them) interleave in the same plane, handed out by one bump pointer and recycled through free lists. Ids are pre-multiplied (`id = recordIndex × 8`) so every field access is a single indexed load, `M[id + SLOT]`, and record 0 is burned as *null* so every "is there a link?" check is `x !== 0`. Two side arrays indexed by the same id hold the only GC-visible parts: `values` (two slots per record — current value, plus staged value or effect cleanup) and `fns` (the getter or callback). The graph itself is invisible to the garbage collector.
+- Node records (signals, computeds, effects, scopes) and link records (edges) interleave in one plane: one bump pointer, free lists for recycling
+- `id = recordIndex × 8` — field access is one indexed load, `M[id + SLOT]`
+- record 0 is burned as *null* — every "is there a link?" check is `x !== 0`
+- side arrays hold the only GC-visible data: `values` (current value + staged value or effect cleanup), `fns` (getter or callback); the graph itself is invisible to the GC
 
-The `FLAGS` slot packs a node's state and its type into one bitfield:
+The `FLAGS` slot packs state and type into one bitfield:
 
 ```mermaid
 ---
@@ -71,7 +74,12 @@ packet-beta
 13-15: "unused"
 ```
 
-Bits 0–5 are upstream's `ReactiveFlags`, values unchanged — the push-pull protocol below runs on `DIRTY` and `PENDING`. Bits 7–10 say which primitive the record is, so type dispatch (upstream checks like `'getter' in node`) becomes a bit test on a word already loaded for the state check. Bits 11–12 are engine-internal lifecycle: the record's handle was garbage-collected while still subscribed, and a handle-owned getter is currently installed in `fns`. Bits 0–6 (`PUBLIC_MASK`) are what `getActiveSub()` exposes; everything above — and bits 16–31 — is engine-owned.
+- bits 0–5 — upstream's `ReactiveFlags`, values unchanged; push-pull runs on `DIRTY` and `PENDING`
+- `HAS_CHILD_EFFECT` — effect contains child effects
+- `K_*` kind bits — type dispatch is a bit test on the already-loaded word, not upstream's `'getter' in node` property check
+- `ORPHANED` — handle was garbage-collected while subscribers remain; record reclaimed at last unlink
+- `FN_INSTALLED` — handle-owned getter currently installed in `fns`
+- bits 0–6 (`PUBLIC_MASK`) — exposed by `getActiveSub()`; everything above is engine-owned
 
 Here's how our modified algorithm works:
 
