@@ -33,10 +33,10 @@ test('a second system (cloned engine) behaves identically', () => {
 	lib.drain();
 	expect(seen).toBe(15);
 	expect(runs).toBe(2);
-	lib.sys.startBatch();
+	lib.startBatch();
 	s(6);
 	s(7);
-	lib.sys.endBatch();
+	lib.endBatch();
 	lib.drain();
 	expect(seen).toBe(21);
 	stop();

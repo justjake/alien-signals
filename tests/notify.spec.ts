@@ -30,11 +30,11 @@ test('one notification per wave until the host re-arms', () => {
 		s();
 	});
 	lib.notified.length = 0;
-	lib.sys.startBatch();
+	lib.startBatch();
 	s(1);
 	s(2);
 	s(3);
-	lib.sys.endBatch();
+	lib.endBatch();
 	expect(lib.notified.length).toBe(1); // deduped while un-run
 	lib.drain();
 	s(4);
@@ -49,10 +49,10 @@ test('reads stay consistent while effects are parked', () => {
 	lib.effect(() => {
 		c();
 	});
-	lib.sys.startBatch();
+	lib.startBatch();
 	s(5);
 	expect(c()).toBe(50); // pull re-verifies before any effect ran
-	lib.sys.endBatch();
+	lib.endBatch();
 	lib.drain();
 });
 
@@ -63,7 +63,8 @@ test('without a notify option, watching nodes are silently skipped', () => {
 	});
 	const src = sys.custom(1 << 16 | ReactiveFlags.Mutable);
 	const watcher = sys.custom(3 << 16 | ReactiveFlags.Watching);
-	sys.link(src, watcher);
-	sys.markDirty(src);
-	expect(() => sys.propagate(src)).not.toThrow();
+	const M = sys.buffer();
+	const edge = sys.e.link(src, watcher, 1);
+	M[src] |= ReactiveFlags.Dirty; // slot 0 = flags
+	expect(() => sys.e.propagate(edge, false)).not.toThrow();
 });

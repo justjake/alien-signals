@@ -33,13 +33,10 @@ const BUDGETS: Record<string, number> = {
 	updateAndShallow: 100,
 	shallowPropagate: 160,
 	isValidLink: 100,
-	purgeDeps: 100,
+	purgeDeps: 100, // the HOST's purge loop (index.ts) — core's died with the kit
 	// the kindless seam + userspace verbs on hot paths
-	update: 160, // entry-epoch capture + state rewrite + hostUpdate call + stamp
+	update: 80, // pure seam trampoline: flags load + hostUpdate dispatch
 	notify: 80, // WATCHING dedup + host handoff
-	verify: 200,
-	track: 80,
-	markDirty: 80,
 };
 
 const pkgRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');

@@ -39,13 +39,13 @@ test('growth preserves the graph mid-batch', () => {
 	lib.effect(() => {
 		seen = s();
 	});
-	lib.sys.startBatch();
+	lib.startBatch();
 	s(7);
 	for (let i = 0; i < 300; i++) {
 		lib.signal(i);
 	}
 	expect(seen).toBe(0);
-	lib.sys.endBatch();
+	lib.endBatch();
 	lib.drain();
 	expect(seen).toBe(7);
 });

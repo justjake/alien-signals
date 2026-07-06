@@ -278,107 +278,55 @@ function uninitialized(): never {
 /**
  * Id-level operations of the live engine, exposed as {@link ReactiveSystem.e}.
  * Reassigned when the arena grows (the engine is rebuilt over the larger
- * arena); stale references keep working — retired engines forward to the
- * current one. Handles returned by the make* methods do NOT go through this
- * object — they are closures minted inside the engine over `const M`,
- * calling these functions directly.
+ * arena); mint/free forward from retired engines, but the five graph ops
+ * do NOT — hosts re-capture this object from an onGrow callback.
  */
 export interface ReactiveEngine {
 	/** Mint a host-kind node (see ReactiveSystem.custom). */
 	newCustom(hostBits: number): NodeId;
 	/** Explicitly free any node id if `gen` still matches. */
 	free(id: NodeId, gen: number): void;
-	/** True: the node must update. False: verified clean (and stamped). */
-	verify(id: NodeId): boolean;
-	/** One f64 compare: may the caller skip verification entirely? */
-	verified(id: NodeId): boolean;
-	/** Re-track bracket for update code that reads dependencies. */
-	beginTracking(id: NodeId): void;
-	endTracking(id: NodeId): void;
-	/** Mark definitely-changed and kill the quiet-read stamp. */
-	markDirty(id: NodeId): void;
-	/** Link `id` to the active subscriber (if tracking); returns its flags. */
-	track(id: NodeId): number;
-	/**
-	 * The fused value-read protocol: stamp gate, reentrancy guard,
-	 * verification, tracking, clean-path stamping. 0 = return the cached
-	 * value; 1 = update, shallowPropagate on change, then track.
-	 */
-	pull(id: NodeId): number;
-	/**
-	 * Run `fn(arg)` as `id`'s tracked evaluation: the fused equivalent of
-	 * setActiveSub + beginTracking + fn + endTracking + restore.
-	 */
-	runTracked(id: NodeId, fn: (arg: unknown) => unknown, arg: unknown): unknown;
-	/** The node's full flags word (state + host bits). */
-	nodeFlags(id: NodeId): number;
-	/** Write the public+host writable bits; kills the quiet-read stamp. */
-	setNodeFlags(id: NodeId, flags: number): void;
-	/**
-	 * Add a dependency edge: `sub` re-verifies (and effects re-run) when
-	 * `dep` changes. Returns the edge's id (the existing one if the edge is
-	 * already present). The edge behaves exactly like one made by a tracked
-	 * read: if `sub` re-tracks (recomputes or re-runs), manual edges it does
-	 * not re-establish are dropped.
-	 */
-	linkNode(depId: NodeId, subId: NodeId): LinkId;
-	/** Remove an edge made by `linkNode` (or observed via tracking). */
-	unlinkEdge(linkId: LinkId): void;
-	/**
-	 * Mark everything downstream of `id` possibly-stale (PENDING), queue
-	 * affected effects, invalidate quiet-read stamps, and — matching a
-	 * write — flush unless a batch is open. Pair with `shallowPropagateNode`
-	 * when the node's value changed out of band, so direct subscribers are
-	 * promoted to DIRTY and actually recompute.
-	 */
-	propagateNode(id: NodeId, innerWrite?: boolean): void;
-	/**
-	 * Promote `id`'s PENDING subscribers to DIRTY (they will recompute on
-	 * next pull), queue affected effects, invalidate stamps, and flush
-	 * unless a batch is open.
-	 */
-	shallowPropagateNode(id: NodeId): void;
 
-	// ---- the raw graph ops (trusted-host tier) ----------------------------
-	// The same five algorithms upstream alien-signals' index.ts builds on,
-	// with the same shapes: the host reads M[id + NodeSlot.Subs]/Deps itself
-	// and passes LINK ids, owns its own tracking state (activeSub, the
-	// M[SysSlot.Cycle] pass counter), bumps D[SysSlot.EpochF64] on writes,
-	// and brackets user-code frames with M[SysSlot.EnterDepth]++/--.
-	// UNLIKE everything above, these do not forward after arena growth:
-	// re-capture `system.e` (and buffer()/stampView()) from an onGrow
-	// callback, and never cache them in locals across a call that can
+	// ---- the five graph ops -----------------------------------------------
+	// The same algorithms upstream alien-signals' index.ts builds on, with
+	// the same shapes: the host reads M[id + NodeSlot.Subs]/Deps itself and
+	// passes LINK ids, owns its own tracking state (the active subscriber,
+	// the M[SysSlot.Cycle] pass counter), bumps D[SysSlot.EpochF64] on
+	// writes, runs its own effect queue and batching, and brackets user-code
+	// frames with M[SysSlot.EnterDepth]++/--. These do not forward after
+	// arena growth: re-capture `system.e` (and buffer()/stampView()) from an
+	// onGrow callback, and never cache them in locals across a call that can
 	// allocate.
 
 	/**
-	 * Raw edge insert/refresh between `dep` and `sub` with the caller's
+	 * Edge insert/refresh between `dep` and `sub` with the caller's
 	 * tracking-pass `version` (see SysSlot.Cycle). Returns the edge id.
 	 */
 	link(depId: NodeId, subId: NodeId, version: number): LinkId;
 	/**
-	 * Raw edge removal. `subId` defaults to the link's recorded subscriber;
+	 * Edge removal. `subId` defaults to the link's recorded subscriber;
 	 * passing it saves the load when the caller already knows it (dependency
 	 * purges). Returns the link's nextDep, so a purge loop is
 	 * `while (l !== 0) l = unlink(l, sub)`.
 	 */
 	unlink(linkId: LinkId, subId?: NodeId): LinkId;
 	/**
-	 * Raw invalidation wave over a SUBS list: marks the transitive
-	 * subscriber closure PENDING/DIRTY and notifies WATCHING nodes. The
+	 * The invalidation wave over a SUBS list: marks the transitive
+	 * subscriber closure Pending/Dirty and notifies Watching nodes. The
 	 * caller bumps the epoch and flushes; `innerWrite` is true when the
 	 * write happened inside an active update (host runDepth > 0).
 	 */
 	propagate(subsLinkId: LinkId, innerWrite: boolean): void;
 	/**
-	 * Raw recursive staleness resolution over a DEPS list: returns true if
+	 * Recursive staleness resolution over a DEPS list: returns true if
 	 * `sub` must recompute (some dependency's value actually changed —
 	 * updates run through the `update` seam during the walk).
 	 */
 	checkDirty(depsLinkId: LinkId, subId: NodeId): boolean;
 	/**
-	 * Raw one-level promotion over a SUBS list: PENDING subscribers become
-	 * DIRTY, WATCHING ones are notified. Call after an in-place value
-	 * change (the DIRTY|PENDING upgrade after a changed recompute).
+	 * One-level promotion over a SUBS list: Pending subscribers become
+	 * Dirty, Watching ones are notified. Call after an in-place value
+	 * change (the Dirty|Pending upgrade after a changed recompute).
 	 */
 	shallowPropagate(subsLinkId: LinkId): void;
 }
@@ -425,55 +373,12 @@ export interface ReactiveSystem {
 	custom(hostBits?: number, owner?: WeakKey): NodeId;
 	/** Explicitly free any node id if `gen` still matches. */
 	free(id: NodeId, gen: number): void;
-	/** True: the node must update. False: verified clean (and stamped). */
-	verify(id: NodeId): boolean;
-	/** One f64 compare: may the caller skip verification entirely? */
-	verified(id: NodeId): boolean;
-	/** Re-track bracket for update code that reads dependencies. */
-	beginTracking(id: NodeId): void;
-	endTracking(id: NodeId): void;
-	/** Mark definitely-changed and kill the quiet-read stamp. */
-	markDirty(id: NodeId): void;
-	/** Link `id` to the active subscriber (if tracking); returns its flags. */
-	track(id: NodeId): number;
 	/**
-	 * The fused value-read protocol: stamp gate, reentrancy guard,
-	 * verification, tracking, clean-path stamping. 0 = return the cached
-	 * value; 1 = update, shallowPropagate on change, then track.
+	 * The node's current generation (M[id + NodeSlot.Gen]): capture at mint,
+	 * pass to free(), and compare before acting on a queued id — a mismatch
+	 * means the record was freed (and possibly reused) in the meantime.
 	 */
-	pull(id: NodeId): number;
-	/**
-	 * Run `fn(arg)` as `id`'s tracked evaluation: the fused equivalent of
-	 * setActiveSub + beginTracking + fn + endTracking + restore.
-	 */
-	runTracked(id: NodeId, fn: (arg: unknown) => unknown, arg: unknown): unknown;
-	/** The node's full flags word (state + host bits). */
-	nodeFlags(id: NodeId): number;
-	/** Write the public+host writable bits; kills the quiet-read stamp. */
-	setNodeFlags(id: NodeId, flags: number): void;
-	/** Add a dependency edge; see {@link ReactiveEngine.linkNode}. */
-	link(depId: NodeId, subId: NodeId): LinkId;
-	/** Remove an edge; see {@link ReactiveEngine.unlinkEdge}. */
-	unlink(linkId: LinkId): void;
-	/** Push staleness downstream; see {@link ReactiveEngine.propagateNode}. */
-	propagate(id: NodeId, innerWrite?: boolean): void;
-	/** Promote pending subscribers; see {@link ReactiveEngine.shallowPropagate}. */
-	shallowPropagate(id: NodeId): void;
-	/** Current generation counter of a record (capture at creation). */
 	gen(id: number): number;
-	/** Re-notify dependencies read inside `fn` as if they had been written. */
-	trigger(fn: () => void): void;
-	startBatch(): void;
-	endBatch(): void;
-	getBatchDepth(): number;
-	/** Active subscriber id (0 = none). */
-	getActiveSub(): number;
-	/** Set the active subscriber id (0 = none); returns the previous id. */
-	setActiveSub(id: number): number;
-	/** Raw flags word of a node (includes engine-owned kind bits). */
-	nodeFlags(id: number): number;
-	/** Overwrite the PUBLIC (semantic) flag bits of a node; kind bits keep. */
-	setNodeFlags(id: number, flags: number): void;
 	/**
 	 * The live record arena. Trusted hosts address it directly through the
 	 * NodeSlot/LinkSlot/SysSlot layout; the identity changes on growth (see
@@ -509,33 +414,27 @@ export interface ReactiveSystemOptions {
 	/** Arena STARTING capacity in 32-byte records (default 2^23; grows). */
 	initialRecords?: number;
 	/**
-	 * Host effect scheduler (upstream's `notify` seam, id-shaped). When set,
-	 * the engine never runs effects itself: each effect that would have been
-	 * queued is reported here exactly once — in the order the built-in queue
-	 * would run them (outer effects before their children) — and stays
-	 * silent until the host runs it via `runEffect(effectId, gen)`.
+	 * The effect scheduler (upstream's `notify` seam, id-shaped): the
+	 * propagation wave reports each Watching node here exactly once,
+	 * clearing its Watching bit as the dedup. The host owns the queue, the
+	 * ordering, the batching, and the running.
 	 *
 	 * Contract:
-	 * - run every notified effect eventually, or it never re-notifies (the
-	 *   dedup that prevents double-queueing is only reset by running it);
-	 * - `gen` makes stale ids harmless: a disposed-and-recycled record makes
-	 *   `runEffect` a no-op, so the host queue needs no cleanup on dispose;
-	 * - notifications fire at write time even inside batches — with a host
-	 *   scheduler, startBatch/endBatch no longer defer anything.
+	 * - queue (id, gen) and run it eventually, re-arming Watching after the
+	 *   run — the dedup only resets when the host sets the bit again;
+	 * - `gen` makes stale ids harmless: compare against M[id + NodeSlot.Gen]
+	 *   before running, and a disposed-and-recycled record is skipped;
+	 * - notifications fire at write time (propagate), batched or not — the
+	 *   host decides when to flush.
 	 */
 	notify?: (effectId: number, gen: number) => void;
 	/**
-	 * Called when a top-level operation finishes with notifications pending
-	 * (write-parity: after an unbatched propagate, at the outermost
-	 * endBatch, after trigger). Drain your effect queue here.
-	 */
-	flush?: () => void;
-	/**
-	 * Resolve a custom node's update (see `custom`): commit whatever
-	 * "update" means for your kind and return whether its value changed —
-	 * the return feeds the equality cut-off exactly like the built-ins'.
-	 * Called by the graph walks with the node's flags word (dispatch on
-	 * your host bits, `flags & HOST_MASK`) while the node is DIRTY.
+	 * Resolve a node's update (upstream's `update` seam): the graph walks
+	 * hand over every Mutable node whose staleness resolved to Dirty, and
+	 * the host does EVERYTHING — reset the flags word (preserving the bits
+	 * outside ReactiveFlags), re-track dependencies, recompute, stamp — and
+	 * returns whether the value changed (the equality cut-off). `flags` is
+	 * the node's word at entry; dispatch on your host bits.
 	 */
 	update?: (id: NodeId, flags: number) => boolean;
 	/**
@@ -560,10 +459,6 @@ export interface ReactiveSystemOptions {
 
 /** A record id: a node's (or link's) starting offset in the arena. */
 export type NodeId = number;
-export type SignalId = number;
-export type ComputedId = number;
-export type EffectId = number;
-export type EffectScopeId = number;
 /** Id of an edge record returned by `link`; pass to `unlink`. */
 export type LinkId = number;
 
@@ -611,7 +506,6 @@ function cloneWorks(): boolean {
 			registry: undefined,
 			hostNotify: undefined,
 			hostUpdate: undefined,
-			hostFlush: undefined,
 			hostStart: undefined,
 			hostStop: undefined,
 			growPending: false,
@@ -624,17 +518,17 @@ function cloneWorks(): boolean {
 			recNext: 8,
 			nodeFreeHead: 0,
 			linkFreeHead: 0,
-			batchDepth: 0,
 		}, dummy);
 		dummy.inner = probe;
 		// Exercise mint, flags, edges, staleness resolution: any unresolved
 		// identifier in the cloned source throws here, not later.
-		const a = probe.newCustom(1 << 16 | 1); // host tag + MUTABLE
+		const a = probe.newCustom(1 << 16 | 1); // host tag + Mutable
 		const b = probe.newCustom(2 << 16 | 1);
 		const edge = probe.link(a, b, 1);
-		probe.markDirty(a);
+		const M = probe.buffer();
+		M[a + NodeSlot.Flags] |= Flag.Dirty;
 		probe.propagate(edge, false);
-		return probe.verify(b) === true;
+		return probe.checkDirty(M[b + NodeSlot.Deps], b) === true;
 	} catch {
 		return false;
 	}
@@ -676,7 +570,6 @@ interface EngineState {
 	recNext: number;
 	nodeFreeHead: number;
 	linkFreeHead: number;
-	batchDepth: number;
 }
 
 /**
@@ -692,7 +585,6 @@ interface EngineShared {
 	registry: FinalizationRegistry<number> | undefined;
 	hostNotify: ((effectId: number, gen: number) => void) | undefined;
 	hostUpdate: ((id: NodeId, flags: number) => boolean) | undefined;
-	hostFlush: (() => void) | undefined;
 	hostStart: ((id: NodeId) => unknown) | undefined;
 	hostStop: ((id: NodeId, state: unknown) => void) | undefined;
 	growPending: boolean;
@@ -709,17 +601,10 @@ interface Engine extends ReactiveEngine {
 	state(): EngineState;
 	busy(): boolean;
 	maybeBoundary(): void;
-	startBatch(): void;
-	endBatch(): void;
-	getBatchDepth(): number;
-	setActiveSub(id: number): number;
-	getActiveSub(): number;
 	resetGuard(): void;
 	resetState(): void;
 	freeRecordCounts(): { freeNodeRecords: number; freeLinkRecords: number };
 	orphan(id: number): void;
-	clearStamp(id: number): void;
-	trigger(fn: () => void): void;
 	sweepPendingFree(): void;
 }
 
@@ -755,7 +640,6 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		registry: undefined,
 		hostNotify: options?.notify,
 		hostUpdate: options?.update,
-		hostFlush: options?.flush,
 		hostStart: options?.start,
 		hostStop: options?.stop,
 		growPending: false,
@@ -793,7 +677,6 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			recNext: 8,
 			nodeFreeHead: 0,
 			linkFreeHead: 0,
-			batchDepth: 0,
 		}, shared);
 		shared.inner = engine;
 		facade.e = engine;
@@ -878,25 +761,11 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 	const bootEngine: ReactiveEngine = {
 		newCustom: uninitialized,
 		free: uninitialized,
-		verify: uninitialized,
-		verified: uninitialized,
-		beginTracking: uninitialized,
-		endTracking: uninitialized,
-		markDirty: uninitialized,
-		track: uninitialized,
-		pull: uninitialized,
-		runTracked: uninitialized,
-		nodeFlags: uninitialized,
-		setNodeFlags: uninitialized,
 		link: uninitialized,
 		unlink: uninitialized,
 		propagate: uninitialized,
 		checkDirty: uninitialized,
 		shallowPropagate: uninitialized,
-		linkNode: uninitialized,
-		unlinkEdge: uninitialized,
-		propagateNode: uninitialized,
-		shallowPropagateNode: uninitialized,
 	};
 
 	const facade: ReactiveSystem = {
@@ -967,74 +836,8 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		free(id: NodeId, gen: number): void {
 			ensureEngine().free(id, gen);
 		},
-		verify(id: NodeId): boolean {
-			return ensureEngine().verify(id);
-		},
-		verified(id: NodeId): boolean {
-			return ensureEngine().verified(id);
-		},
-		beginTracking(id: NodeId): void {
-			ensureEngine().beginTracking(id);
-		},
-		endTracking(id: NodeId): void {
-			ensureEngine().endTracking(id);
-		},
-		markDirty(id: NodeId): void {
-			ensureEngine().markDirty(id);
-		},
-		track(id: NodeId): number {
-			return ensureEngine().track(id);
-		},
-		pull(id: NodeId): number {
-			return ensureEngine().pull(id);
-		},
-		runTracked(id: NodeId, fn: (arg: unknown) => unknown, arg: unknown): unknown {
-			return ensureEngine().runTracked(id, fn, arg);
-		},
-		link(depId: NodeId, subId: NodeId): LinkId {
-			const engine = ensureEngine();
-			engine.maybeBoundary(); // link allocates a record
-			return engine.linkNode(depId, subId);
-		},
-		unlink(linkId: LinkId): void {
-			ensureEngine().unlinkEdge(linkId);
-		},
-		propagate(id: NodeId, innerWrite?: boolean): void {
-			ensureEngine().propagateNode(id, innerWrite);
-		},
-		shallowPropagate(id: NodeId): void {
-			ensureEngine().shallowPropagateNode(id);
-		},
 		gen(id: number): number {
 			return ensureEngine().buffer()[id + NodeSlot.Gen];
-		},
-		trigger(fn: () => void): void {
-			const engine = ensureEngine();
-			engine.maybeBoundary();
-			engine.trigger(fn);
-		},
-		// Batch and tracking state lives in the engine; opening a batch
-		// materializes (batches exist to hold writes, writes need an arena).
-		startBatch(): void {
-			ensureEngine().startBatch();
-		},
-		endBatch(): void {
-			ensureEngine().endBatch();
-		},
-		getBatchDepth(): number {
-			return shared.inner === undefined ? 0 : shared.inner.getBatchDepth();
-		},
-		getActiveSub(): number {
-			return shared.inner === undefined ? 0 : shared.inner.getActiveSub();
-		},
-		setActiveSub(id: number): number {
-			return ensureEngine().setActiveSub(id);
-		},
-		nodeFlags(id: number): number {
-			return ensureEngine().nodeFlags(id);
-		},
-		setNodeFlags(id: number, flags: number): void {
-			ensureEngine().setNodeFlags(id, flags);
 		},
 		buffer(): Int32Array {
 			return ensureEngine().buffer();
@@ -1103,23 +906,14 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 	// equals it is provably current. One float64 (2^53 never wraps).
 	// The tracking-pass counter (upstream's cycle) lives in record 0 as
 	// M[SysSlot.Cycle] for the same reason (see SysSlot.Cycle).
-	let batchDepth = boot.batchDepth;
-	// Always neutral at a generation boundary:
-	let activeSub = 0;
-	let runDepth = 0;
-	// Enter depth (live engine frames holding the arena; 0 = op boundary)
-	// lives in record 0 as M[SysSlot.EnterDepth] so trusted hosts bracket their
-	// own user-code frames with it (see SysSlot.EnterDepth).
+	// Tracking state (the active subscriber, run depth, batching) is the
+	// HOST's, as module or closure lets on its side of the seam — exactly
+	// upstream's split. Enter depth (live frames holding the arena; 0 = an
+	// operation boundary) lives in record 0 as M[SysSlot.EnterDepth] so the
+	// host brackets its own user-code frames with it.
 
 	function snapshot(): EngineState {
-		return { recNext, nodeFreeHead, linkFreeHead, batchDepth };
-	}
-
-	// Invalidate every quiet-read stamp: any observed change MUST pass here
-	// (or use the inline twin in write()) or stamped computeds keep serving
-	// their cached values.
-	function bumpEpoch(): void {
-		++D[SysSlot.EpochF64];
+		return { recNext, nodeFreeHead, linkFreeHead };
 	}
 
 	// Persistent scratch stacks (upstream's cons-cell Stack<T>). Re-entrant
@@ -1170,38 +964,17 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		state: snapshot,
 		busy,
 		maybeBoundary,
-		startBatch,
-		endBatch,
-		getBatchDepth,
-		setActiveSub,
-		getActiveSub,
 		resetGuard,
 		resetState,
 		freeRecordCounts,
 		orphan,
-		clearStamp,
 		newCustom,
 		free: freeNodeId,
-		verify,
-		verified,
-		beginTracking,
-		endTracking,
-		markDirty,
-		track,
-		pull,
-		runTracked,
-		nodeFlags: nodeFlagsOf,
-		setNodeFlags: setNodeFlagsOf,
 		link,
 		unlink,
 		propagate,
 		checkDirty,
 		shallowPropagate,
-		linkNode,
-		unlinkEdge,
-		propagateNode,
-		shallowPropagateNode,
-		trigger,
 		sweepPendingFree,
 	};
 
@@ -1209,44 +982,6 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 
 		function busy(): boolean {
 			return M[SysSlot.EnterDepth] !== 0;
-		}
-
-		function startBatch(): void {
-			if (retired) {
-				shared.inner!.startBatch();
-				return;
-			}
-			++batchDepth;
-		}
-
-		function endBatch(): void {
-			if (retired) {
-				shared.inner!.endBatch();
-				return;
-			}
-			if (!--batchDepth) {
-				const hostFlush = shared.hostFlush;
-				if (hostFlush !== undefined) {
-					hostFlush();
-				}
-			}
-		}
-
-		function getBatchDepth(): number {
-			return retired ? shared.inner!.getBatchDepth() : batchDepth;
-		}
-
-		function setActiveSub(id: number): number {
-			if (retired) {
-				return shared.inner!.setActiveSub(id);
-			}
-			const prev = activeSub;
-			activeSub = id;
-			return prev;
-		}
-
-		function getActiveSub(): number {
-			return retired ? shared.inner!.getActiveSub() : activeSub;
 		}
 
 		// May grow — retiring THIS engine — so mint paths re-check `retired`
@@ -1264,8 +999,8 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		}
 
 		function resetGuard(): void {
-			if (M[SysSlot.EnterDepth] !== 0 || activeSub !== 0 || batchDepth !== 0 || runDepth !== 0) {
-				throw new Error('dalien-signals: reset() called during an active operation (inside an effect, computed, batch, or trigger)');
+			if (M[SysSlot.EnterDepth] !== 0) {
+				throw new Error('dalien-signals: reset() called during an active operation (inside an effect, computed getter, or other tracked frame)');
 			}
 		}
 
@@ -1286,7 +1021,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			// zeroed stamps/versions, which can never equal a live counter.
 		}
 
-		// ---- userspace-kind verbs (see ReactiveSystemOptions.update) ----------
+		// ---- minting and freeing (see ReactiveSystemOptions.update) -----------
 
 		function newCustom(hostBits: number): number {
 			if (retired) {
@@ -1327,159 +1062,6 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			pendingFree.push(id);
 			shared.boundaryPending = true;
 			shared.scheduleMaintenance();
-		}
-
-		// Resolve a node's staleness without reading it: true means "you must
-		// update"; false means verified clean (PENDING cleared, and the node
-		// is stamped with the epoch captured BEFORE verification — user code
-		// run during it can only make the stamp miss, never lie).
-		function verify(id: number): boolean {
-			if (retired) {
-				return shared.inner!.verify(id);
-			}
-			const flags = M[id + NodeSlot.Flags];
-			if (flags & Flag.Dirty) {
-				return true;
-			}
-			if (!(flags & Flag.Pending)) {
-				return false;
-			}
-			const entryEpoch = D[SysSlot.EpochF64];
-			if (checkDirty(M[id + NodeSlot.Deps], id)) {
-				return true;
-			}
-			M[id + NodeSlot.Flags] &= ~Flag.Pending;
-			D[(id >> 1) + 3] = entryEpoch;
-			return false;
-		}
-
-		/** One f64 compare: may the caller skip verification entirely? */
-		function verified(id: number): boolean {
-			return D[(id >> 1) + 3] === D[SysSlot.EpochF64];
-		}
-
-		// The re-track bracket (upstream's startTracking/endTracking): a
-		// custom update that reads dependencies wraps its user code in these
-		// (with setActiveSub around them) to get computed-style re-tracking.
-		function beginTracking(id: number): void {
-			if (retired) {
-				shared.inner!.beginTracking(id);
-				return;
-			}
-			++M[SysSlot.EnterDepth];
-			++M[SysSlot.Cycle];
-			M[id + NodeSlot.DepsTail] = 0;
-			M[id + NodeSlot.Flags] = (M[id + NodeSlot.Flags] & ~(Flag.Dirty | Flag.Pending | Flag.Recursed)) | Flag.RecursedCheck;
-		}
-
-		function endTracking(id: number): void {
-			if (retired) {
-				shared.inner!.endTracking(id);
-				return;
-			}
-			M[id + NodeSlot.Flags] &= ~Flag.RecursedCheck;
-			purgeDeps(id);
-			--M[SysSlot.EnterDepth];
-		}
-
-		function nodeFlagsOf(id: number): number {
-			return retired ? shared.inner!.nodeFlags(id) : M[id + NodeSlot.Flags];
-		}
-
-		function setNodeFlagsOf(id: number, flags: number): void {
-			if (retired) {
-				shared.inner!.setNodeFlags(id, flags);
-				return;
-			}
-			M[id + NodeSlot.Flags] = (M[id + NodeSlot.Flags] & ~(Flag.PublicMask | Flag.HostMask))
-				| (flags & (Flag.PublicMask | Flag.HostMask));
-			D[(id >> 1) + 3] = 0;
-		}
-
-		// The fused tracking bracket: setActiveSub + beginTracking + fn +
-		// endTracking + restore, one call instead of five. `arg` threads the
-		// caller's context through so no closure is allocated per run.
-		function runTracked(id: number, fn: (arg: unknown) => unknown, arg: unknown): unknown {
-			if (retired) {
-				return shared.inner!.runTracked(id, fn, arg);
-			}
-			const prevSub = activeSub;
-			activeSub = id;
-			++M[SysSlot.EnterDepth];
-			++M[SysSlot.Cycle];
-			M[id + NodeSlot.DepsTail] = 0;
-			M[id + NodeSlot.Flags] = (M[id + NodeSlot.Flags] & ~(Flag.Dirty | Flag.Pending | Flag.Recursed)) | Flag.RecursedCheck;
-			try {
-				return fn(arg);
-			} finally {
-				M[id + NodeSlot.Flags] &= ~Flag.RecursedCheck;
-				purgeDeps(id);
-				--M[SysSlot.EnterDepth];
-				activeSub = prevSub;
-			}
-		}
-
-		/** Mark a node definitely-changed and kill its quiet-read stamp. */
-		function markDirty(id: number): void {
-			if (retired) {
-				shared.inner!.markDirty(id);
-				return;
-			}
-			M[id + NodeSlot.Flags] |= Flag.Dirty;
-			D[(id >> 1) + 3] = 0;
-		}
-
-		// Link `id` to the active subscriber (if tracking) and hand back the
-		// flags word in the same frame: a userspace signal read is ONE call.
-		function track(id: number): number {
-			if (retired) {
-				return shared.inner!.track(id);
-			}
-			if (activeSub !== 0) {
-				link(id, activeSub, M[SysSlot.Cycle]);
-			}
-			return M[id + NodeSlot.Flags];
-		}
-
-		// The fused read protocol for value-kinds: stamp gate, reentrancy
-		// guard, verification, tracking, and clean-path stamping in one
-		// frame — the loads stay in registers instead of being re-derived
-		// across verb boundaries. Returns 0 when the cached value may be
-		// returned as-is; 1 when the caller must update (recompute, then
-		// shallowPropagate on change, then track).
-		function pull(id: number): number {
-			if (D[(id >> 1) + 3] === D[SysSlot.EpochF64]) {
-				if (activeSub !== 0) {
-					link(id, activeSub, M[SysSlot.Cycle]);
-				}
-				return 0;
-			}
-			if (retired) {
-				return shared.inner!.pull(id);
-			}
-			const flags = M[id + NodeSlot.Flags];
-			if (flags & Flag.RecursedCheck) {
-				// Re-entrant self-read mid-recompute: stale read by contract.
-				if (activeSub !== 0) {
-					link(id, activeSub, M[SysSlot.Cycle]);
-				}
-				return 0;
-			}
-			if (flags & Flag.Dirty) {
-				return 1;
-			}
-			if (flags & Flag.Pending) {
-				const entryEpoch = D[SysSlot.EpochF64];
-				if (checkDirty(M[id + NodeSlot.Deps], id)) {
-					return 1;
-				}
-				M[id + NodeSlot.Flags] &= ~Flag.Pending;
-				D[(id >> 1) + 3] = entryEpoch;
-			}
-			if (activeSub !== 0) {
-				link(id, activeSub, M[SysSlot.Cycle]);
-			}
-			return 0;
 		}
 
 		function freeRecordCounts(): { freeNodeRecords: number; freeLinkRecords: number } {
@@ -1645,56 +1227,6 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 				unwatched(dep);
 			}
 			return nextDep;
-		}
-
-		// ---- composable kit (public, id-shaped; cold next to the walks) -------
-
-		// Public link: same three cases as link(), but returns the edge id.
-		// Manual edges carry the current tracking version, so they age out on
-		// re-track exactly like read-discovered edges (upstream parity).
-		function linkNode(dep: number, sub: number): number {
-			if (retired) {
-				return shared.inner!.linkNode(dep, sub);
-			}
-			return link(dep, sub, M[SysSlot.Cycle]);
-		}
-
-		function unlinkEdge(linkId: number): void {
-			if (retired) {
-				shared.inner!.unlinkEdge(linkId);
-				return;
-			}
-			unlink(linkId);
-		}
-
-		function propagateNode(id: number, innerWrite?: boolean): void {
-			if (retired) {
-				shared.inner!.propagateNode(id, innerWrite);
-				return;
-			}
-			const subs = M[id + NodeSlot.Subs];
-			if (subs !== 0) {
-				bumpEpoch();
-				propagate(subs, innerWrite ?? runDepth !== 0);
-				if (!batchDepth && shared.hostFlush !== undefined) {
-					shared.hostFlush();
-				}
-			}
-		}
-
-		function shallowPropagateNode(id: number): void {
-			if (retired) {
-				shared.inner!.shallowPropagateNode(id);
-				return;
-			}
-			const subs = M[id + NodeSlot.Subs];
-			if (subs !== 0) {
-				bumpEpoch();
-				shallowPropagate(subs);
-				if (!batchDepth && shared.hostFlush !== undefined) {
-					shared.hostFlush();
-				}
-			}
 		}
 
 		// ---- watched lifecycle (ReactiveSystemOptions.start/stop) -------------
@@ -2007,17 +1539,19 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 
 		// ---- node behaviors (upstream index.ts, transliterated) ---------------
 
-		// The walks land here for every MUTABLE|DIRTY node: resolution is the
-		// host's (see ReactiveSystemOptions.update). Stamped with the epoch
-		// captured BEFORE the host code runs: a write from inside it moves
-		// the epoch past entryEpoch, so the stamp can only miss, never lie.
+		// The walks land here for every MUTABLE|DIRTY node: resolution is
+		// entirely the host's (see ReactiveSystemOptions.update) — the host
+		// resets the flags word, re-tracks, recomputes, and stamps, exactly
+		// like upstream's updateComputed. Without a callback the node is just
+		// marked resolved so walks terminate.
 		function update(node: number): boolean {
 			const flags = M[node + NodeSlot.Flags];
-			const entryEpoch = D[SysSlot.EpochF64];
-			M[node + NodeSlot.Flags] = (flags & (Flag.Watching | Flag.Sticky | Flag.Live | Flag.PublicMask & ~Flag.Dirty & ~Flag.Pending)) | Flag.Mutable;
-			const changed = shared.hostUpdate === undefined ? true : shared.hostUpdate(node, flags);
-			D[(node >> 1) + 3] = entryEpoch;
-			return changed;
+			const hostUpdate = shared.hostUpdate;
+			if (hostUpdate !== undefined) {
+				return hostUpdate(node, flags);
+			}
+			M[node + NodeSlot.Flags] = flags & ~(Flag.Dirty | Flag.Pending);
+			return true;
 		}
 
 		// Effect scheduling is the host's (see ReactiveSystemOptions.notify):
@@ -2047,21 +1581,11 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			}
 		}
 
-		// Invalidate the quiet-read stamp (public flag surgery via
-		// setNodeFlags may mark Dirty/Pending without a write).
-		function clearStamp(id: number): void {
-			if (retired) {
-				shared.inner!.clearStamp(id);
-				return;
-			}
-			D[(id >> 1) + 3] = 0;
-		}
-
 		// FinalizationRegistry target: the handle for this signal/computed was
 		// garbage collected. Reclaim the record now if the graph no longer
 		// needs it; otherwise mark it and reclaim when the last subscriber
-		// unlinks (unwatched). Only make* handles register, and only this path
-		// frees signal/computed records, so the id cannot be stale here.
+		// unlinks (unwatched). Only owner-registered nodes get here, and only
+		// this path frees them, so the id cannot be stale.
 		function orphan(id: number): void {
 			if (retired) {
 				shared.inner!.orphan(id);
@@ -2098,59 +1622,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			}
 		}
 
-		function purgeDeps(sub: number): void {
-			const depsTail = M[sub + NodeSlot.DepsTail];
-			let dep = depsTail !== 0 ? M[depsTail + LinkSlot.NextDep] : M[sub + NodeSlot.Deps];
-			while (dep !== 0) {
-				dep = unlink(dep, sub);
-			}
-		}
-
 		// ---- operations dispatched from the public system object --------------
-
-		// Upstream index.ts trigger(): run `fn` under a temporary watching sub,
-		// then re-notify every dependency it read as if written. The temp node
-		// is kindless: it is never notified (the propagate ladder masks its
-		// Watching bit in every reachable branch), never a dep of anything, and
-		// is reclaimed at the next boundary.
-		function trigger(fn: () => void): void {
-			if (retired) {
-				shared.inner!.trigger(fn);
-				return;
-			}
-			const sub = allocNode(Flag.Watching | Flag.RecursedCheck);
-			const prevSub = activeSub;
-			activeSub = sub;
-			++batchDepth;
-			++M[SysSlot.EnterDepth];
-			try {
-				fn();
-			} finally {
-				activeSub = prevSub;
-				++D[SysSlot.EpochF64];
-				M[sub + NodeSlot.Flags] = 0;
-				let cur = M[sub + NodeSlot.Deps];
-				while (cur !== 0) {
-					const dep = M[cur + LinkSlot.Dep];
-					cur = unlink(cur, sub);
-					const subs = M[dep + NodeSlot.Subs];
-					if (subs !== 0) {
-						propagate(subs, runDepth !== 0);
-						shallowPropagate(subs);
-					}
-				}
-				pendingFree.push(sub);
-				shared.boundaryPending = true;
-				shared.scheduleMaintenance();
-				--M[SysSlot.EnterDepth];
-				if (!--batchDepth) {
-					const hostFlush = shared.hostFlush;
-					if (hostFlush !== undefined) {
-						hostFlush();
-					}
-				}
-			}
-		}
 	}
 
 

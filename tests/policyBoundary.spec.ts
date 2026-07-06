@@ -17,16 +17,15 @@ const PUBLIC_SURFACE = new Set([
 	'ReactiveEngine',
 	'ReactiveNode',
 	'ReactiveFlags',
-	'SignalHandle',
 	'NodeId',
-	'SignalId',
-	'ComputedId',
-	'EffectId',
-	'EffectScopeId',
 	'LinkId',
-	// handle identity (public: how any consumer brands our handles)
-	'HandleKind',
-	'handleKind',
+	// the record layout (trusted hosts address the arena directly)
+	'NodeSlot',
+	'LinkSlot',
+	'SysSlot',
+	// codegen feature detection
+	'codegenAvailable',
+	'codegenSupported',
 ]);
 
 test('index.ts consumes only the public system surface', () => {

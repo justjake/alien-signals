@@ -58,23 +58,26 @@ const scope = effectScope(() => { effect(() => { c1(); }); });
 scope();
 d1();
 d2();
-// Exercise the kindless seam + userspace verbs directly.
+// Exercise the kindless seam + the raw graph ops directly.
 const nodes = [];
 const sys = createReactiveSystem({
 	initialRecords: 4096,
-	update(id) {
+	update(id, flags) {
 		const st = nodes[id >> 3];
+		sys.buffer()[id] = flags & ~48; // clear Dirty|Pending (slot 0 = flags)
 		return st.current !== (st.current = st.pending);
 	},
 	notify() {},
 });
 const nsId = sys.custom(1 << 16 | ReactiveFlags.Mutable);
 nodes[nsId >> 3] = { current: 1, pending: 1 };
-sys.track(nsId);
+const watcherId = sys.custom(2 << 16 | ReactiveFlags.Watching);
+const M = sys.buffer();
+const rawEdge = sys.e.link(nsId, watcherId, 1);
 nodes[nsId >> 3].pending = 2;
-sys.markDirty(nsId);
-sys.propagate(nsId);
-sys.verify(nsId);
-sys.verified(nsId);
+M[nsId] |= ReactiveFlags.Dirty;
+sys.e.propagate(rawEdge, false);
+sys.e.checkDirty(M[watcherId + 1], watcherId); // slot 1 = deps head
+sys.e.unlink(rawEdge, watcherId);
 
 console.log('smoke ok', c3());
