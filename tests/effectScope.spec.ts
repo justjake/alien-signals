@@ -73,7 +73,7 @@ test('scope as intermediate parent: cleanup order respects nesting', () => {
 	]);
 });
 
-test('a scope owns the signals and computeds minted inside it', () => {
+test('a scope owns the signals and computeds minted inside it', async () => {
 	let s!: ReturnType<typeof signalRaw<number>>;
 	let c!: ReturnType<typeof computed<number>>;
 	const scope = effectScopeRaw(() => {
@@ -84,12 +84,14 @@ test('a scope owns the signals and computeds minted inside it', () => {
 	expect(isSignal(s)).toBe(true);
 	expect(isComputed(c)).toBe(true);
 	dispose(scope);
-	// Region ownership: the scope freed its members.
+	// Region ownership, deferred off the disposer's clock: the scope's
+	// members free at the next microtask.
+	await Promise.resolve();
 	expect(isSignal(s)).toBe(false);
 	expect(isComputed(c)).toBe(false);
 });
 
-test('a member disposed early is not double-freed by its scope', () => {
+test('a member disposed early is not double-freed by its scope', async () => {
 	let s!: ReturnType<typeof signalRaw<number>>;
 	const scope = effectScopeRaw(() => {
 		s = signalRaw(1);
@@ -98,6 +100,7 @@ test('a member disposed early is not double-freed by its scope', () => {
 	// The record may be reused by a NEW node before the scope goes.
 	const stranger = signalRaw(42);
 	dispose(scope); // gen guard: must not free the stranger
+	await Promise.resolve();
 	expect(get(stranger)).toBe(42);
 	dispose(stranger);
 });

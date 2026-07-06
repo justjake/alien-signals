@@ -383,15 +383,33 @@ function disposeEffect(id: SignalId): void {
 	}
 	const region = owned[idx];
 	if (region !== undefined) {
-		// A scope frees the signals/computeds minted inside it (gen-guarded:
-		// members freed early, or freed by a nested scope, no-op here).
+		// A scope frees the signals/computeds minted inside it — DEFERRED to
+		// a microtask, so disposal costs land off the disposing caller's
+		// clock (where garbage-collected graphs pay theirs). Gen-guarded:
+		// members freed early, or whose records were reused, no-op.
 		owned[idx] = undefined;
+		pendingRegions.push(region);
+		if (!regionFlushScheduled) {
+			regionFlushScheduled = true;
+			queueMicrotask(freePendingRegions);
+		}
+	}
+}
+
+const pendingRegions: number[][] = [];
+let regionFlushScheduled = false;
+
+function freePendingRegions(): void {
+	regionFlushScheduled = false;
+	for (let r = 0; r < pendingRegions.length; r++) {
+		const region = pendingRegions[r];
 		for (let i = 0; i < region.length; i += 2) {
 			const member: SignalId = region[i];
 			fns[member >> Arena.NodeIndexShift] = undefined;
 			freeNode(member, region[i + 1]);
 		}
 	}
+	pendingRegions.length = 0;
 }
 
 // ---- public API ---------------------------------------------------------------
@@ -462,6 +480,7 @@ export function reset(): void {
 	fns.length = 0;
 	cleanups.length = 0;
 	owned.length = 0;
+	pendingRegions.length = 0;
 	queued.length = 0;
 	queuedGens.length = 0;
 	notifyIndex = 0;
