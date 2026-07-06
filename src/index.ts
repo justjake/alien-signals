@@ -461,7 +461,7 @@ export function computed<T>(getter: (previousValue?: T) => T): () => T {
 			e.track(id);
 		} else if (e.pull(id) !== 0) {
 			if (recompute(id, st)) {
-				e.shallowPropagate(id);
+				e.shallowPropagateNode(id);
 			}
 			e.track(id);
 		}
