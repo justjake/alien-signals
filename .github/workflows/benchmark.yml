@@ -7,15 +7,14 @@
 #   changes (median-of-N estimator, interleaved isolated runner, adapters),
 #   stored as benchs/ci/milomg-fork.patch and applied to a pinned upstream
 #   clone. Regenerate with benchs/ci/regen-patch.sh when the fork changes.
-# - Node and Bun are the ONLY parallel axis. Do not shard frameworks or
-#   suites across runners: every comparison in one chart must come from the
-#   same machine, and GitHub runners are heterogeneous hardware. Sharding
-#   would parallelize the work and invalidate the result.
-# - Frameworks are run in interleaved rounds (A B C, A B C, ...) and each
-#   test reports the median across rounds, which is what makes shared-runner
-#   noise survivable. Defaults measure the contested cluster (the top four);
-#   dispatch the workflow manually with frameworks=ALL for the full chart
-#   (expect multiple hours on a 2-core runner).
+# - Frameworks and suites are NEVER sharded across runners: comparing
+#   framework A on one machine with framework B on another is invalid.
+#   ROUNDS are sharded instead: each round job runs a complete interleaved
+#   pass (A B C ...) on its own runner — a self-contained same-machine
+#   comparison — and the aggregate job takes per-test medians across the
+#   three rounds (benchs/ci/merge-rounds.mjs explains why that keeps
+#   ratios honest). Three shards x two runtimes = 6 parallel jobs; a full
+#   frameworks=ALL dispatch completes in about the time of one round.
 # - Hosted runners are noisy neighbors. Treat run-over-run deltas under ~5%
 #   as weather, not signal; the interesting artifact is dalien vs alien
 #   within one run.
@@ -33,10 +32,6 @@ on:
         description: 'Framework names (quoted, space-separated), or ALL'
         required: false
         default: '"Dalien Signals" "Alien Signals" "Reactively" "Preact Signals"'
-      rounds:
-        description: 'Interleaved rounds per framework'
-        required: false
-        default: '3'
 
 concurrency:
   group: benchmark-${{ github.ref }}
@@ -50,17 +45,17 @@ env:
   ALIEN_REPO: https://github.com/stackblitz/alien-signals
   ALIEN_SHA: c00e63969bf261fc5dce31fae70cb9a90912b06e
   FRAMEWORKS: ${{ inputs.frameworks || '"Dalien Signals" "Alien Signals" "Reactively" "Preact Signals"' }}
-  ROUNDS: ${{ inputs.rounds || '3' }}
 
 jobs:
-  bench:
+  round:
     strategy:
       fail-fast: false
       matrix:
         runtime: [node, bun]
-    name: bench-${{ matrix.runtime }}
+        round: [1, 2, 3]
+    name: round-${{ matrix.runtime }}-${{ matrix.round }}
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 150
     steps:
       # Recreate the local development layout so the harness's relative
       # file: dependencies resolve unchanged:
@@ -140,15 +135,49 @@ jobs:
           cd packages/node
           npx esbuild src/index.ts src/isolated.ts --bundle --format=esm --platform=node --target=esnext --outdir=dist --sourcemap=external
 
-      - name: Run benchmark (${{ matrix.runtime }})
+      - name: Run benchmark round (${{ matrix.runtime }} r${{ matrix.round }})
         working-directory: milomg-reactivity-benchmark/packages/node
         run: |
           if [ "$FRAMEWORKS" = "ALL" ]; then ARGS=""; else ARGS="$FRAMEWORKS"; fi
           RUNNER=node
           if [ "${{ matrix.runtime }}" = "bun" ]; then RUNNER=bun; fi
-          echo "$RUNNER dist/isolated.js --rounds $ROUNDS $ARGS"
-          echo "$ARGS" | xargs "$RUNNER" dist/isolated.js --rounds "$ROUNDS" > "$GITHUB_WORKSPACE/results-${{ matrix.runtime }}.csv"
-          cat "$GITHUB_WORKSPACE/results-${{ matrix.runtime }}.csv"
+          echo "$ARGS" | xargs "$RUNNER" dist/isolated.js --rounds 1 > "$GITHUB_WORKSPACE/results-${{ matrix.runtime }}-r${{ matrix.round }}.csv"
+          cat "$GITHUB_WORKSPACE/results-${{ matrix.runtime }}-r${{ matrix.round }}.csv"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rounds-${{ matrix.runtime }}-${{ matrix.round }}
+          path: results-${{ matrix.runtime }}-r${{ matrix.round }}.csv
+          if-no-files-found: error
+
+  aggregate:
+    needs: round
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: [node, bun]
+    name: bench-${{ matrix.runtime }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: packages/dalien-signals
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: rounds-${{ matrix.runtime }}-*
+          merge-multiple: true
+
+      - name: Merge rounds (per-test median across same-machine blocks)
+        run: |
+          node packages/dalien-signals/benchs/ci/merge-rounds.mjs \
+            "results-${{ matrix.runtime }}.csv" \
+            results-${{ matrix.runtime }}-r*.csv
 
       # The runner tolerates crashed children (medians over surviving
       # rounds), which is right for flaky third parties but must not let a
@@ -175,7 +204,7 @@ jobs:
             "results-${{ matrix.runtime }}.csv" \
             "benchmark-${{ matrix.runtime }}.svg" \
             "Total benchmark time by framework" \
-            "js-reactivity-benchmark (median of $ROUNDS interleaved isolated rounds), $RUNTIME_VERSION, GitHub Actions $(uname -m) - lower is better"
+            "js-reactivity-benchmark (median of 3 interleaved isolated rounds), $RUNTIME_VERSION, GitHub Actions $(uname -m) - lower is better"
           HEIGHT=$(grep -o 'height="[0-9]*"' "benchmark-${{ matrix.runtime }}.svg" | head -1 | grep -o '[0-9]*')
           google-chrome --headless=new --no-sandbox --disable-gpu \
             --screenshot="benchmark-${{ matrix.runtime }}.png" \
@@ -186,7 +215,7 @@ jobs:
       - name: Job summary
         run: |
           {
-            echo "### Benchmark totals (${{ matrix.runtime }}, median of $ROUNDS rounds)"
+            echo "### Benchmark totals (${{ matrix.runtime }}, median of 3 rounds)"
             echo ""
             echo '| framework | total (ms) |'
             echo '| --- | ---: |'
