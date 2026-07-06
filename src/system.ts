@@ -131,9 +131,12 @@ const enum C {
 	SUBS = 3,
 	SUBS_TAIL = 4,
 	GEN = 5, // bumped on free; disposers capture it to defuse stale ids
-	// Quiet-read verification stamp, split across two i32 slots (53-bit
-	// epoch: never wraps). Same cache line as FLAGS, so the fast-path check
-	// costs no extra memory traffic. Node records are now fully packed.
+	// Quiet-read verification stamp: slots 6-7 hold ONE float64 (the write
+	// epoch; 53-bit integer range never wraps), read through the D
+	// Float64Array view over the same buffer — one load and one compare on
+	// the fast path instead of two of each. Same cache line as FLAGS. The
+	// f64 index of a node's stamp is (id >> 1) + 3 (records are 32 bytes,
+	// the stamp at byte offset 24, so 8-byte alignment holds).
 	VSTAMP_HI = 6,
 	VSTAMP_LO = 7,
 
@@ -496,17 +499,14 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 	// ladder entirely. Preact/Vue 3.6/Svelte ship the same idea; upstream
 	// alien-signals does not. Split lo/hi (manual carry at 2^30) so stamps
 	// fit two i32 record slots and the whole scheme never wraps.
-	let epochLo = 1;
-	let epochHi = 1;
+	let epoch = 1;
 
 	// Invalidate every quiet-read stamp: any observed change MUST pass here
 	// (or use the inline twin in write()) or stamped computeds keep serving
-	// their cached values.
+	// their cached values. A float64 epoch never wraps (2^53 writes is
+	// decades of sustained 10ns writes).
 	function bumpEpoch(): void {
-		if (++epochLo === 0x40000000) {
-			epochLo = 0;
-			++epochHi;
-		}
+		++epoch;
 	}
 	let runDepth = 0;
 	let batchDepth = 0;
@@ -898,6 +898,8 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 
 	function createEngine(records: number, from?: Int32Array): Engine {
 		const M = new Int32Array(records * 8);
+		// Float64 view over the same plane for the one-slot epoch stamps.
+		const D = new Float64Array(M.buffer);
 		if (from !== undefined) {
 			// Growth migration: ids are arena-relative offsets, so copying the
 			// live prefix preserves every id, edge, generation, and stamp.
@@ -1070,8 +1072,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		}
 
 		function freeNode(id: number): void {
-			M[id + C.VSTAMP_LO] = 0;
-			M[id + C.VSTAMP_HI] = 0;
+			D[(id >> 1) + 3] = 0;
 			M[id + C.FLAGS] = 0;
 			M[id + C.DEPS_TAIL] = 0;
 			M[id + C.SUBS] = 0;
@@ -1436,6 +1437,16 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 				// Anything deeper falls through to the general loop with no
 				// state mutated.
 			}
+			// Chains: a run of single-dep, single-subscriber pending nodes
+			// needs no traversal stack — the descent is unbranched, and the
+			// unwind path is recoverable by climbing each node's unique
+			// subscriber link. deep/grid/island cones are exactly this shape.
+			if (!M[startLink + C.NEXT_DEP]) {
+				const r = chainCheck(startLink);
+				if (r >= 0) {
+					return r !== 0 && M[startSub + C.FLAGS] !== 0;
+				}
+			}
 			const stackBase = checkSp;
 			try {
 				return checkDirtyLoop(startLink, startSub);
@@ -1455,6 +1466,55 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 				return true;
 			}
 			return false;
+		}
+
+		// Stackless walk for pure chains (see checkDirty). Descends while the
+		// pending dep has exactly one dep-link and one subscriber; on finding
+		// a directly-dirty base, updates back UP by climbing the unique
+		// subscriber links — the resume state a branching walk would need a
+		// stack for is recoverable from the graph itself. Returns 1 (dirty:
+		// caller re-checks its sub), 0 (resolved clean), -1 (shape is not a
+		// chain here: fall through to the general loop, nothing mutated).
+		function chainCheck(startLink: number): number {
+			let link = startLink;
+			let depth = 0;
+			let dep = 0;
+			while (true) {
+				dep = M[link + C.DEP];
+				const flags = M[dep + C.FLAGS];
+				if ((flags & (C.MUTABLE | C.DIRTY)) === (C.MUTABLE | C.DIRTY)) {
+					break; // dirty base found
+				}
+				if ((flags & (C.MUTABLE | C.PENDING)) !== (C.MUTABLE | C.PENDING)) {
+					return -1; // clean or non-mutable dep: not a resolvable chain
+				}
+				const depDeps = M[dep + C.DEPS];
+				if (!depDeps || M[depDeps + C.NEXT_DEP] !== 0) {
+					return -1; // branching deps
+				}
+				const depSubs = M[dep + C.SUBS];
+				if (!depSubs || M[depSubs + C.NEXT_SUB] !== 0) {
+					return -1; // shared node: the climb needs a unique subscriber
+				}
+				link = depDeps;
+				++depth;
+			}
+			if (!depth) {
+				return -1; // directly-dirty first dep: the shallow paths own this
+			}
+			let changed = updateAndShallow(dep, M[dep + C.SUBS]);
+			let node = dep;
+			while (depth--) {
+				const up = M[node + C.SUBS];
+				const sub = M[up + C.SUB];
+				if (changed) {
+					changed = updateAndShallow(sub, M[sub + C.SUBS]);
+				} else {
+					M[sub + C.FLAGS] &= ~C.PENDING;
+				}
+				node = sub;
+			}
+			return changed ? 1 : 0;
 		}
 
 		function checkDirtyLoop(cur: number, sub: number): boolean {
@@ -1612,8 +1672,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 				// Alien recomputes an unwatched computed on its next read (it
 				// is marked Dirty without any write); drop the stamp so the
 				// fast path cannot skip that recompute.
-				M[node + C.VSTAMP_LO] = 0;
-				M[node + C.VSTAMP_HI] = 0;
+				D[(node >> 1) + 3] = 0;
 				if (flags & C.ORPHANED) {
 					reclaimOrphan(node); // handle already collected; nothing can re-subscribe
 				} else {
@@ -1835,8 +1894,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 				inner!.clearStamp(id);
 				return;
 			}
-			M[id + C.VSTAMP_LO] = 0;
-			M[id + C.VSTAMP_HI] = 0;
+			D[(id >> 1) + 3] = 0;
 		}
 
 		// FinalizationRegistry target: the handle for this signal/computed was
@@ -2004,10 +2062,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 					// Stamps only exist on subscribed-or-once-subscribed
 					// computeds, which hold links; an unobserved write can
 					// invalidate no stamp, so the epoch only moves here.
-					if (++epochLo === 0x40000000) {
-						epochLo = 0;
-						++epochHi;
-					}
+					++epoch;
 					propagate(subs, runDepth !== 0);
 					if (!batchDepth) {
 						flush();
@@ -2019,7 +2074,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		// computedOper for id-level callers: their getter is installed
 		// permanently by newComputed, so no evaluator ever needs carrying.
 		function computedRead(c: number): unknown {
-			if (M[c + C.VSTAMP_LO] === epochLo && M[c + C.VSTAMP_HI] === epochHi) {
+			if (D[(c >> 1) + 3] === epoch) {
 				const fastSub = activeSub;
 				if (fastSub !== 0) {
 					link(c, fastSub, cycle);
@@ -2034,8 +2089,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			// Stamp with the epoch captured BEFORE the body: if user code run
 			// during verification writes a signal (bumping the epoch), the
 			// stamp is already stale and the next read re-verifies.
-			const lo = epochLo;
-			const hi = epochHi;
+			const entryEpoch = epoch;
 			const flags = M[c + C.FLAGS];
 			if (
 				flags & C.DIRTY
@@ -2067,8 +2121,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			// before the next write. The entry-captured epoch keeps this
 			// safe: a write from user code during verification moved the
 			// epoch past `lo/hi`, so the stamp can only miss, never lie.
-			M[c + C.VSTAMP_LO] = lo;
-			M[c + C.VSTAMP_HI] = hi;
+			D[(c >> 1) + 3] = entryEpoch;
 			return vals[c >> 2];
 		}
 
@@ -2121,7 +2174,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		// Slow twin of computedRead for the sentinel paths: carries the
 		// handle-owned evaluator and installs it on subscription.
 		function computedReadWith(c: number, getter: (previousValue?: unknown) => unknown): unknown {
-			if (M[c + C.VSTAMP_LO] === epochLo && M[c + C.VSTAMP_HI] === epochHi) {
+			if (D[(c >> 1) + 3] === epoch) {
 				const fastSub = activeSub;
 				if (fastSub !== 0) {
 					link(c, fastSub, cycle);
@@ -2143,8 +2196,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			if (retired) {
 				return inner!.computedReadWith(c, getter);
 			}
-			const lo = epochLo;
-			const hi = epochHi;
+			const entryEpoch = epoch;
 			const flags = M[c + C.FLAGS];
 			if (
 				flags & C.DIRTY
@@ -2179,8 +2231,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			}
 			// Stamp tracked reads too — see computedRead for the epoch
 			// argument; the write->flush->read pattern consumes these stamps.
-			M[c + C.VSTAMP_LO] = lo;
-			M[c + C.VSTAMP_HI] = hi;
+			D[(c >> 1) + 3] = entryEpoch;
 			return vals[c >> 2];
 		}
 
@@ -2203,10 +2254,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 				fn();
 			} finally {
 				activeSub = prevSub;
-				if (++epochLo === 0x40000000) {
-					epochLo = 0;
-					++epochHi;
-				}
+				++epoch;
 				M[sub + C.FLAGS] = 0;
 				let cur = M[sub + C.DEPS];
 				while (cur !== 0) {
