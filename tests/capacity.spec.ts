@@ -3,22 +3,62 @@ import { computed, effect, growCapacity, signal } from '../src';
 import { createReactiveSystem } from '../src/system';
 import { makeMiniLib } from './helpers/miniLib';
 
-// Capacity is fixed at creation (initialCapacity, required) and only ever
+// Capacity is fixed at creation (capacityRecords, required) and only ever
 // raised: automatically when the graph outgrows the arena, or explicitly
 // via growCapacity(records).
 
-test('createReactiveSystem allocates initialCapacity eagerly (stride-8 arena)', () => {
-	const sys = createReactiveSystem({ initialCapacity: 64 });
+test('createReactiveSystem allocates capacityRecords eagerly (stride-8 arena)', () => {
+	const sys = createReactiveSystem({ capacityRecords: 64 });
 	expect(sys.arena.memory.length).toBe(64 * 8);
 });
 
-test('initialCapacity must be a positive finite number', () => {
-	expect(() => createReactiveSystem({ initialCapacity: Number.NaN })).toThrowError(TypeError);
-	expect(() => createReactiveSystem({ initialCapacity: -5 })).toThrowError(TypeError);
+test('capacity must be a positive finite number, in exactly one unit', () => {
+	expect(() => createReactiveSystem({ capacityRecords: Number.NaN })).toThrowError(TypeError);
+	expect(() => createReactiveSystem({ capacityRecords: -5 })).toThrowError(TypeError);
+	expect(() => createReactiveSystem({} as never)).toThrowError(/required/);
+	expect(() => createReactiveSystem({ capacityRecords: 64, capacityMegabytes: 1 })).toThrowError(/not both/);
+});
+
+test('capacityMegabytes: 1 MB holds 32,768 records', () => {
+	const sys = createReactiveSystem({ capacityMegabytes: 1 });
+	expect(sys.arena.memory.length).toBe(32768 * 8);
+});
+
+test('capacity does not need to be a power of two', () => {
+	const lib = makeMiniLib({ capacityRecords: 100 });
+	const s = lib.signal(1);
+	let seen = 0;
+	lib.effect(() => {
+		seen = s() * 2;
+	});
+	s(21);
+	expect(seen).toBe(42);
+	expect(lib.sys.arena.memory.length).toBe(100 * 8);
+});
+
+test('maxCapacity clamps automatic growth; a full arena at max throws', () => {
+	const lib = makeMiniLib({ capacityRecords: 16, maxCapacityRecords: 64 });
+	expect(() => {
+		for (let i = 0; i < 500; i++) {
+			lib.signal(i);
+		}
+	}).toThrowError(/exhausted/);
+	expect(lib.sys.arena.memory.length).toBe(64 * 8); // grew to max, no further
+});
+
+test('growCapacity past maxCapacity throws RangeError', () => {
+	const sys = createReactiveSystem({ capacityRecords: 64, maxCapacityRecords: 128 });
+	expect(() => sys.growCapacity(256)).toThrowError(RangeError);
+	sys.growCapacity(128); // up to the max is fine
+	expect(sys.arena.memory.length).toBe(128 * 8);
+});
+
+test('maxCapacity below the starting capacity throws', () => {
+	expect(() => createReactiveSystem({ capacityRecords: 128, maxCapacityRecords: 64 })).toThrowError(/smaller/);
 });
 
 test('growCapacity raises capacity immediately when idle', () => {
-	const sys = createReactiveSystem({ initialCapacity: 64 });
+	const sys = createReactiveSystem({ capacityRecords: 64 });
 	const before = sys.arena;
 	sys.growCapacity(1024);
 	expect(sys.arena.memory.length).toBe(1024 * 8);
@@ -26,7 +66,7 @@ test('growCapacity raises capacity immediately when idle', () => {
 });
 
 test('growCapacity is a no-op when already big enough; throws on invalid', () => {
-	const sys = createReactiveSystem({ initialCapacity: 1024 });
+	const sys = createReactiveSystem({ capacityRecords: 1024 });
 	const before = sys.arena;
 	sys.growCapacity(512);
 	expect(sys.arena).toBe(before);
@@ -35,7 +75,7 @@ test('growCapacity is a no-op when already big enough; throws on invalid', () =>
 });
 
 test('growCapacity preserves the live graph', () => {
-	const lib = makeMiniLib({ initialCapacity: 64 });
+	const lib = makeMiniLib({ capacityRecords: 64 });
 	const s = lib.signal(1);
 	const c = lib.computed(() => s() * 10);
 	let seen = 0;
@@ -49,7 +89,7 @@ test('growCapacity preserves the live graph', () => {
 });
 
 test('growCapacity mid-operation is stashed and applied at the boundary', async () => {
-	const lib = makeMiniLib({ initialCapacity: 256 });
+	const lib = makeMiniLib({ capacityRecords: 256 });
 	const s = lib.signal(0);
 	let requested = false;
 	lib.effect(() => {
@@ -81,7 +121,7 @@ test('index growCapacity export grows the default system', () => {
 });
 
 test('top-level allocation past capacity grows instead of throwing', () => {
-	const lib = makeMiniLib({ initialCapacity: 16 });
+	const lib = makeMiniLib({ capacityRecords: 16 });
 	const handles: Array<() => number> = [];
 	for (let i = 0; i < 500; i++) {
 		handles.push(lib.signal(i));

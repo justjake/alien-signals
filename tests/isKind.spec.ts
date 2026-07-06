@@ -32,7 +32,7 @@ test('is* identify handles of every kind, at zero creation cost', () => {
 
 test('is* reject minilib handles from other libraries', async () => {
 	const { makeMiniLib } = await import('./helpers/miniLib');
-	const lib = makeMiniLib({ initialCapacity: 4096 });
+	const lib = makeMiniLib({ capacityRecords: 4096 });
 	const foreign = lib.signal(1);
 	expect(isSignal(foreign as unknown as () => void)).toBe(false);
 });

@@ -9,7 +9,7 @@ import { makeMiniLib } from './helpers/miniLib';
 // kind library, which is the only way nodes exist now.
 
 test('userspace nodes minted before growth keep working after it', () => {
-	const lib = makeMiniLib({ initialCapacity: 64 });
+	const lib = makeMiniLib({ capacityRecords: 64 });
 	const s = lib.signal(1);
 	const c = lib.computed(() => s() * 10);
 	let seen = 0;
@@ -33,7 +33,7 @@ test('userspace nodes minted before growth keep working after it', () => {
 });
 
 test('growth preserves the graph mid-batch', () => {
-	const lib = makeMiniLib({ initialCapacity: 64 });
+	const lib = makeMiniLib({ capacityRecords: 64 });
 	const s = lib.signal(0);
 	let seen = -1;
 	lib.effect(() => {
@@ -51,7 +51,7 @@ test('growth preserves the graph mid-batch', () => {
 });
 
 test('disposers minted before growth free the right record after it', () => {
-	const lib = makeMiniLib({ initialCapacity: 64 });
+	const lib = makeMiniLib({ capacityRecords: 64 });
 	const s = lib.signal(0);
 	let runs = 0;
 	const stop = lib.effect(() => {
@@ -67,7 +67,7 @@ test('disposers minted before growth free the right record after it', () => {
 });
 
 test('exhaustion inside one operation still throws an actionable error', () => {
-	const lib = makeMiniLib({ initialCapacity: 32 });
+	const lib = makeMiniLib({ capacityRecords: 32 });
 	expect(() => {
 		lib.effect(() => {
 			for (let i = 0; i < 100; i++) {
@@ -78,7 +78,7 @@ test('exhaustion inside one operation still throws an actionable error', () => {
 });
 
 test('reset() after growth keeps the grown capacity and works', () => {
-	const lib = makeMiniLib({ initialCapacity: 64 });
+	const lib = makeMiniLib({ capacityRecords: 64 });
 	for (let i = 0; i < 300; i++) {
 		lib.signal(i);
 	}
@@ -96,7 +96,7 @@ test('reset() after growth keeps the grown capacity and works', () => {
 });
 
 test('system.arena tracks the current generation; stale mint refs forward', () => {
-	const lib = makeMiniLib({ initialCapacity: 64 });
+	const lib = makeMiniLib({ capacityRecords: 64 });
 	const arenaBefore = lib.sys.arena;
 	const s = lib.signal(5);
 	for (let i = 0; i < 300; i++) {

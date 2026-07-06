@@ -120,7 +120,7 @@ const system = createReactiveSystem({
 	// import (physical memory tracks records actually touched). The arena
 	// grows automatically when the graph outgrows it; growCapacity() raises
 	// it up front.
-	initialCapacity: 1 << 20,
+	capacityRecords: 1 << 20,
 	allocated(arena: ReactiveArena): void {
 		M = arena.memory;
 		D = arena.versions;

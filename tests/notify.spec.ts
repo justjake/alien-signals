@@ -7,7 +7,7 @@ import { makeMiniLib } from './helpers/miniLib';
 // WATCHING as the dedup. Hosts own queues, ordering, and running.
 
 test('notifications carry gens; stale ids are detectable', () => {
-	const lib = makeMiniLib({ initialCapacity: 4096 });
+	const lib = makeMiniLib({ capacityRecords: 4096 });
 	const s = lib.signal(0);
 	let runs = 0;
 	const stop = lib.effect(() => {
@@ -24,7 +24,7 @@ test('notifications carry gens; stale ids are detectable', () => {
 });
 
 test('one notification per wave until the host re-arms', () => {
-	const lib = makeMiniLib({ initialCapacity: 4096 });
+	const lib = makeMiniLib({ capacityRecords: 4096 });
 	const s = lib.signal(0);
 	lib.effect(() => {
 		s();
@@ -43,7 +43,7 @@ test('one notification per wave until the host re-arms', () => {
 });
 
 test('reads stay consistent while effects are parked', () => {
-	const lib = makeMiniLib({ initialCapacity: 4096 });
+	const lib = makeMiniLib({ capacityRecords: 4096 });
 	const s = lib.signal(1);
 	const c = lib.computed(() => s() * 10);
 	lib.effect(() => {
@@ -58,7 +58,7 @@ test('reads stay consistent while effects are parked', () => {
 
 test('without a notify option, watching nodes are silently skipped', () => {
 	const sys = createReactiveSystem({
-		initialCapacity: 4096,
+		capacityRecords: 4096,
 		update: () => true,
 	});
 	const src = sys.createReactiveNode({}, 1 << 16 | ReactiveFlags.Mutable);

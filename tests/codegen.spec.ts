@@ -15,11 +15,11 @@ test('codegen is available under vitest/node', () => {
 });
 
 test('a second system (cloned engine) behaves identically', () => {
-	const first = makeMiniLib({ initialCapacity: 4096 });
+	const first = makeMiniLib({ capacityRecords: 4096 });
 	first.signal(0); // materialize: consumes the static-literal slot
 
 	// Everything below runs on a compiled clone.
-	const lib = makeMiniLib({ initialCapacity: 4096 });
+	const lib = makeMiniLib({ capacityRecords: 4096 });
 	const s = lib.signal(2);
 	const c2 = lib.computed(() => s() * 3);
 	let seen = 0;
@@ -52,7 +52,7 @@ test('a second system (cloned engine) behaves identically', () => {
 });
 
 test('growth produces cloned generations; two growths chain clones', () => {
-	const lib = makeMiniLib({ initialCapacity: 64 });
+	const lib = makeMiniLib({ capacityRecords: 64 });
 	const s = lib.signal(1);
 	const c2 = lib.computed(() => s() + 100);
 	let seen = 0;

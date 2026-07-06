@@ -250,11 +250,30 @@ export const enum Flag {
 	PublicMask = 127,
 }
 
+// 32-byte records: 1 MB holds 32,768 of them.
+const RECORDS_PER_MEGABYTE = (1024 * 1024) / 32;
+
 function normalizeRecords(n: number): number {
 	if (typeof n !== 'number' || !Number.isFinite(n) || n <= 0) {
-		throw new TypeError('dalien-signals: capacity must be a positive finite number of records');
+		throw new TypeError('dalien-signals: capacity must be a positive finite number');
 	}
 	return Math.max(16, Math.ceil(n));
+}
+
+// Exactly one of the two units must be given. Capacity does NOT need to be
+// a power of two — it is only ever a length bound (the power-of-two math in
+// the layout is the 8-slot record stride, which is fixed).
+function resolveCapacity(records: number | undefined, megabytes: number | undefined, which: string): number {
+	if (records !== undefined && megabytes !== undefined) {
+		throw new TypeError('dalien-signals: give ' + which + ' in records OR megabytes, not both');
+	}
+	if (records !== undefined) {
+		return normalizeRecords(records);
+	}
+	if (megabytes !== undefined) {
+		return normalizeRecords(megabytes * RECORDS_PER_MEGABYTE);
+	}
+	throw new TypeError('dalien-signals: ' + which + 'Records or ' + which + 'Megabytes is required');
 }
 
 function noop(): void {}
@@ -340,10 +359,11 @@ export interface ReactiveSystem {
 	readonly arena: ReactiveArena;
 	/**
 	 * Raise the arena's capacity to at least `records` 32-byte records
-	 * (no-op if already that big; throws on a non-positive or non-finite
-	 * request). Grows immediately when the system is idle; a request made
-	 * mid-operation (inside an effect or getter) is stashed and applied at
-	 * the next operation boundary, where growth is safe.
+	 * (no-op if already that big; TypeError on a non-positive or non-finite
+	 * request; RangeError past maxCapacity). Grows immediately when the
+	 * system is idle; a request made mid-operation (inside an effect or
+	 * getter) is stashed and applied at the next operation boundary, where
+	 * growth is safe.
 	 */
 	growCapacity(records: number): void;
 	/**
@@ -396,12 +416,23 @@ export interface ReactiveSystem {
 
 export interface ReactiveSystemOptions {
 	/**
-	 * Arena STARTING capacity in 32-byte records, allocated when the system
-	 * is created. Capacity is virtual until touched (typed arrays are
-	 * lazily-mapped zero pages); a graph outgrowing it migrates to a bigger
-	 * arena automatically, and growCapacity() raises it explicitly.
+	 * Arena STARTING capacity, allocated when the system is created — as a
+	 * count of 32-byte records, or as megabytes; give exactly one. Capacity
+	 * is virtual until touched (typed arrays are lazily-mapped zero pages);
+	 * a graph outgrowing it migrates to a bigger arena automatically, and
+	 * growCapacity() raises it explicitly. Any size >= 16 records works —
+	 * powers of two are not required.
 	 */
-	initialCapacity: number;
+	capacityRecords?: number;
+	capacityMegabytes?: number;
+	/**
+	 * Ceiling on the arena, in records or megabytes (at most one; default
+	 * unlimited). Automatic growth stops here — once a full arena is at max
+	 * capacity, allocation throws — and a growCapacity() request past it
+	 * throws a RangeError. Must be >= the starting capacity.
+	 */
+	maxCapacityRecords?: number;
+	maxCapacityMegabytes?: number;
 	/**
 	 * The effect scheduler (upstream's `notify` seam, id-shaped): the
 	 * propagation wave reports each Watching node here exactly once,
@@ -617,7 +648,13 @@ interface Engine extends ReactiveArena {
  * dependency-tracking state.
  */
 export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSystem {
-	let configuredRecords = normalizeRecords(options.initialCapacity);
+	let configuredRecords = resolveCapacity(options.capacityRecords, options.capacityMegabytes, 'capacity');
+	const maxRecords = options.maxCapacityRecords !== undefined || options.maxCapacityMegabytes !== undefined
+		? resolveCapacity(options.maxCapacityRecords, options.maxCapacityMegabytes, 'maxCapacity')
+		: Infinity;
+	if (configuredRecords > maxRecords) {
+		throw new TypeError('dalien-signals: maxCapacity is smaller than the starting capacity');
+	}
 	// An explicit growCapacity() target; grow() honors it over doubling.
 	let requestedRecords = 0;
 
@@ -708,8 +745,14 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 
 	function grow(): void {
 		shared.growPending = false;
-		const target = requestedRecords > configuredRecords ? requestedRecords : configuredRecords * 2;
+		let target = requestedRecords > configuredRecords ? requestedRecords : configuredRecords * 2;
 		requestedRecords = 0;
+		if (target > maxRecords) {
+			target = maxRecords;
+		}
+		if (target <= configuredRecords) {
+			return; // already at max capacity; allocation past a full arena throws
+		}
 		const prev = shared.inner!;
 		const next = instantiateEngine(target, prev.memory, prev.state(), shared);
 		configuredRecords = target;
@@ -768,6 +811,9 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 			const target = normalizeRecords(records);
 			if (target <= configuredRecords) {
 				return; // already that big
+			}
+			if (target > maxRecords) {
+				throw new RangeError('dalien-signals: growCapacity() request exceeds maxCapacity');
 			}
 			requestedRecords = target;
 			if (shared.inner!.busy()) {
