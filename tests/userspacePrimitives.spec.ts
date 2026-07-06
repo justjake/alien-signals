@@ -273,33 +273,3 @@ test('quiet re-reads hit the implicit stamp (verified gate)', () => {
 	expect(counting()).toBe(6); // (2 + 1) * 2
 	expect(evals).toBe(2);
 });
-
-test('INTEROP: built-in computed over a userspace signal', () => {
-	const { sys, signal } = makeUserspace();
-	const s = signal(2);
-	const builtin = sys.makeComputed(() => (s() as number) * 100);
-	let seen = 0;
-	sys.makeEffect(() => {
-		seen = builtin() as number;
-	});
-	expect(seen).toBe(200);
-	s(3); // custom write -> walks -> update seam commits -> built-in recomputes
-	expect(seen).toBe(300);
-});
-
-test('INTEROP: userspace computed over a built-in signal', () => {
-	const us = makeUserspace();
-	const base = us.sys.makeSignal(5);
-	const c = us.computed(() => (base() as number) + 1);
-	let seen = 0;
-	let runs = 0;
-	us.effect(() => {
-		seen = c();
-		runs++;
-	});
-	expect(seen).toBe(6);
-	(base as (v: number) => void)(9); // built-in write notifies the userspace effect
-	us.drain();
-	expect(seen).toBe(10);
-	expect(runs).toBe(2);
-});

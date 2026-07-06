@@ -196,6 +196,13 @@ function runCleanup(st: EffectState): void {
 	}
 }
 
+// Distinctly-named twin of disposeNode: keeps the scope disposer literal's
+// source text different from the effect disposer's, so the is* brand checks
+// (cold string compares) can tell them apart.
+function disposeScopeNode(id: NodeId): void {
+	disposeNode(id);
+}
+
 function disposeChildren(st: EffectState | ComputedState): void {
 	while (st.children.length !== 0) {
 		disposeNode(st.children.pop()!);
@@ -533,7 +540,7 @@ export function effectScope(fn: () => void): () => void {
 		systemSetActiveSub(prevSub);
 	}
 	const disposeScope = anon((): void => {
-		disposeNode(id);
+		disposeScopeNode(id);
 	});
 	scopeSrc ??= String(disposeScope);
 	return disposeScope;

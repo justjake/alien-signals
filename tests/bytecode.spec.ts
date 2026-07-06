@@ -27,27 +27,19 @@ const BUDGETS: Record<string, number> = {
 	linkInsert: 340,
 	unlink: 300,
 	propagate: 420,
-	checkDirty: 420, // wrapper + shallow fast paths + the chainCheck dispatch; still inside the inline limit so run()/computedReadWith can absorb it
+	checkDirty: 420, // wrapper + shallow fast paths + the chainCheck dispatch
 	chainCheck: 300, // stackless chain walk (not inlined; it loops)
 	checkDirtyLoop: INLINE_LIMIT,
 	updateAndShallow: 100,
 	shallowPropagate: 160,
 	isValidLink: 100,
-	// node behaviors
-	update: 120,
-	updateComputed: 300,
-	updateSignal: 100,
-	notify: 220,
-	run: INLINE_LIMIT,
 	purgeDeps: 100,
-	unlinkChildEffects: 200,
-	// public operations
-	read: 160,
-	write: 200, // +19 bytecodes for the retired-engine forward guard (arena growth)
-	computedRead: INLINE_LIMIT, // id-level / reclaim-off entry point
-	computedReadWith: INLINE_LIMIT, // reclaim-mode handle entry point (carries the getter)
-	// scheduler
-	flush: 280, // engine-local since the closed-engine refactor: carries the retired forwards and in-loop growth check; called, not inlined into hot walks
+	// the kindless seam + userspace verbs on hot paths
+	update: 160, // entry-epoch capture + state rewrite + hostUpdate call + stamp
+	notify: 80, // WATCHING dedup + host handoff
+	verify: 200,
+	track: 80,
+	markDirty: 80,
 };
 
 const pkgRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');

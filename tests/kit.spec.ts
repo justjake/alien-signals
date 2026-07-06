@@ -1,281 +1,139 @@
 import { expect, test } from 'vitest';
-import { createReactiveSystem } from '../src/system';
+import { ReactiveFlags, createReactiveSystem } from '../src/system';
+import { makeMiniLib } from './helpers/miniLib';
 
-// The composable kit: id-shaped link/unlink/propagate/shallowPropagate plus
-// the start/stop watched lifecycle. Together with notify/runEffect these are
-// the seams a host needs to build its own framework on the system.
+// The composable kit at the id level: link/unlink/propagate/shallowPropagate
+// and the start/stop watched lifecycle, driven kindlessly.
 
-test('link returns the edge id; the same pair returns the same id', () => {
-	const sys = createReactiveSystem({ initialRecords: 4096 });
-	const s = sys.signal(1);
-	let runs = 0;
-	const e = sys.effect(() => {
-		runs++; // tracks nothing: manual edges only
+test('link returns the edge id; the same pair dedupes; unlink removes', () => {
+	const sys = createReactiveSystem({
+		initialRecords: 4096,
+		update: () => true,
+		notify: () => {},
 	});
-	expect(runs).toBe(1);
-	const l1 = sys.link(s, e);
-	const l2 = sys.link(s, e);
+	const dep = sys.custom(1 << 16 | ReactiveFlags.Mutable);
+	const sub = sys.custom(2 << 16 | ReactiveFlags.Mutable);
+	const l1 = sys.link(dep, sub);
+	const l2 = sys.link(dep, sub);
 	expect(l1).toBe(l2);
-	sys.signalWrite(s, 2);
-	expect(runs).toBe(2); // manual edge delivered the update
+	sys.unlink(l1);
+	const l3 = sys.link(dep, sub);
+	expect(typeof l3).toBe('number');
 });
 
-test('unlink(linkId) removes the edge', () => {
-	const sys = createReactiveSystem({ initialRecords: 4096 });
-	const s = sys.signal(1);
-	let runs = 0;
-	const e = sys.effect(() => {
-		runs++;
+test('propagate marks downstream pending and notifies watchers', () => {
+	const notified: number[] = [];
+	const sys = createReactiveSystem({
+		initialRecords: 4096,
+		update: () => true,
+		notify: (id) => {
+			notified.push(id);
+		},
 	});
-	const l = sys.link(s, e);
-	sys.signalWrite(s, 2);
-	expect(runs).toBe(2);
-	sys.unlink(l);
-	sys.signalWrite(s, 3);
-	expect(runs).toBe(2); // no longer subscribed
-});
-
-test('manual edges age out when the subscriber re-tracks', () => {
-	const sys = createReactiveSystem({ initialRecords: 4096 });
-	const tracked = sys.signal(0);
-	const manual = sys.signal(0);
-	let runs = 0;
-	const e = sys.effect(() => {
-		sys.signalRead(tracked);
-		runs++;
-	});
-	sys.link(manual, e);
-	sys.signalWrite(manual, 1);
-	expect(runs).toBe(2); // manual edge fired, effect re-tracked
-	sys.signalWrite(manual, 2);
-	expect(runs).toBe(2); // re-track dropped the manual edge (upstream parity)
-	sys.signalWrite(tracked, 1);
-	expect(runs).toBe(3); // tracked edge still live
-});
-
-test('propagate + shallowPropagate invalidate out-of-band changes', () => {
-	const sys = createReactiveSystem({ initialRecords: 4096 });
-	let external = 1;
-	const src = sys.signal(0); // stands in for the external resource
-	const c = sys.computed(() => {
-		sys.signalRead(src);
-		return external * 10;
-	});
-	let seen = 0;
-	sys.effect(() => {
-		seen = sys.computedRead(c) as number;
-	});
-	expect(seen).toBe(10);
-
-	external = 2;
-	// No signal write happened: quiet-read stamps still consider c current.
-	expect(sys.computedRead(c)).toBe(10);
-	// Out-of-band invalidation: mark downstream stale, promote direct
-	// subscribers to dirty, effects flush (write parity).
-	sys.startBatch();
+	const src = sys.custom(1 << 16 | ReactiveFlags.Mutable);
+	const watcher = sys.custom(3 << 16 | ReactiveFlags.Watching);
+	sys.link(src, watcher);
+	sys.markDirty(src);
 	sys.propagate(src);
-	sys.shallowPropagate(src);
-	sys.endBatch();
-	expect(seen).toBe(20); // effect re-ran
-	expect(sys.computedRead(c)).toBe(20); // stamp was invalidated
+	expect(notified).toEqual([watcher]);
+	// dedup: WATCHING cleared until re-armed
+	sys.markDirty(src);
+	sys.propagate(src);
+	expect(notified).toEqual([watcher]);
+	// The host "runs" the watcher: verify clears its pending state, then
+	// re-arming WATCHING makes it notifiable again (an already-pending
+	// watcher is deliberately not re-notified).
+	sys.verify(watcher);
+	sys.setNodeFlags(watcher, ReactiveFlags.Watching);
+	sys.markDirty(src);
+	sys.propagate(src);
+	expect(notified).toEqual([watcher, watcher]);
 });
 
 test('start fires on first subscriber only; stop on last unlink with state', () => {
 	const events: string[] = [];
 	const sys = createReactiveSystem({
 		initialRecords: 4096,
-		start: (id, js) => {
-			events.push(`start:${js}`);
-			return { token: js };
+		update: () => true,
+		notify: () => {},
+		start: (id) => {
+			events.push(`start:${id}`);
+			return `state:${id}`;
 		},
-		stop: (id, js, state) => {
-			events.push(`stop:${js}:${(state as { token: unknown }).token}`);
+		stop: (id, state) => {
+			events.push(`stop:${id}:${state}`);
 		},
 	});
-	const s = sys.makeSignal('res');
-	let d1: (() => void) | undefined;
-	let d2: (() => void) | undefined;
-	d1 = sys.makeEffect(() => {
-		s();
-	});
-	d2 = sys.makeEffect(() => {
-		s();
-	});
-	// Effects are watched nodes themselves (started if they gain parents);
-	// standalone effects have no subscribers, so only the signal starts.
-	expect(events).toEqual(['start:res']);
-	d1();
-	expect(events).toEqual(['start:res']); // still one subscriber left
-	d2();
-	expect(events).toEqual(['start:res', 'stop:res:res']);
+	const dep = sys.custom(1 << 16 | ReactiveFlags.Mutable);
+	const s1 = sys.custom(2 << 16);
+	const s2 = sys.custom(2 << 16);
+	const l1 = sys.link(dep, s1);
+	expect(events).toEqual([`start:${dep}`]);
+	const l2 = sys.link(dep, s2);
+	expect(events.length).toBe(1); // second subscriber: no second start
+	sys.unlink(l1);
+	expect(events.length).toBe(1);
+	sys.unlink(l2);
+	expect(events).toEqual([`start:${dep}`, `stop:${dep}:state:${dep}`]);
 });
 
-test('re-running an effect does not churn start/stop for kept deps', () => {
+test('stop survives writes and recomputes of the started node', () => {
 	const events: string[] = [];
-	const sys = createReactiveSystem({
+	const lib = makeMiniLib({
 		initialRecords: 4096,
-		start: (id, js) => {
-			events.push(`start:${js}`);
-			return js;
-		},
-		stop: (id, js) => {
-			events.push(`stop:${js}`);
-		},
-	});
-	const s = sys.makeSignal('a');
-	sys.makeEffect(() => {
-		s();
-	});
-	expect(events).toEqual(['start:a']);
-	(s as (v: string) => void)('b'); // effect re-runs, keeps the dep
-	expect(events).toEqual(['start:a']);
-});
-
-test('conditionally dropped deps get stop; re-observing restarts', () => {
-	const events: string[] = [];
-	const sys = createReactiveSystem({
-		initialRecords: 4096,
-		start: (id, js) => {
-			events.push(`start:${js}`);
-			return js;
-		},
-		stop: (id, js) => {
-			events.push(`stop:${js}`);
-		},
-	});
-	const which = sys.makeSignal(true);
-	const a = sys.makeSignal('a');
-	const b = sys.makeSignal('b');
-	sys.makeEffect(() => {
-		if (which() as boolean) {
-			a();
-		} else {
-			b();
-		}
-	});
-	expect(events).toEqual(['start:true', 'start:a']);
-	events.length = 0;
-	(which as (v: boolean) => void)(false);
-	expect(events).toContain('start:b');
-	expect(events).toContain('stop:a');
-});
-
-test('reset() delivers stop for every started node, newest first', () => {
-	const events: string[] = [];
-	const sys = createReactiveSystem({
-		initialRecords: 4096,
-		start: (id, js) => {
-			events.push(`start:${js}`);
-			return js;
-		},
-		stop: (id, js) => {
-			events.push(`stop:${js}`);
-		},
-	});
-	const s1 = sys.makeSignal('one');
-	const s2 = sys.makeSignal('two');
-	sys.makeEffect(() => {
-		s1();
-		s2();
-	});
-	events.length = 0;
-	sys.reset();
-	expect(events).toEqual(['stop:two', 'stop:one']);
-});
-
-test('computeds pass their getter as js', () => {
-	let startedJs: unknown;
-	const sys = createReactiveSystem({
-		initialRecords: 4096,
-		start: (id, js) => {
-			startedJs = js;
+		start: () => {
+			events.push('start');
 			return undefined;
-		},
-	});
-	const getter = () => 42;
-	const c = sys.computed(getter);
-	let seen = 0;
-	sys.makeEffect(() => {
-		seen = sys.computedRead(c) as number;
-	});
-	expect(seen).toBe(42);
-	expect(startedJs).toBe(getter);
-});
-
-test('start/stop survive arena growth', () => {
-	const events: string[] = [];
-	const sys = createReactiveSystem({
-		initialRecords: 64,
-		start: (id, js) => {
-			events.push('start');
-			return 'state';
-		},
-		stop: (id, js, state) => {
-			events.push(`stop:${state}`);
-		},
-	});
-	const s = sys.makeSignal(0);
-	const stopEffect = sys.makeEffect(() => {
-		s();
-	});
-	expect(events).toEqual(['start']);
-	for (let i = 0; i < 500; i++) {
-		sys.makeSignal(i); // force growth while the resource is live
-	}
-	stopEffect();
-	expect(events).toEqual(['start', 'stop:state']);
-});
-
-test('stop still fires after the started node was written and recomputed', () => {
-	// Regression: write/updateSignal/updateComputed/run do absolute flag
-	// stores; HOST_STARTED must survive them or the start/stop pairing
-	// silently breaks for any node that changes value while watched.
-	const events: string[] = [];
-	const sys = createReactiveSystem({
-		initialRecords: 4096,
-		start: (id, js) => {
-			events.push('start');
-			return js;
 		},
 		stop: () => {
 			events.push('stop');
 		},
 	});
-	const s = sys.makeSignal(2);
-	const c = sys.makeComputed(() => (s() as number) * 3);
-	const stop = sys.makeEffect(() => {
+	const s = lib.signal(2);
+	const c = lib.computed(() => s() * 3);
+	const stop = lib.effect(() => {
 		c();
 	});
-	(s as (v: number) => void)(5);
-	sys.startBatch();
-	(s as (v: number) => void)(6);
-	(s as (v: number) => void)(7);
-	sys.endBatch();
+	s(5);
+	lib.sys.startBatch();
+	s(6);
+	s(7);
+	lib.sys.endBatch();
+	lib.drain();
 	events.length = 0;
 	stop();
 	expect(events).toEqual(['stop', 'stop']); // computed, then signal
 });
 
-test('a watched child effect gets stop when its parent re-runs or disposes', () => {
-	const events: string[] = [];
+test('reset() delivers stop for every started node, newest first', () => {
+	const stops: number[] = [];
 	const sys = createReactiveSystem({
 		initialRecords: 4096,
-		start: (id, js) => {
-			events.push(`start:${typeof js}`);
-			return js;
-		},
-		stop: (id, js) => {
-			events.push(`stop:${typeof js}`);
+		update: () => true,
+		notify: () => {},
+		start: (id) => id,
+		stop: (id) => {
+			stops.push(id);
 		},
 	});
-	const s = sys.makeSignal(0);
-	const stopOuter = sys.makeEffect(() => {
-		s();
-		sys.makeEffect(() => {}); // child: watched via the parent link
+	const d1 = sys.custom(1 << 16 | ReactiveFlags.Mutable);
+	const d2 = sys.custom(1 << 16 | ReactiveFlags.Mutable);
+	const sub = sys.custom(2 << 16);
+	sys.link(d1, sub);
+	sys.link(d2, sub);
+	sys.reset();
+	expect(stops).toEqual([d2, d1]);
+});
+
+test('free(id, gen): explicit lifetime; stale gens are no-ops', () => {
+	const sys = createReactiveSystem({
+		initialRecords: 4096,
+		update: () => true,
+		notify: () => {},
 	});
-	expect(events.filter((e) => e.startsWith('start')).length).toBeGreaterThanOrEqual(2);
-	events.length = 0;
-	stopOuter();
-	// The child effect's stop is delivered during the dispose cascade.
-	expect(events.filter((e) => e.startsWith('stop')).length).toBeGreaterThanOrEqual(2);
+	const id = sys.custom(1 << 16 | ReactiveFlags.Mutable);
+	const gen = sys.gen(id);
+	sys.free(id, gen);
+	sys.free(id, gen); // double free: gen/live checks make it harmless
+	expect(() => sys.free(id, gen)).not.toThrow();
 });

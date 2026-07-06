@@ -1,133 +1,107 @@
 import { expect, test } from 'vitest';
-import { createReactiveSystem } from '../src/system';
+import { makeMiniLib } from './helpers/miniLib';
 
 // Arena growth (grow-by-migration): when the bump pointer passes 3/4 of
-// capacity, the factory builds a new engine over an arena twice the size at
-// the next operation boundary, copies the live prefix (ids are arena-relative
-// offsets, so every id survives), and retires the old engine. Retired-engine
-// entry points forward to the current engine, so handles minted before a
-// growth keep working. These tests pin that contract.
+// capacity, the factory builds the next engine generation over an arena
+// twice the size at an operation boundary, copies the live prefix (ids are
+// arena-relative offsets, so every id survives), and retires the old engine
+// whose entry points forward. These tests drive growth through a userspace
+// kind library, which is the only way nodes exist now.
 
-test('handles minted before growth keep working after it', () => {
-	const sys = createReactiveSystem({ initialRecords: 64 });
-	const s = sys.makeSignal(1);
-	const c = sys.makeComputed(() => (s() as number) * 10);
+test('userspace nodes minted before growth keep working after it', () => {
+	const lib = makeMiniLib({ initialRecords: 64 });
+	const s = lib.signal(1);
+	const c = lib.computed(() => s() * 10);
 	let seen = 0;
 	let runs = 0;
-	sys.makeEffect(() => {
-		seen = c() as number;
+	lib.effect(() => {
+		seen = c();
 		runs++;
 	});
-	const before = sys.buffer().length;
-
-	// Push the arena through multiple growths with top-level mints.
-	const extras: Array<() => unknown> = [];
-	for (let i = 0; i < 500; i++) {
-		extras.push(sys.makeSignal(i));
+	const before = lib.sys.buffer().length;
+	const extras: Array<() => number> = [];
+	for (let i = 0; i < 300; i++) {
+		extras.push(lib.signal(i));
 	}
-	expect(sys.buffer().length).toBeGreaterThan(before);
-
-	// The pre-growth signal handle (write path), computed handle (read path),
-	// and effect subscription (propagation) all still work.
+	expect(lib.sys.buffer().length).toBeGreaterThan(before);
 	expect(c()).toBe(10);
-	(s as (v: number) => void)(5);
+	s(5);
 	expect(seen).toBe(50);
 	expect(runs).toBe(2);
-	// Pre-growth mints kept their values.
 	expect(extras[0]()).toBe(0);
-	expect(extras[499]()).toBe(499);
+	expect(extras[299]()).toBe(299);
 });
 
-test('growth preserves the dependency graph mid-batch', () => {
-	const sys = createReactiveSystem({ initialRecords: 64 });
-	const s = sys.makeSignal(0);
+test('growth preserves the graph mid-batch', () => {
+	const lib = makeMiniLib({ initialRecords: 64 });
+	const s = lib.signal(0);
 	let seen = -1;
-	sys.makeEffect(() => {
-		seen = s() as number;
+	lib.effect(() => {
+		seen = s();
 	});
-	sys.startBatch();
-	(s as (v: number) => void)(7);
-	// Mint enough at top level (inside the batch, outside any effect) to
-	// trigger growth while the write is still queued.
+	lib.sys.startBatch();
+	s(7);
 	for (let i = 0; i < 300; i++) {
-		sys.makeSignal(i);
+		lib.signal(i);
 	}
-	expect(seen).toBe(0); // batch still open
-	sys.endBatch();
-	expect(seen).toBe(7); // queued effect ran on the grown arena
+	expect(seen).toBe(0);
+	lib.sys.endBatch();
+	lib.drain();
+	expect(seen).toBe(7);
 });
 
-test('disposers minted before growth dispose the right record after it', () => {
-	const sys = createReactiveSystem({ initialRecords: 64 });
-	const s = sys.makeSignal(0);
+test('disposers minted before growth free the right record after it', () => {
+	const lib = makeMiniLib({ initialRecords: 64 });
+	const s = lib.signal(0);
 	let runs = 0;
-	const stop = sys.makeEffect(() => {
+	const stop = lib.effect(() => {
 		s();
 		runs++;
 	});
 	for (let i = 0; i < 300; i++) {
-		sys.makeSignal(i);
+		lib.signal(i);
 	}
 	stop();
-	(s as (v: number) => void)(1);
-	expect(runs).toBe(1); // disposed effect never re-ran
-});
-
-test('unobserved-value semantics survive growth (staged writes)', () => {
-	const sys = createReactiveSystem({ initialRecords: 64 });
-	const s = sys.makeSignal(1);
-	(s as (v: number) => void)(2); // staged, no subscribers
-	for (let i = 0; i < 300; i++) {
-		sys.makeSignal(i);
-	}
-	expect(s()).toBe(2);
+	s(1);
+	expect(runs).toBe(1);
 });
 
 test('exhaustion inside one operation still throws an actionable error', () => {
-	const sys = createReactiveSystem({ initialRecords: 32 });
-	// Inside an effect body enterDepth > 0, so growth cannot run; a mint
-	// burst that blows through the remaining headroom must fail loudly.
+	const lib = makeMiniLib({ initialRecords: 32 });
 	expect(() => {
-		sys.makeEffect(() => {
+		lib.effect(() => {
 			for (let i = 0; i < 100; i++) {
-				sys.makeSignal(i);
+				lib.signal(i);
 			}
 		});
 	}).toThrowError(/exhausted inside one operation.*configure/);
 });
 
 test('reset() after growth keeps the grown capacity and works', () => {
-	const sys = createReactiveSystem({ initialRecords: 64 });
-	for (let i = 0; i < 500; i++) {
-		sys.makeSignal(i);
+	const lib = makeMiniLib({ initialRecords: 64 });
+	for (let i = 0; i < 300; i++) {
+		lib.signal(i);
 	}
-	const grown = sys.buffer().length;
+	const grown = lib.sys.buffer().length;
 	expect(grown).toBeGreaterThan(64 * 8);
-	sys.reset();
-	expect(sys.buffer().length).toBe(grown);
-	const s = sys.makeSignal(1);
+	lib.sys.reset();
+	expect(lib.sys.buffer().length).toBe(grown);
+	const s = lib.signal(1);
 	let seen = 0;
-	sys.makeEffect(() => {
-		seen = s() as number;
+	lib.effect(() => {
+		seen = s();
 	});
-	(s as (v: number) => void)(3);
+	s(3);
 	expect(seen).toBe(3);
 });
 
-test('system.e and id-level operations track the current engine', () => {
-	const sys = createReactiveSystem({ initialRecords: 64 });
-	const id = sys.signal(5);
-	const cid = sys.computed(() => (sys.signalRead(id) as number) + 1);
-	const eBefore = sys.e;
-	for (let i = 0; i < 500; i++) {
-		sys.signal(i);
+test('system.e tracks the current generation; stale refs forward', () => {
+	const lib = makeMiniLib({ initialRecords: 64 });
+	const eBefore = lib.sys.e;
+	const s = lib.signal(5);
+	for (let i = 0; i < 300; i++) {
+		lib.signal(i);
 	}
-	expect(sys.e).not.toBe(eBefore); // engine was rebuilt
-	// Ids minted on the old engine resolve on the new one.
-	expect(sys.signalRead(id)).toBe(5);
-	expect(sys.computedRead(cid)).toBe(6);
-	// The retired engine object still works, one hop behind.
-	expect(eBefore.read(id)).toBe(5);
-	eBefore.write(id, 9);
-	expect(sys.signalRead(id)).toBe(9);
+	expect(lib.sys.e).not.toBe(eBefore);
+	expect(s()).toBe(5); // pre-growth closure reaches the new generation
 });

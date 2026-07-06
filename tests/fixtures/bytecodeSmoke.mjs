@@ -58,12 +58,23 @@ const scope = effectScope(() => { effect(() => { c1(); }); });
 scope();
 d1();
 d2();
-// Exercise the id-level computedRead path (permanently-installed getter).
-const sys = createReactiveSystem({ initialRecords: 4096 });
-const nsId = sys.signal(1);
-const ncId = sys.computed(() => sys.signalRead(nsId) + 1);
-sys.computedRead(ncId);
-sys.signalWrite(nsId, 2);
-sys.computedRead(ncId);
+// Exercise the kindless seam + userspace verbs directly.
+const nodes = [];
+const sys = createReactiveSystem({
+	initialRecords: 4096,
+	update(id) {
+		const st = nodes[id >> 3];
+		return st.current !== (st.current = st.pending);
+	},
+	notify() {},
+});
+const nsId = sys.custom(1 << 16 | ReactiveFlags.Mutable);
+nodes[nsId >> 3] = { current: 1, pending: 1 };
+sys.track(nsId);
+nodes[nsId >> 3].pending = 2;
+sys.markDirty(nsId);
+sys.propagate(nsId);
+sys.verify(nsId);
+sys.verified(nsId);
 
 console.log('smoke ok', c3());

@@ -1,89 +1,66 @@
 import { expect, test } from 'vitest';
-import { createReactiveSystem } from '../src/system.js';
-
-function drainFinalizers(): Promise<void> {
-	return new Promise((resolve) => {
-		// One GC plus two macrotask turns lets FinalizationRegistry cleanups
-		// enqueue and run.
-		gc!();
-		setTimeout(() => {
-			gc!();
-			setTimeout(() => resolve(), 0);
-		}, 0);
-	});
-}
+import { makeMiniLib } from './helpers/miniLib';
 
 test('reset() rewinds the arena and the system keeps working', () => {
-	const sys = createReactiveSystem({ initialRecords: 1 << 16 });
-	const s = sys.makeSignal(1) as { (): number; (v: number): void };
-	const c = sys.makeComputed(() => s() + 1) as () => number;
+	const lib = makeMiniLib({ initialRecords: 4096 });
+	const s = lib.signal(1);
 	let seen = 0;
-	sys.makeEffect(() => {
-		seen = c();
+	lib.effect(() => {
+		seen = s();
 	});
-	s(41);
-	expect(seen).toBe(42);
-
-	sys.reset();
-
-	const s2 = sys.makeSignal(10) as { (): number; (v: number): void };
-	const c2 = sys.makeComputed(() => s2() * 2) as () => number;
+	s(5);
+	expect(seen).toBe(5);
+	const used = lib.sys.stats().allocatedRecords;
+	expect(used).toBeGreaterThan(0);
+	lib.sys.reset();
+	expect(lib.sys.stats().allocatedRecords).toBe(0);
+	const s2 = lib.signal(10);
 	let seen2 = 0;
-	sys.makeEffect(() => {
-		seen2 = c2();
+	lib.effect(() => {
+		seen2 = s2();
 	});
-	expect(seen2).toBe(20);
 	s2(11);
-	expect(seen2).toBe(22);
+	expect(seen2).toBe(11);
 });
 
 test('reset() restores capacity consumed by a dead generation', () => {
-	const sys = createReactiveSystem({ initialRecords: 1 << 12 });
-	// Burn most of the arena across generations; without reset this throws.
-	for (let generation = 0; generation < 20; generation++) {
-		for (let i = 0; i < 1000; i++) {
-			sys.makeSignal(i);
-		}
-		sys.reset();
+	const lib = makeMiniLib({ initialRecords: 256 });
+	for (let i = 0; i < 100; i++) {
+		lib.signal(i);
 	}
+	const before = lib.sys.stats().allocatedRecords;
+	lib.sys.reset();
+	expect(lib.sys.stats().allocatedRecords).toBeLessThan(before);
 });
 
 test('reset() during an active operation throws', () => {
-	const sys = createReactiveSystem({ initialRecords: 1 << 16 });
-	let error: Error | undefined;
-	sys.makeEffect(() => {
+	const lib = makeMiniLib({ initialRecords: 4096 });
+	const s = lib.signal(0);
+	let threw: Error | undefined;
+	lib.effect(() => {
+		s();
 		try {
-			sys.reset();
-		} catch (e) {
-			error = e as Error;
+			lib.sys.reset();
+		} catch (error) {
+			threw = error as Error;
 		}
 	});
-	expect(error?.message).toMatch(/active operation/);
+	expect(threw?.message).toMatch(/active operation/);
 });
 
 test('pre-reset finalizations cannot reclaim post-reset records', async () => {
-	const sys = createReactiveSystem({ initialRecords: 1 << 16 });
-	// Mint a batch of handles and drop them so their registry cells are
-	// pending, then reset before the cleanups run.
+	const lib = makeMiniLib({ initialRecords: 4096 });
+	// Owner-registered node whose owner dies before reset: the stale
+	// finalizer must self-disarm after reset replaces the registry.
 	(() => {
-		for (let i = 0; i < 1000; i++) {
-			const s = sys.makeSignal(i) as () => number;
-			const c = sys.makeComputed(() => s() + 1) as () => number;
-			c();
-		}
+		const owner = { alive: true };
+		lib.sys.custom(1 << 16, owner);
 	})();
-	sys.reset();
-	// New generation occupying the same record ids as the dropped handles.
-	const s2 = sys.makeSignal(7) as { (): number; (v: number): void };
-	const c2 = sys.makeComputed(() => s2() + 1) as () => number;
-	let seen = 0;
-	sys.makeEffect(() => {
-		seen = c2();
-	});
-	// Let the old generation's finalizers fire; the disarmed registry must
-	// not touch the new generation's records.
-	await drainFinalizers();
-	s2(100);
-	expect(seen).toBe(101);
-	expect(c2()).toBe(101);
+	lib.sys.reset();
+	const survivor = lib.signal(42);
+	if (globalThis.gc !== undefined) {
+		globalThis.gc();
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+	expect(survivor()).toBe(42);
 });

@@ -30,10 +30,9 @@ test('is* identify handles of every kind, at zero creation cost', () => {
 	sc();
 });
 
-test('is* work across systems', () => {
-	const sys = createReactiveSystem({ initialRecords: 4096 });
-	expect(isSignal(sys.makeSignal(1) as () => void)).toBe(true);
-	expect(isComputed(sys.makeComputed(() => 1) as () => void)).toBe(true);
-	expect(isEffect(sys.makeEffect(() => {}))).toBe(true);
-	expect(isEffectScope(sys.makeScope(() => {}))).toBe(true);
+test('is* reject minilib handles from other libraries', async () => {
+	const { makeMiniLib } = await import('./helpers/miniLib');
+	const lib = makeMiniLib({ initialRecords: 4096 });
+	const foreign = lib.signal(1);
+	expect(isSignal(foreign as unknown as () => void)).toBe(false);
 });

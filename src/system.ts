@@ -166,22 +166,13 @@ const enum C {
 	RECURSED = 8,
 	DIRTY = 16,
 	PENDING = 32,
-	HAS_CHILD_EFFECT = 64,
-	K_SIGNAL = 128,
-	K_COMPUTED = 256,
-	K_EFFECT = 512,
-	K_SCOPE = 1024,
-	// Host-defined node kind: the walks resolve its updates through the
-	// system's `update` callback instead of the built-in library.
-	K_CUSTOM = 16384,
-	KIND_MASK = K_SIGNAL | K_COMPUTED | K_EFFECT | K_SCOPE | K_CUSTOM,
+	// The record holds a live node (set by alloc, cleared by free): the
+	// engine's only notion of "kind" — everything else is host bits.
+	LIVE = 128,
 	// The record's handle was garbage-collected (FinalizationRegistry fired)
 	// while subscribers still existed; reclaim when the last subscriber
 	// unlinks. Engine-internal, outside PUBLIC_MASK.
 	ORPHANED = 2048,
-	// A handle-owned getter is currently installed in the fns column (only
-	// while the computed has subscribers — see makeComputed). Engine-internal.
-	FN_INSTALLED = 4096,
 	// The host's start() lifecycle callback ran for this node and its stop()
 	// has not (see ReactiveSystemOptions.start/stop). Engine-internal.
 	HOST_STARTED = 8192,
@@ -216,54 +207,6 @@ function normalizeRecords(n: number): number {
 	return Math.max(16, Math.ceil(n));
 }
 
-// Handle identity for isSignal/isComputed/isEffect/isEffectScope, at ZERO
-// creation cost. Handles are deliberately ANONYMOUS closures — any NAMED
-// closure (variable-inferred or declared) gets wrapped by esbuild keepNames
-// pipelines (tsx, some bundlers) in Object.defineProperty(fn, 'name', ...):
-// dictionary-mode properties and ~120ns per created handle, measured. Even a
-// symbol brand costs ~3ns and ~24B per handle. Instead: every handle of a
-// kind is an instantiation of the SAME closure literal, so Function.prototype
-// .toString() is identical across all of them — each literal's source is
-// sampled once at first mint, and kind checks are a cold string compare.
-// (Upstream's `fn.name === 'bound signalOper'` check had the same spoofable-
-// by-construction character; this one additionally survives keepNames.)
-export const enum HandleKind {
-	None = 0,
-	Signal = 1,
-	Computed = 2,
-	Effect = 3,
-	EffectScope = 4,
-}
-
-// Sampled source text per kind; computed handles have two literals (one per
-// reclamation mode). Module-level: every system shares the same literals.
-let signalSrc: string | undefined;
-let computedSrc: string | undefined;
-let effectSrc: string | undefined;
-let scopeSrc: string | undefined;
-
-
-/** Kind of a handle produced by this module's make* factories. */
-export function handleKind(fn: unknown): HandleKind {
-	if (typeof fn !== 'function') {
-		return HandleKind.None;
-	}
-	const src = String(fn);
-	if (src === signalSrc) {
-		return HandleKind.Signal;
-	}
-	if (src === computedSrc) {
-		return HandleKind.Computed;
-	}
-	if (src === effectSrc) {
-		return HandleKind.Effect;
-	}
-	if (src === scopeSrc) {
-		return HandleKind.EffectScope;
-	}
-	return HandleKind.None;
-}
-
 function noop(): void {}
 
 function uninitialized(): never {
@@ -281,17 +224,6 @@ function uninitialized(): never {
  * calling these functions directly.
  */
 export interface ReactiveEngine {
-	read(id: number): unknown;
-	/** Write a signal; propagates and (outside a batch) flushes effects. */
-	write(id: number, value: unknown): void;
-	computedRead(id: number): unknown;
-	/** Dispose an effect/scope if `gen` still matches (stale ids are no-ops). */
-	dispose(id: number, gen: number): void;
-	/**
-	 * Run a host-notified effect if `gen` still matches (stale ids are
-	 * no-ops). Only meaningful with a `notify` host scheduler installed.
-	 */
-	runEffect(id: number, gen: number): void;
 	/** Mint a host-kind node (see ReactiveSystem.custom). */
 	newCustom(hostBits: number): NodeId;
 	/** Explicitly free any node id if `gen` still matches. */
@@ -331,17 +263,7 @@ export interface ReactiveEngine {
 	 * unless a batch is open.
 	 */
 	shallowPropagate(id: NodeId): void;
-	makeSignal(initialValue?: unknown): SignalHandle;
-	makeComputed(getter: (previousValue?: unknown) => unknown): () => unknown;
-	makeEffect(fn: () => (() => void) | void): () => void;
-	makeScope(fn: () => void): () => void;
 }
-
-/** Callable signal handle: `s()` reads, `s(value)` writes. */
-export type SignalHandle = {
-	(): unknown;
-	(value: unknown): void;
-};
 
 /** The self-contained reactive system returned by {@link createReactiveSystem}. */
 export interface ReactiveSystem {
@@ -374,29 +296,6 @@ export interface ReactiveSystem {
 	 * itself (and its warmed-up JIT state) is reused across resets.
 	 */
 	reset(): void;
-	/** Create a signal and return its callable handle (zero-indirection closure). */
-	makeSignal(initialValue?: unknown): SignalHandle;
-	/** Create a computed and return its read handle. */
-	makeComputed(getter: (previousValue?: unknown) => unknown): () => unknown;
-	/** Create an effect (runs immediately) and return its disposer. */
-	makeEffect(fn: () => (() => void) | void): () => void;
-	/** Create an effect scope (runs immediately) and return its disposer. */
-	makeScope(fn: () => void): () => void;
-	/** Allocate a signal record holding `initialValue`. Returns its id. */
-	signal(initialValue?: unknown): number;
-	/** Allocate a computed record over `getter`. Returns its id. */
-	computed(getter: (previousValue?: unknown) => unknown): number;
-	/** Allocate an effect record, run `fn` immediately, and return its id. */
-	effect(fn: () => (() => void) | void): number;
-	/** Allocate an effect scope record and run `fn` inside it. */
-	effectScope(fn: () => void): number;
-	/** Dispose an effect/scope if `gen` still matches (stale ids are no-ops). */
-	dispose(id: number, gen: number): void;
-	/**
-	 * Run a host-notified effect if `gen` still matches (stale ids are
-	 * no-ops). Only meaningful with a `notify` host scheduler installed.
-	 */
-	runEffect(id: number, gen: number): void;
 	/**
 	 * Mint a host-kind node. `hostBits` (masked to HOST_MASK) are your
 	 * dispatch tags, preserved by the engine across every state rewrite and
@@ -429,9 +328,6 @@ export interface ReactiveSystem {
 	shallowPropagate(id: NodeId): void;
 	/** Current generation counter of a record (capture at creation). */
 	gen(id: number): number;
-	signalRead(id: number): unknown;
-	signalWrite(id: number, value: unknown): void;
-	computedRead(id: number): unknown;
 	/** Re-notify dependencies read inside `fn` as if they had been written. */
 	trigger(fn: () => void): void;
 	startBatch(): void;
@@ -455,8 +351,6 @@ export interface ReactiveSystem {
 		freeLinkRecords: number;
 		pendingFreeRecords: number;
 		pendingRegistrations: number;
-		/** Whether call-site seeding has run (see ReactiveSystemOptions.seeding). */
-		seeded: boolean;
 	};
 }
 
@@ -479,6 +373,12 @@ export interface ReactiveSystemOptions {
 	 *   scheduler, startBatch/endBatch no longer defer anything.
 	 */
 	notify?: (effectId: number, gen: number) => void;
+	/**
+	 * Called when a top-level operation finishes with notifications pending
+	 * (write-parity: after an unbatched propagate, at the outermost
+	 * endBatch, after trigger). Drain your effect queue here.
+	 */
+	flush?: () => void;
 	/**
 	 * Resolve a custom node's update (see `custom`): commit whatever
 	 * "update" means for your kind and return whether its value changed —
@@ -503,16 +403,8 @@ export interface ReactiveSystemOptions {
 	 * - `reset()` delivers `stop` for every started node (newest first);
 	 *   those callbacks must not touch reactive state mid-reset.
 	 */
-	start?: (id: NodeId, js: unknown) => unknown;
-	stop?: (id: NodeId, js: unknown, state: unknown) => void;
-	/**
-	 * Call-site seeding policy. 'auto' (default) seeds when minted callback
-	 * shapes diversify — single-shape processes keep V8's full speculation;
-	 * 'eager' seeds at materialization (flat from the first callback, taxes
-	 * dedicated kernels); 'off' never seeds (fastest single-shape steady
-	 * state, exposed to deopt churn when shapes diversify).
-	 */
-	seeding?: 'auto' | 'eager' | 'off';
+	start?: (id: NodeId) => unknown;
+	stop?: (id: NodeId, state: unknown) => void;
 }
 
 /** A record id: a node's (or link's) starting offset in the arena. */
@@ -523,12 +415,6 @@ export type EffectId = number;
 export type EffectScopeId = number;
 /** Id of an edge record returned by `link`; pass to `unlink`. */
 export type LinkId = number;
-
-// Seeding diversity is tracked per call-site family (see maybeSeed).
-const enum SeedFamily {
-	Getter = 0,
-	Callback = 1,
-}
 
 // ---- engine generations and codegen cloning -------------------------------
 //
@@ -568,21 +454,17 @@ function cloneWorks(): boolean {
 	try {
 		const compile = new Function(engineSourceText + '0') as () => typeof createEngine;
 		const dummy: EngineShared = {
-			values: [undefined, undefined],
-			fns: [undefined],
-			queued: [],
 			pendingFree: [],
-			pendingFnClear: [],
 			hostState: [],
 			inner: undefined,
 			registry: undefined,
 			hostNotify: undefined,
 			hostUpdate: undefined,
+			hostFlush: undefined,
 			hostStart: undefined,
 			hostStop: undefined,
 			growPending: false,
 			boundaryPending: false,
-			maybeSeed: noop,
 			grow: noop,
 			boundaryWork: noop,
 			scheduleMaintenance: noop,
@@ -594,17 +476,21 @@ function cloneWorks(): boolean {
 			epoch: 1,
 			cycle: 0,
 			batchDepth: 0,
-			notifyIndex: 0,
-			queuedLength: 0,
 		}, dummy);
 		dummy.inner = probe;
-		const handle = probe.makeSignal(1) as unknown as { (): unknown; (v: unknown): void };
-		handle(2);
-		return handle() === 2;
+		// Exercise mint, flags, edges, staleness resolution: any unresolved
+		// identifier in the cloned source throws here, not later.
+		const a = probe.newCustom(1 << 16 | 1); // host tag + MUTABLE
+		const b = probe.newCustom(2 << 16 | 1);
+		probe.link(a, b);
+		probe.markDirty(a);
+		probe.propagate(a);
+		return probe.verify(b) === true;
 	} catch {
 		return false;
 	}
 }
+
 
 /**
  * Whether engine generations can be compiled from source in this
@@ -644,8 +530,6 @@ interface EngineState {
 	epoch: number;
 	cycle: number;
 	batchDepth: number;
-	notifyIndex: number;
-	queuedLength: number;
 }
 
 /**
@@ -655,21 +539,17 @@ interface EngineState {
  * engine and travel via {@link EngineState}.
  */
 interface EngineShared {
-	values: unknown[];
-	fns: (Function | undefined)[];
-	queued: number[];
 	pendingFree: number[];
-	pendingFnClear: number[];
 	hostState: unknown[];
 	inner: Engine | undefined;
 	registry: FinalizationRegistry<number> | undefined;
 	hostNotify: ((effectId: number, gen: number) => void) | undefined;
 	hostUpdate: ((id: NodeId, flags: number) => boolean) | undefined;
-	hostStart: ((id: NodeId, js: unknown) => unknown) | undefined;
-	hostStop: ((id: NodeId, js: unknown, state: unknown) => void) | undefined;
+	hostFlush: (() => void) | undefined;
+	hostStart: ((id: NodeId) => unknown) | undefined;
+	hostStop: ((id: NodeId, state: unknown) => void) | undefined;
 	growPending: boolean;
 	boundaryPending: boolean;
-	maybeSeed(fn: Function, family: number): void;
 	grow(): void;
 	boundaryWork(): void;
 	scheduleMaintenance(): void;
@@ -677,11 +557,9 @@ interface EngineShared {
 
 interface Engine extends ReactiveEngine {
 	buffer(): Int32Array;
-	computedReadWith(c: number, getter: (previousValue?: unknown) => unknown): unknown;
 	retire(): void;
 	state(): EngineState;
 	busy(): boolean;
-	flush(): void;
 	maybeBoundary(): void;
 	startBatch(): void;
 	endBatch(): void;
@@ -691,21 +569,10 @@ interface Engine extends ReactiveEngine {
 	resetGuard(): void;
 	resetState(): void;
 	freeRecordCounts(): { freeNodeRecords: number; freeLinkRecords: number };
-	newSignal(value: unknown): number;
-	newComputed(getter: (previousValue?: unknown) => unknown): number;
-	newEffect(fn: () => (() => void) | void): number;
-	newScope(fn: () => void): number;
-	makeSignal(initialValue: unknown): SignalHandle;
-	makeComputed(getter: (previousValue?: unknown) => unknown): () => unknown;
-	makeEffect(fn: () => (() => void) | void): () => void;
-	makeScope(fn: () => void): () => void;
 	orphan(id: number): void;
 	clearStamp(id: number): void;
-	run(e: number): void;
-	requeueAbort(e: number): void;
 	trigger(fn: () => void): void;
 	sweepPendingFree(): void;
-	sweepFnClears(): void;
 }
 
 /**
@@ -719,7 +586,6 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 	let configuredRecords = options?.initialRecords !== undefined
 		? normalizeRecords(options.initialRecords)
 		: DEFAULT_RECORDS;
-	let seeding = options?.seeding ?? 'auto';
 
 	// Everything engine generations share: stable array identities plus
 	// cold-path mutable slots (see EngineShared). Hot counters live inside
@@ -735,27 +601,21 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 	// is immediate — every batching scheme measured worse), and each
 	// registry's callbacks self-disarm once replaced by reset().
 	const shared: EngineShared = {
-		values: [undefined, undefined],
-		fns: [undefined],
-		queued: [],
 		pendingFree: [],
-		pendingFnClear: [],
 		hostState: [],
 		inner: undefined,
 		registry: undefined,
 		hostNotify: options?.notify,
 		hostUpdate: options?.update,
+		hostFlush: options?.flush,
 		hostStart: options?.start,
 		hostStop: options?.stop,
 		growPending: false,
 		boundaryPending: false,
-		maybeSeed,
 		grow,
 		boundaryWork,
 		scheduleMaintenance,
 	};
-	const values = shared.values;
-	const fns = shared.fns;
 	const hostState = shared.hostState;
 
 	function ensureEngine(): Engine {
@@ -788,162 +648,13 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			epoch: 1,
 			cycle: 0,
 			batchDepth: 0,
-			notifyIndex: 0,
-			queuedLength: 0,
 		}, shared);
 		shared.inner = engine;
 		facade.e = engine;
-		// Sample each handle literal's source once from throwaway mints so
-		// handleKind() works without any per-mint bookkeeping. (The dummy
-		// records self-reclaim via the registry when it exists; otherwise
-		// they cost a few records, once per system.)
-		if (signalSrc === undefined) {
-			signalSrc = String(engine.makeSignal(undefined));
-			computedSrc = String(engine.makeComputed(noop));
-			effectSrc = String(engine.makeEffect(noop));
-			scopeSrc = String(engine.makeScope(noop));
-		}
-		// The boot mints above are engine-internal (noop shapes): reset the
-		// seed sampler so they cannot count as the first observed shape and
-		// make every real first getter look like diversity.
-		seedMints[SeedFamily.Getter] = 0;
-		seedMints[SeedFamily.Callback] = 0;
-		seedSampleAt[SeedFamily.Getter] = 1;
-		seedSampleAt[SeedFamily.Callback] = 1;
-		seedSrcs[SeedFamily.Getter] = undefined;
-		seedSrcs[SeedFamily.Callback] = undefined;
-		if (seeding === 'eager' && !seeded && configuredRecords >= 4096) {
-			seeded = true;
-			seedEngine();
-		}
 		return engine;
 	}
 
 
-	// Seed the engine's user-callback call sites (cold eval, recompute,
-	// effect run) past V8's megamorphic threshold (>4 shapes). When such a
-	// site has seen four or fewer shapes, V8 speculates on the exact call
-	// targets and compiles them inline; a workload that later pushes the
-	// site past the threshold deoptimizes the engine's hot functions and
-	// pays reoptimization cycles mid-run (measured at 20-35% on pull-heavy
-	// graphs when several distinct workloads share one process).
-	//
-	// Seeding triggers on callback-shape DIVERSITY, not node count. The tax
-	// (generalized call sites instead of single-target speculation, ~10-25%
-	// in dedicated loops) only ever pays off when an application funnels
-	// MANY different callback shapes through the engine; a process whose
-	// getters all share one source shape — a microbenchmark, a dedicated
-	// kernel of any size — keeps V8's full speculation forever. Detection:
-	// sample the source text of minted computed/effect callbacks on a
-	// geometric cadence (mints 1, 2, 4, 7, 11, 17, ... — String(fn) costs
-	// ~0.2us, so sampling stays invisible even in create-heavy loops) and
-	// seed the moment a sampled shape differs from the first one. Source
-	// text is a proxy for V8's SharedFunctionInfo identity: it can
-	// undercount diversity (identical text in two modules), but any
-	// genuinely diverse app trips it within a few samples. Skipped on tiny
-	// configured arenas, where the ~30 transient records would be a real
-	// bite out of capacity (a later sample retries after growth).
-	//
-	// The old node-count trigger (33rd mint, zero-regret plateau [20, 45];
-	// benchs/seedThreshold.mjs) taxed single-shape processes at every size
-	// past the threshold — measured 1.09-1.26x on the crossover families at
-	// 10-100 recomputed nodes. benchs/phaseTransition.mjs still verifies
-	// the insurance: a second workload's shapes must not deoptimize the
-	// first's steady state.
-	// Diversity is tracked per call-site family (SeedFamily): getters flow
-	// through the recompute/cold-eval sites, effect and scope callbacks
-	// through the run sites. A process with one getter shape AND one effect
-	// shape keeps speculation at both — each site only sees its own family.
-	const seedMints = [0, 0];
-	const seedSampleAt = [1, 1]; // next mint (per family) to sample
-	const seedSrcs: (string | undefined)[] = [undefined, undefined];
-	let seeded = false;
-	function maybeSeed(fn: Function, family: number): void {
-		if (seeded || ++seedMints[family] !== seedSampleAt[family]) {
-			return;
-		}
-		if (seeding === 'off') {
-			return;
-		}
-		seedSampleAt[family] += (seedSampleAt[family] >> 1) + 1;
-		const src = String(fn);
-		const seen = seedSrcs[family];
-		if (seen === undefined) {
-			seedSrcs[family] = src;
-			return;
-		}
-		if (src === seen || configuredRecords < 4096) {
-			return;
-		}
-		seeded = true;
-		// The warmup is engine-internal: its transient nodes and effect runs
-		// must not leak into host scheduling or lifecycle callbacks.
-		const savedNotify = shared.hostNotify;
-		const savedStart = shared.hostStart;
-		const savedStop = shared.hostStop;
-		// The trigger can fire inside a running effect or getter (a mint is
-		// what samples shapes): detach tracking so warmup nodes cannot link
-		// themselves into the user's graph as children of the active sub.
-		const prevSub = shared.inner!.setActiveSub(0);
-		shared.hostNotify = undefined;
-		shared.hostStart = undefined;
-		shared.hostStop = undefined;
-		try {
-			seedEngine();
-		} finally {
-			shared.inner!.setActiveSub(prevSub);
-			shared.hostNotify = savedNotify;
-			shared.hostStart = savedStart;
-			shared.hostStop = savedStop;
-		}
-	}
-
-	function seedEngine(): void {
-		const engine = shared.inner!;
-		const s0 = engine.makeSignal(0);
-		const read = s0 as () => number;
-		const c1 = engine.makeComputed(() => read() + 1);
-		const c2 = engine.makeComputed((p) => (p === undefined ? 0 : (p as number)) + read());
-		const c3 = engine.makeComputed(() => {
-			const v = read();
-			return v * 2;
-		});
-		const c4 = engine.makeComputed(() => read() - 1);
-		const c5 = engine.makeComputed(() => (read() & 1) + read());
-		const cs = [c1, c2, c3, c4, c5];
-		const e1 = engine.makeEffect(() => {
-			c1();
-		});
-		const e2 = engine.makeEffect(() => {
-			c2();
-			c3();
-		});
-		const e3 = engine.makeEffect(() => {
-			c4();
-		});
-		const e4 = engine.makeEffect(() => {
-			void c5();
-		});
-		const e5 = engine.makeEffect(() => {
-			for (const c of cs) {
-				c();
-			}
-		});
-		const write = s0 as (v: number) => void;
-		for (let round = 1; round <= 3; round++) {
-			write(round);
-			c1();
-			c2();
-			c3();
-			c4();
-			c5();
-		}
-		e1();
-		e2();
-		e3();
-		e4();
-		e5();
-	}
 
 	// ---- operation boundaries: reclamation + growth ---------------------------
 
@@ -996,20 +707,11 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 	function boundaryWork(): void {
 		shared.boundaryPending = false;
 		// boundaryPending is only ever raised by engine code, so `inner` is
-		// always materialized by the time this runs.
-		if (shared.pendingFnClear.length !== 0) {
-			shared.inner!.sweepFnClears();
-		}
-		// Sweep only while the effect queue is empty: an un-flushed queue (e.g.
-		// a read's shallowPropagate notified an effect after the last flush) may
-		// still reference a disposed record, and freeing it here would let a new
-		// node reuse the id and be run() by the stale queue entry.
+		// always materialized by the time this runs. Host effect queues hold
+		// (id, gen) pairs, so sweeping cannot misdeliver: a recycled id fails
+		// the host's gen check.
 		if (shared.pendingFree.length !== 0) {
-			if (!shared.inner!.state().queuedLength) {
-				shared.inner!.sweepPendingFree();
-			} else {
-				shared.boundaryPending = true; // retry once the queue drains
-			}
+			shared.inner!.sweepPendingFree();
 		}
 	}
 
@@ -1018,17 +720,9 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 	// sites reach the engine with one property load; everything else is cold
 	// delegation through ensureEngine(), which materializes on first use.
 
-	// `system.e` before materialization: creation entry points materialize
-	// and delegate; id-level operations throw (ids can only come from a
-	// materialized system). Handle call sites (read/write/computedRead/
-	// dispose) only ever see the real engine's hidden class — handles
-	// post-date materialization — so their ICs stay monomorphic.
+	// `system.e` before materialization: id-level operations throw (ids can
+	// only come from a materialized system).
 	const bootEngine: ReactiveEngine = {
-		read: uninitialized,
-		write: uninitialized,
-		computedRead: uninitialized,
-		dispose: uninitialized,
-		runEffect: uninitialized,
 		newCustom: uninitialized,
 		free: uninitialized,
 		verify: uninitialized,
@@ -1041,26 +735,10 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		unlink: uninitialized,
 		propagate: uninitialized,
 		shallowPropagate: uninitialized,
-		makeSignal: (initialValue?: unknown) => ensureEngine().makeSignal(initialValue),
-		makeComputed: (getter: (previousValue?: unknown) => unknown) => ensureEngine().makeComputed(getter),
-		makeEffect: (fn: () => (() => void) | void) => ensureEngine().makeEffect(fn),
-		makeScope: (fn: () => void) => ensureEngine().makeScope(fn),
 	};
 
 	const facade: ReactiveSystem = {
 		e: bootEngine,
-		makeSignal(initialValue?: unknown): SignalHandle {
-			return ensureEngine().makeSignal(initialValue);
-		},
-		makeComputed(getter: (previousValue?: unknown) => unknown): () => unknown {
-			return ensureEngine().makeComputed(getter);
-		},
-		makeEffect(fn: () => (() => void) | void): () => void {
-			return ensureEngine().makeEffect(fn);
-		},
-		makeScope(fn: () => void): () => void {
-			return ensureEngine().makeScope(fn);
-		},
 		configure(configureOptions?: ReactiveSystemOptions): void {
 			if (shared.inner !== undefined) {
 				throw new Error('dalien-signals: configure() must be called before the first signal/computed/effect/effectScope is created');
@@ -1073,9 +751,6 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			}
 			if (configureOptions?.update !== undefined) {
 				shared.hostUpdate = configureOptions.update;
-			}
-			if (configureOptions?.seeding !== undefined) {
-				seeding = configureOptions.seeding;
 			}
 			if (configureOptions?.start !== undefined) {
 				shared.hostStart = configureOptions.start;
@@ -1108,7 +783,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 					const state = hostState[id >> 3];
 					hostState[id >> 3] = undefined;
 					if (shared.hostStop !== undefined) {
-						shared.hostStop(id, flags & C.K_SIGNAL ? values[id >> 2] : fns[id >> 3], state);
+						shared.hostStop(id, state);
 					}
 				}
 			}
@@ -1116,38 +791,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			engine.resetState(); // arena fill + counters + shared queue drains
 			shared.boundaryPending = false;
 			shared.growPending = false; // capacity stays at its grown size
-			values.length = 2;
-			values[0] = undefined;
-			values[1] = undefined;
-			fns.length = 1;
-			fns[0] = undefined;
 			shared.registry = mintRegistry();
-		},
-		signal(initialValue?: unknown): number {
-			const engine = ensureEngine();
-			engine.maybeBoundary();
-			return engine.newSignal(initialValue);
-		},
-		computed(getter: (previousValue?: unknown) => unknown): number {
-			const engine = ensureEngine();
-			engine.maybeBoundary();
-			return engine.newComputed(getter);
-		},
-		effect(fn: () => (() => void) | void): number {
-			const engine = ensureEngine();
-			engine.maybeBoundary();
-			return engine.newEffect(fn);
-		},
-		effectScope(fn: () => void): number {
-			const engine = ensureEngine();
-			engine.maybeBoundary();
-			return engine.newScope(fn);
-		},
-		dispose(id: number, gen: number): void {
-			ensureEngine().dispose(id, gen);
-		},
-		runEffect(id: number, gen: number): void {
-			ensureEngine().runEffect(id, gen);
 		},
 		custom(hostBits?: number, owner?: WeakKey): NodeId {
 			const engine = ensureEngine();
@@ -1196,18 +840,6 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		gen(id: number): number {
 			return ensureEngine().buffer()[id + C.GEN];
 		},
-		signalRead(id: number): unknown {
-			return ensureEngine().read(id);
-		},
-		signalWrite(id: number, value: unknown): void {
-			ensureEngine().write(id, value);
-		},
-		computedRead(id: number): unknown {
-			// No boundary on the read path: top-level first-eval read sequences
-			// allocate well under C.REC_SLACK between the surrounding
-			// safe-points; steady-state reads allocate nothing.
-			return ensureEngine().computedRead(id);
-		},
 		trigger(fn: () => void): void {
 			const engine = ensureEngine();
 			engine.maybeBoundary();
@@ -1252,7 +884,6 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 				freeLinkRecords,
 				pendingFreeRecords: shared.pendingFree.length,
 				pendingRegistrations: 0,
-				seeded,
 			};
 		},
 	};
@@ -1292,15 +923,13 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 	let epoch = boot.epoch;
 	let cycle = boot.cycle;
 	let batchDepth = boot.batchDepth;
-	let notifyIndex = boot.notifyIndex;
-	let queuedLength = boot.queuedLength;
 	// Always neutral at a generation boundary:
 	let activeSub = 0;
 	let runDepth = 0;
 	let enterDepth = 0; // live engine frames that captured M; 0 = op boundary
 
 	function snapshot(): EngineState {
-		return { recNext, nodeFreeHead, linkFreeHead, epoch, cycle, batchDepth, notifyIndex, queuedLength };
+		return { recNext, nodeFreeHead, linkFreeHead, epoch, cycle, batchDepth };
 	}
 
 	// Invalidate every quiet-read stamp: any observed change MUST pass here
@@ -1345,31 +974,16 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		M.fill(0, 0, recNext);
 	}
 
-	// Handle literals pass through anon() so they sit in ARGUMENT position —
-	// a `const oper = <arrow>` initializer would be name-inferred and
-	// keepNames-wrapped (the ~120ns/handle tax anonymity exists to avoid).
-	// Identity function; TurboFan inlines it to nothing. Lives inside the
-	// engine so the closed-function property holds.
-	function anon<T>(f: T): T {
-		return f;
-	}
-
 	// Local aliases for the shared side arrays (stable identities): one load
 	// at construction, then context-specialized constants in the hot paths.
-	const vals = shared.values;
-	const fnTab = shared.fns;
-	const queue = shared.queued;
 	const pendingFree = shared.pendingFree;
-	const pendingFnClear = shared.pendingFnClear;
 	const hostState = shared.hostState;
 
 	return {
 		buffer: () => M,
-		computedReadWith,
 		retire,
 		state: snapshot,
 		busy,
-		flush,
 		maybeBoundary,
 		startBatch,
 		endBatch,
@@ -1379,120 +993,25 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		resetGuard,
 		resetState,
 		freeRecordCounts,
-			newSignal,
-			newComputed,
-			newEffect,
-			newScope,
-			makeSignal,
-			makeComputed,
-			makeEffect,
-			makeScope,
-			orphan,
-			clearStamp,
-			read,
-			write,
-			computedRead,
-			run,
-			runEffect,
-			newCustom,
-			free: freeNodeId,
-			verify,
-			verified,
-			beginTracking,
-			endTracking,
-			markDirty,
-			track,
-			link: linkNode,
-			unlink: unlinkEdge,
-			propagate: propagateNode,
-			shallowPropagate: shallowPropagateNode,
-			requeueAbort,
-			dispose,
-			trigger,
-			sweepPendingFree,
-			sweepFnClears,
-		};
+		orphan,
+		clearStamp,
+		newCustom,
+		free: freeNodeId,
+		verify,
+		verified,
+		beginTracking,
+		endTracking,
+		markDirty,
+		track,
+		link: linkNode,
+		unlink: unlinkEdge,
+		propagate: propagateNode,
+		shallowPropagate: shallowPropagateNode,
+		trigger,
+		sweepPendingFree,
+	};
 
-		// ---- user-facing handles ------------------------------------------------
-		// Handles are closures minted INSIDE the engine over `const M`: calling
-		// one reaches the graph with upstream-parity hop count (the closure IS
-		// the operation; read/write/computedRead/dispose below are direct
-		// closure-scope calls that TurboFan statically resolves and inlines).
-		// The closures' statically-inferred names ('signalOper' etc., stored on
-		// the shared function info at zero per-instance cost) are the identity
-		// channel for index.ts's isSignal/isComputed/isEffect/isEffectScope.
-
-		function makeSignal(initialValue: unknown): SignalHandle {
-			maybeBoundary(); // may grow, retiring this engine
-			if (retired) {
-				return shared.inner!.makeSignal(initialValue);
-			}
-			const id = newSignal(initialValue);
-			const oper = anon(((...value: [unknown?]): unknown => {
-				if (value.length) {
-					write(id, value[0]);
-				} else {
-					return read(id);
-				}
-			}) as SignalHandle);
-			if (shared.registry !== undefined) {
-				shared.registry.register(oper, id);
-			}
-			return oper;
-		}
-
-		// The HANDLE owns the getter; the fns column only borrows it while the
-		// computed is subscribed (installed on first tracked read, dropped at
-		// unwatched). Storing it unconditionally would let the column pin the
-		// handle itself through capture cycles (getter -> shared block context
-		// -> handle), making the FinalizationRegistry unable to ever fire —
-		// upstream has no such anchor because its whole graph is GC-traceable.
-		function makeComputed(getter: (previousValue?: unknown) => unknown): () => unknown {
-			shared.maybeSeed(getter, SeedFamily.Getter);
-			maybeBoundary(); // may grow, retiring this engine
-			if (retired) {
-				return shared.inner!.makeComputed(getter);
-			}
-			const id = allocNode(C.K_COMPUTED);
-			// Registration is deferred to the first evaluation (see
-			// coldEvalWith): an unevaluated computed has no value and no
-			// engine-side closure anchor (getters are handle-owned), so there
-			// is nothing GC-visible to reclaim — and create-heavy workloads
-			// skip the registry entirely for computeds they never use. A
-			// dropped never-read computed leaks only its 32-byte arena record.
-			return anon(() => computedReadWith(id, getter));
-		}
-
-		function makeEffect(fn: () => (() => void) | void): () => void {
-			shared.maybeSeed(fn, SeedFamily.Callback);
-			maybeBoundary(); // may grow, retiring this engine
-			if (retired) {
-				return shared.inner!.makeEffect(fn);
-			}
-			const id = newEffect(fn);
-			const gen = M[id + C.GEN];
-			return () => {
-				dispose(id, gen);
-			};
-		}
-
-		function makeScope(fn: () => void): () => void {
-			shared.maybeSeed(fn, SeedFamily.Callback);
-			maybeBoundary(); // may grow, retiring this engine
-			if (retired) {
-				return shared.inner!.makeScope(fn);
-			}
-			const id = newScope(fn);
-			const gen = M[id + C.GEN];
-			// disposeScope wraps dispose: the distinct callee NAME keeps this
-			// literal's source text different from makeEffect's under every
-			// transform (their kinds are told apart by source, not by brand).
-			return () => {
-				disposeScope(id, gen);
-			};
-		}
-
-		// ---- allocation --------------------------------------------------------
+	// ---- allocation ----------------------------------------------------------
 
 		function busy(): boolean {
 			return enterDepth !== 0;
@@ -1512,7 +1031,10 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 				return;
 			}
 			if (!--batchDepth) {
-				flush();
+				const hostFlush = shared.hostFlush;
+				if (hostFlush !== undefined) {
+					hostFlush();
+				}
 			}
 		}
 
@@ -1542,50 +1064,8 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			if (shared.growPending) {
 				shared.grow();
 			}
-			if (shared.boundaryPending
-				&& (pendingFree.length > 8192 || pendingFnClear.length > 8192)) {
+			if (shared.boundaryPending && pendingFree.length > 8192) {
 				shared.boundaryWork();
-			}
-		}
-
-		function flush(): void {
-			if (retired) {
-				shared.inner!.flush();
-				return;
-			}
-			// Boundary-lite: record reclamation only BEFORE the flush loop, not
-			// between effects (a mid-flush sweep could recycle an id the queue
-			// still holds).
-			maybeBoundary();
-			if (retired) {
-				// maybeBoundary grew: the successor inherited the queue indices.
-				shared.inner!.flush();
-				return;
-			}
-			try {
-				while (notifyIndex < queuedLength) {
-					// Effects mint nodes; between two runs no frame holds M, so
-					// a long flush can grow here instead of risking hard
-					// exhaustion. The successor inherits the queue indices.
-					if (shared.growPending && !enterDepth) {
-						shared.grow();
-						if (retired) {
-							shared.inner!.flush();
-							return;
-						}
-					}
-					const e = queue[notifyIndex];
-					queue[notifyIndex++] = 0;
-					run(e);
-				}
-			} finally {
-				while (notifyIndex < queuedLength) {
-					const e = queue[notifyIndex];
-					queue[notifyIndex++] = 0;
-					requeueAbort(e);
-				}
-				notifyIndex = 0;
-				queuedLength = 0;
 			}
 		}
 
@@ -1603,11 +1083,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			recNext = 8;
 			nodeFreeHead = 0;
 			linkFreeHead = 0;
-			notifyIndex = 0;
-			queuedLength = 0;
-			queue.length = 0;
 			pendingFree.length = 0;
-			pendingFnClear.length = 0;
 			// Epoch and link-cycle counters keep counting: fresh records hold
 			// zeroed stamps/versions, which can never equal a live counter.
 		}
@@ -1622,7 +1098,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			// nature (MUTABLE for value nodes so walks update them and waves
 			// traverse them; WATCHING for effect-likes so notify fires;
 			// neither for wave-opaque bookkeeping nodes).
-			return allocNode(C.K_CUSTOM | (hostBits & (C.HOST_MASK | C.PUBLIC_MASK)));
+			return allocNode(hostBits & (C.HOST_MASK | C.PUBLIC_MASK));
 		}
 
 		// Generic, gen-guarded free for ANY node id: the explicit-lifetime
@@ -1637,13 +1113,8 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 				return; // already reclaimed (and possibly reused)
 			}
 			const flags = M[id + C.FLAGS];
-			if (!(flags & C.KIND_MASK)) {
+			if (!(flags & C.LIVE)) {
 				return; // already freed
-			}
-			if (flags & (C.K_EFFECT | C.K_SCOPE)) {
-				disposeInner(id);
-				maybeBoundary();
-				return;
 			}
 			if (flags & C.HOST_STARTED) {
 				hostStopNode(id);
@@ -1655,9 +1126,6 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 				unlink(sub);
 				sub = M[id + C.SUBS];
 			}
-			vals[id >> 2] = undefined;
-			vals[(id >> 2) + 1] = undefined;
-			fnTab[id >> 3] = undefined;
 			pendingFree.push(id);
 			shared.boundaryPending = true;
 			shared.scheduleMaintenance();
@@ -1765,18 +1233,8 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 					shared.growPending = true;
 					shared.scheduleMaintenance();
 				}
-				// Size the side columns for a fresh record only (recycled ids
-				// are already inside the sized region). push keeps the arrays
-				// PACKED; a store past length would go HOLEY permanently.
-				const v = id >> 2;
-				while (vals.length <= v + 1) {
-					vals.push(undefined);
-				}
-				while (fnTab.length <= id >> 3) {
-					fnTab.push(undefined);
-				}
 			}
-			M[id + C.FLAGS] = flags;
+			M[id + C.FLAGS] = flags | C.LIVE;
 			return id;
 		}
 
@@ -1787,10 +1245,6 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			M[id + C.SUBS] = 0;
 			M[id + C.SUBS_TAIL] = 0;
 			++M[id + C.GEN];
-			const v = id >> 2;
-			vals[v] = undefined;
-			vals[v + 1] = undefined;
-			fnTab[id >> 3] = undefined;
 			M[id + C.DEPS] = nodeFreeHead;
 			nodeFreeHead = id;
 		}
@@ -1804,29 +1258,6 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 				freeNode(pendingFree[i]);
 			}
 			pendingFree.length = 0;
-		}
-
-		// Return borrowed getters of still-unsubscribed computeds to their
-		// handles. Safe at any boundary: no walk is live, and a re-subscribed
-		// or recycled record is skipped (or, for a make* computed, harmlessly
-		// re-installed on its next tracked read).
-		function sweepFnClears(): void {
-			if (retired) {
-				shared.inner!.sweepFnClears();
-				return;
-			}
-			for (let i = 0; i < pendingFnClear.length; ++i) {
-				const id = pendingFnClear[i];
-				const flags = M[id + C.FLAGS];
-				if (
-					(flags & (C.K_COMPUTED | C.FN_INSTALLED)) === (C.K_COMPUTED | C.FN_INSTALLED)
-					&& !M[id + C.SUBS]
-				) {
-					fnTab[id >> 3] = undefined;
-					M[id + C.FLAGS] = flags & ~C.FN_INSTALLED;
-				}
-			}
-			pendingFnClear.length = 0;
 		}
 
 		function allocLink(): number {
@@ -1978,8 +1409,8 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			if (subs !== 0) {
 				bumpEpoch();
 				propagate(subs, innerWrite ?? runDepth !== 0);
-				if (!batchDepth) {
-					flush();
+				if (!batchDepth && shared.hostFlush !== undefined) {
+					shared.hostFlush();
 				}
 			}
 		}
@@ -1993,8 +1424,8 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			if (subs !== 0) {
 				bumpEpoch();
 				shallowPropagate(subs);
-				if (!batchDepth) {
-					flush();
+				if (!batchDepth && shared.hostFlush !== undefined) {
+					shared.hostFlush();
 				}
 			}
 		}
@@ -2009,10 +1440,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 				return;
 			}
 			M[id + C.FLAGS] = flags | C.HOST_STARTED;
-			hostState[id >> 3] = shared.hostStart!(
-				id,
-				flags & C.K_SIGNAL ? vals[id >> 2] : fnTab[id >> 3],
-			);
+			hostState[id >> 3] = shared.hostStart!(id);
 		}
 
 		function hostStopNode(id: number): void {
@@ -2021,7 +1449,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			const state = hostState[id >> 3];
 			hostState[id >> 3] = undefined;
 			if (shared.hostStop !== undefined) {
-				shared.hostStop(id, flags & C.K_SIGNAL ? vals[id >> 2] : fnTab[id >> 3], state);
+				shared.hostStop(id, state);
 			}
 		}
 
@@ -2312,76 +1740,28 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 
 		// ---- node behaviors (upstream index.ts, transliterated) ---------------
 
+		// The walks land here for every MUTABLE|DIRTY node: resolution is the
+		// host's (see ReactiveSystemOptions.update). Stamped with the epoch
+		// captured BEFORE the host code runs: a write from inside it moves
+		// the epoch past entryEpoch, so the stamp can only miss, never lie.
 		function update(node: number): boolean {
 			const flags = M[node + C.FLAGS];
-			if (flags & C.K_COMPUTED) {
-				return updateComputed(node);
-			}
-			if (flags & C.K_SIGNAL) {
-				return updateSignal(node);
-			}
-			if (flags & C.K_CUSTOM) {
-				return updateCustom(node, flags);
-			}
-			M[node + C.FLAGS] = (flags & C.KIND_MASK) | C.MUTABLE;
-			return true;
-		}
-
-		// Host-kind resolution (see ReactiveSystemOptions.update). Stamped
-		// with the epoch captured BEFORE the host code runs: a write from
-		// inside it moves the epoch past entryEpoch, so the stamp can only
-		// miss, never lie — the same argument computedRead makes.
-		function updateCustom(node: number, flags: number): boolean {
 			const entryEpoch = epoch;
-			M[node + C.FLAGS] = (flags & (C.KIND_MASK | C.WATCHING | C.STICKY)) | C.MUTABLE;
-			const changed = shared.hostUpdate!(node, flags);
+			M[node + C.FLAGS] = (flags & (C.WATCHING | C.STICKY | C.LIVE | C.PUBLIC_MASK & ~C.DIRTY & ~C.PENDING)) | C.MUTABLE;
+			const changed = shared.hostUpdate === undefined ? true : shared.hostUpdate(node, flags);
 			D[(node >> 1) + 3] = entryEpoch;
 			return changed;
 		}
 
+		// Effect scheduling is the host's (see ReactiveSystemOptions.notify):
+		// the propagation ladder lands here for WATCHING nodes; clearing the
+		// bit is the dedup (one notification until the host re-arms it).
 		function notify(e: number): void {
-			let insertIndex = queuedLength;
-			const firstInsertedIndex = insertIndex;
-
-			do {
-				queue[insertIndex++] = e;
-				M[e + C.FLAGS] &= ~C.WATCHING;
-				const subs = M[e + C.SUBS];
-				e = subs !== 0 ? M[subs + C.SUB] : 0;
-				if (!e || !(M[e + C.FLAGS] & C.WATCHING)) {
-					break;
-				}
-			} while (true);
-
-			queuedLength = insertIndex;
-
-			// The parent chain was appended child-first: reverse the inserted
-			// segment in place so outer effects run before inner.
-			let left = firstInsertedIndex;
-			while (left < --insertIndex) {
-				const tmp = queue[left];
-				queue[left++] = queue[insertIndex];
-				queue[insertIndex] = tmp;
+			M[e + C.FLAGS] &= ~C.WATCHING;
+			const hostNotify = shared.hostNotify;
+			if (hostNotify !== undefined) {
+				hostNotify(e, M[e + C.GEN]);
 			}
-
-			// Host scheduler: hand over the ordered segment instead of keeping
-			// it queued. Out of line to keep notify (called from the propagate
-			// ladder) inside its bytecode budget.
-			if (shared.hostNotify !== undefined) {
-				notifyHost(firstInsertedIndex);
-			}
-		}
-
-		// The flags bookkeeping notify already did (WATCHING cleared) is the
-		// same dedup the built-in queue relies on; run() restores it.
-		function notifyHost(first: number): void {
-			const host = shared.hostNotify!;
-			for (let i = first; i < queuedLength; ++i) {
-				const id = queue[i];
-				queue[i] = 0;
-				host(id, M[id + C.GEN]);
-			}
-			queuedLength = first;
 		}
 
 		function unwatched(node: number): void {
@@ -2391,228 +1771,13 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 					return; // stop() re-subscribed the node; it is watched again
 				}
 			}
-			const flags = M[node + C.FLAGS];
-			if (flags & C.K_COMPUTED) {
-				// Alien recomputes an unwatched computed on its next read (it
-				// is marked Dirty without any write); drop the stamp so the
-				// fast path cannot skip that recompute.
-				D[(node >> 1) + 3] = 0;
-				if (flags & C.ORPHANED) {
-					reclaimOrphan(node); // handle already collected; nothing can re-subscribe
-				} else {
-					if (flags & C.FN_INSTALLED) {
-						// Schedule the borrowed getter's return to its owning
-						// handle (boundary-deferred; see pendingFnClear).
-						pendingFnClear.push(node);
-						shared.boundaryPending = true;
-						shared.scheduleMaintenance();
-					}
-					if (M[node + C.DEPS_TAIL] !== 0) {
-						M[node + C.FLAGS] = C.K_COMPUTED | C.MUTABLE | C.DIRTY | (flags & C.FN_INSTALLED);
-						disposeAllDepsInReverse(node);
-					}
-				}
-			} else if (flags & C.K_SIGNAL) {
-				if (flags & C.ORPHANED) {
-					reclaimOrphan(node);
-				}
-			} else if (flags & (C.K_EFFECT | C.K_SCOPE)) {
-				disposeInner(node);
+			// Kill the quiet-read stamp: an unwatched node no longer receives
+			// invalidations, so its cached verification must not be trusted
+			// if something re-subscribes later.
+			D[(node >> 1) + 3] = 0;
+			if (M[node + C.FLAGS] & C.ORPHANED) {
+				reclaimOrphan(node); // owner already collected; nothing can re-subscribe
 			}
-		}
-
-		// Upstream's HasChildEffect slow path in updateComputed/run: unlink
-		// every dep that is not a signal/computed (child effects/scopes), in
-		// reverse, so their disposal (and cleanups) runs LIFO.
-		function unlinkChildEffects(sub: number): void {
-			let cur = M[sub + C.DEPS_TAIL];
-			while (cur !== 0) {
-				const prev = M[cur + C.PREV_DEP];
-				const dep = M[cur + C.DEP];
-				if (!(M[dep + C.FLAGS] & (C.K_COMPUTED | C.K_SIGNAL))) {
-					unlink(cur, sub);
-				}
-				cur = prev;
-			}
-		}
-
-		function updateComputed(c: number, getter?: (previousValue?: unknown) => unknown): boolean {
-			const entryFlags = M[c + C.FLAGS];
-			if (entryFlags & C.HAS_CHILD_EFFECT) {
-				unlinkChildEffects(c);
-			}
-			M[c + C.DEPS_TAIL] = 0;
-			M[c + C.FLAGS] = C.K_COMPUTED | C.MUTABLE | C.RECURSED_CHECK | (entryFlags & (C.FN_INSTALLED | C.STICKY));
-			const prevSub = activeSub;
-			activeSub = c;
-			++enterDepth;
-			try {
-				++cycle;
-				const v = c >> 2;
-				const oldValue = vals[v];
-				const fn = getter !== undefined ? getter : fnTab[c >> 3] as (previousValue?: unknown) => unknown;
-				if (fn === undefined) {
-					// Reachable only through an upstream-style stale walk: the
-					// algorithm may read `nextDep` off links unlinked earlier in
-					// the same walk (see freeLink), and such a dead-end can name
-					// an unwatched computed whose borrowed getter was already
-					// returned to its handle. Its result cannot matter (no
-					// subscribers); report "unchanged" like upstream's cutoff.
-					return false;
-				}
-				return oldValue !== (vals[v] = fn(oldValue));
-			} finally {
-				--enterDepth;
-				activeSub = prevSub;
-				M[c + C.FLAGS] &= ~C.RECURSED_CHECK;
-				purgeDeps(c);
-			}
-		}
-
-		function updateSignal(s: number): boolean {
-			// Engine-internal sticky bits survive the state rewrite.
-			M[s + C.FLAGS] = C.K_SIGNAL | C.MUTABLE | (M[s + C.FLAGS] & C.STICKY);
-			const v = s >> 2;
-			return vals[v] !== (vals[v] = vals[v + 1]);
-		}
-
-		function run(e: number): void {
-			const flags = M[e + C.FLAGS];
-			// Kind-bit piggyback: kindless means disposed-while-queued (skip,
-			// as before) or a retired engine's zeroed arena (forward).
-			if (!(flags & C.KIND_MASK)) {
-				if (retired) {
-					shared.inner!.run(e);
-				}
-				return;
-			}
-			if (
-				flags & C.DIRTY
-				|| (flags & C.PENDING && checkDirty(M[e + C.DEPS], e))
-			) {
-				if (flags & C.HAS_CHILD_EFFECT) {
-					unlinkChildEffects(e);
-				}
-				const cv = (e >> 2) + 1;
-				if (vals[cv]) {
-					runCleanup(e);
-					if (!M[e + C.FLAGS]) {
-						return; // disposed by its own cleanup
-					}
-				}
-				M[e + C.DEPS_TAIL] = 0;
-				M[e + C.FLAGS] = C.K_EFFECT | C.WATCHING | C.RECURSED_CHECK | (M[e + C.FLAGS] & C.STICKY);
-				const prevSub = activeSub;
-				activeSub = e;
-				++enterDepth;
-				try {
-					++cycle;
-					++runDepth;
-					vals[cv] = (fnTab[e >> 3] as () => (() => void) | void)();
-				} finally {
-					--runDepth;
-					--enterDepth;
-					activeSub = prevSub;
-					M[e + C.FLAGS] &= ~C.RECURSED_CHECK;
-					purgeDeps(e);
-				}
-			} else if (M[e + C.DEPS] !== 0) {
-				M[e + C.FLAGS] = C.K_EFFECT | C.WATCHING | (flags & (C.HAS_CHILD_EFFECT | C.STICKY));
-			}
-		}
-
-		// flush() abort path: re-arm effects still queued after a throw.
-		// Host-scheduler counterpart of dispose(id, gen): run a notified
-		// effect if its record generation still matches. A stale id (the
-		// effect was disposed, its record possibly recycled) is a no-op, so
-		// host queues need no cleanup when effects die.
-		function runEffect(e: number, gen: number): void {
-			maybeBoundary(); // growth-safe point between host-scheduled runs
-			if (retired) {
-				shared.inner!.runEffect(e, gen);
-				return;
-			}
-			if (M[e + C.GEN] !== gen) {
-				return;
-			}
-			run(e);
-		}
-
-		function requeueAbort(e: number): void {
-			if (M[e + C.FLAGS] & C.KIND_MASK) {
-				M[e + C.FLAGS] |= C.WATCHING | C.RECURSED;
-			} else if (retired) {
-				shared.inner!.requeueAbort(e);
-			}
-		}
-
-		function runCleanup(e: number): void {
-			const cv = (e >> 2) + 1;
-			const cleanup = vals[cv] as () => void;
-			vals[cv] = undefined;
-			const prevSub = activeSub;
-			activeSub = 0;
-			++enterDepth;
-			try {
-				cleanup();
-			} finally {
-				--enterDepth;
-				activeSub = prevSub;
-			}
-		}
-
-		// effectOper + effectScopeOper: dispose an effect (runs cleanup) or
-		// scope. Children (linked as deps) dispose first via the reverse deps
-		// walk -> unwatched cascade, giving depth-first LIFO cleanup order.
-		function disposeInner(e: number): void {
-			const flags = M[e + C.FLAGS];
-			if (!(flags & C.KIND_MASK)) {
-				return; // already disposed
-			}
-			if (flags & C.HOST_STARTED) {
-				hostStopNode(e); // a watched child effect: stop before teardown
-			}
-			M[e + C.FLAGS] = 0;
-			disposeAllDepsInReverse(e);
-			const sub = M[e + C.SUBS];
-			if (sub !== 0) {
-				unlink(sub);
-			}
-			if (flags & C.K_EFFECT && vals[(e >> 2) + 1]) {
-				runCleanup(e);
-			}
-			// Release the GC payload NOW (nothing reads it once flags are 0):
-			// waiting for the deferred sweep would keep the fn closure alive
-			// past the current task and promote it out of the nursery.
-			// (vals[e >> 2] stays: effects never write the current-value slot;
-			// freeNode clears it for the record's next occupant.)
-			fnTab[e >> 3] = undefined;
-			vals[(e >> 2) + 1] = undefined;
-			// Deferred reclamation: the queue (or an in-flight walk) may still
-			// hold this id; the record is swept back onto the free list at the
-			// next operation boundary.
-			pendingFree.push(e);
-			shared.boundaryPending = true;
-			shared.scheduleMaintenance();
-		}
-
-		function dispose(e: number, gen: number): void {
-			if (retired) {
-				shared.inner!.dispose(e, gen);
-				return;
-			}
-			if (M[e + C.GEN] !== gen) {
-				return; // record already reclaimed (and possibly reused)
-			}
-			disposeInner(e);
-			maybeBoundary();
-		}
-
-		// Distinctly-named wrapper so effect and scope handle literals differ
-		// textually (see makeScope). Declared (hoisted) — the engine's return
-		// object is built before this line would run as a statement.
-		function disposeScope(e: number, gen: number): void {
-			dispose(e, gen);
 		}
 
 		// Invalidate the quiet-read stamp (public flag surgery via
@@ -2636,7 +1801,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 				return;
 			}
 			const flags = M[id + C.FLAGS];
-			if (!(flags & (C.K_SIGNAL | C.K_COMPUTED))) {
+			if (!(flags & C.LIVE)) {
 				return; // already reclaimed
 			}
 			if (M[id + C.SUBS] !== 0) {
@@ -2676,295 +1841,6 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 
 		// ---- operations dispatched from the public system object --------------
 
-		function newSignal(value: unknown): number {
-			if (retired) {
-				return shared.inner!.newSignal(value);
-			}
-			const id = allocNode(C.K_SIGNAL | C.MUTABLE);
-			const v = id >> 2;
-			vals[v] = value; // currentValue
-			vals[v + 1] = value; // pendingValue
-			return id;
-		}
-
-		function newComputed(getter: (previousValue?: unknown) => unknown): number {
-			if (retired) {
-				return shared.inner!.newComputed(getter);
-			}
-			shared.maybeSeed(getter, SeedFamily.Getter);
-			const id = allocNode(C.K_COMPUTED);
-			fnTab[id >> 3] = getter;
-			return id;
-		}
-
-		function newEffect(fn: () => (() => void) | void): number {
-			if (retired) {
-				return shared.inner!.newEffect(fn);
-			}
-			shared.maybeSeed(fn, SeedFamily.Callback);
-			const e = allocNode(C.K_EFFECT | C.WATCHING | C.RECURSED_CHECK);
-			fnTab[e >> 3] = fn;
-			const prevSub = activeSub;
-			activeSub = e;
-			if (prevSub !== 0) {
-				link(e, prevSub, 0);
-				M[prevSub + C.FLAGS] |= C.HAS_CHILD_EFFECT;
-			}
-			++enterDepth;
-			try {
-				++runDepth;
-				vals[(e >> 2) + 1] = fn();
-			} finally {
-				--runDepth;
-				--enterDepth;
-				activeSub = prevSub;
-				M[e + C.FLAGS] &= ~C.RECURSED_CHECK;
-			}
-			return e;
-		}
-
-		function newScope(fn: () => void): number {
-			if (retired) {
-				return shared.inner!.newScope(fn);
-			}
-			shared.maybeSeed(fn, SeedFamily.Callback);
-			const e = allocNode(C.K_SCOPE | C.MUTABLE);
-			const prevSub = activeSub;
-			activeSub = e;
-			if (prevSub !== 0) {
-				link(e, prevSub, 0);
-				M[prevSub + C.FLAGS] |= C.HAS_CHILD_EFFECT;
-			}
-			++enterDepth;
-			try {
-				fn();
-			} finally {
-				--enterDepth;
-				activeSub = prevSub;
-			}
-			return e;
-		}
-
-		// signalOper read path. The retired check piggybacks on the kind bits
-		// of the flags word the function loads anyway: a live signal always
-		// carries K_SIGNAL, a retired engine's arena is zeroed, so the cold
-		// branch is the only place that pays the `retired` context load.
-		function read(s: number): unknown {
-			const flags = M[s + C.FLAGS];
-			if (!(flags & C.K_SIGNAL)) {
-				if (retired) {
-					return shared.inner!.read(s);
-				}
-				return vals[s >> 2]; // freed record: contract-violating read, kept harmless
-			}
-			if (flags & C.DIRTY) {
-				if (updateSignal(s)) {
-					const subs = M[s + C.SUBS];
-					if (subs !== 0) {
-						shallowPropagate(subs);
-					}
-				}
-			}
-			if (activeSub !== 0) {
-				link(s, activeSub, cycle);
-			}
-			return vals[s >> 2];
-		}
-
-		// signalOper write path. flush() (factory-level) starts with a boundary
-		// check, so growth still happens between queued effects at top level.
-		function write(s: number, value: unknown): void {
-			// Same kind-bit piggyback as read(): the staging store below must
-			// not run for a retired engine (vals is the shared current truth).
-			const flags = M[s + C.FLAGS];
-			if (!(flags & C.K_SIGNAL)) {
-				if (retired) {
-					shared.inner!.write(s, value);
-				}
-				return; // freed record: contract-violating write, dropped
-			}
-			const p = (s >> 2) + 1;
-			if (vals[p] !== (vals[p] = value)) {
-				// Engine-internal sticky bits survive the state rewrite.
-				M[s + C.FLAGS] = C.K_SIGNAL | C.MUTABLE | C.DIRTY | (flags & C.STICKY);
-				const subs = M[s + C.SUBS];
-				if (subs !== 0) {
-					// Stamps only exist on subscribed-or-once-subscribed
-					// computeds, which hold links; an unobserved write can
-					// invalidate no stamp, so the epoch only moves here.
-					++epoch;
-					propagate(subs, runDepth !== 0);
-					if (!batchDepth) {
-						flush();
-					}
-				}
-			}
-		}
-
-		// computedOper for id-level callers: their getter is installed
-		// permanently by newComputed, so no evaluator ever needs carrying.
-		function computedRead(c: number): unknown {
-			if (D[(c >> 1) + 3] === epoch) {
-				const fastSub = activeSub;
-				if (fastSub !== 0) {
-					link(c, fastSub, cycle);
-				}
-				return vals[c >> 2];
-			}
-			// Guard-free fast path above: a retired engine's arena is zeroed,
-			// so its stamps can never hit and every call lands here.
-			if (retired) {
-				return shared.inner!.computedRead(c);
-			}
-			// Stamp with the epoch captured BEFORE the body: if user code run
-			// during verification writes a signal (bumping the epoch), the
-			// stamp is already stale and the next read re-verifies.
-			const entryEpoch = epoch;
-			const flags = M[c + C.FLAGS];
-			if (
-				flags & C.DIRTY
-				|| (
-					flags & C.PENDING
-					&& (
-						checkDirty(M[c + C.DEPS], c)
-						|| (M[c + C.FLAGS] = flags & ~C.PENDING, false)
-					)
-				)
-			) {
-				if (updateComputed(c)) {
-					const subs = M[c + C.SUBS];
-					if (subs !== 0) {
-						shallowPropagate(subs);
-					}
-				}
-			} else if (flags === C.K_COMPUTED) { // upstream `!flags`: never evaluated
-				coldEvalInstalled(c);
-			}
-			const sub = activeSub;
-			if (sub !== 0) {
-				link(c, sub, cycle);
-			}
-			// Stamp tracked reads too: during a flush the epoch is stable
-			// (the triggering write already bumped it), so every node the
-			// flush verifies or recomputes becomes a same-epoch fast hit for
-			// the rest of the flush (diamond re-reads) and for any reads
-			// before the next write. The entry-captured epoch keeps this
-			// safe: a write from user code during verification moved the
-			// epoch past `lo/hi`, so the stamp can only miss, never lie.
-			D[(c >> 1) + 3] = entryEpoch;
-			return vals[c >> 2];
-		}
-
-		// First evaluation with the handle-owned getter. Out of line: cold,
-		// and it keeps computedReadWith under the inline budget.
-		//
-		// This is also where the computed joins the FinalizationRegistry.
-		// It runs exactly once per node (`flags === K_COMPUTED` is only true
-		// before the first evaluation; every later flag write sets MUTABLE),
-		// so the hot read path carries no registration check, and computeds
-		// that are created but never read cost no registry cell at all. The
-		// weak target is the getter rather than the handle — the handle owns
-		// the only lasting strong ref to it — so the record is reclaimed once
-		// the getter is unreachable. A caller who keeps the getter alive after
-		// dropping the handle keeps the record (and its cached value) alive
-		// with it; that memory is still reachable from the caller's own
-		// closure, not leaked.
-		function coldEvalWith(c: number, getter: (previousValue?: unknown) => unknown): void {
-			shared.registry!.register(getter, c);
-			M[c + C.FLAGS] = C.K_COMPUTED | C.MUTABLE | C.RECURSED_CHECK | (M[c + C.FLAGS] & C.STICKY);
-			const prevSub = activeSub;
-			activeSub = c;
-			++enterDepth;
-			try {
-				vals[c >> 2] = getter();
-			} finally {
-				--enterDepth;
-				activeSub = prevSub;
-				M[c + C.FLAGS] &= ~C.RECURSED_CHECK;
-			}
-		}
-
-		// First evaluation of a computed whose getter is installed (id-level
-		// computeds). Out of line: cold, and it keeps computedRead under the
-		// inline budget.
-		function coldEvalInstalled(c: number): void {
-			M[c + C.FLAGS] = C.K_COMPUTED | C.MUTABLE | C.RECURSED_CHECK | (M[c + C.FLAGS] & C.STICKY);
-			const prevSub = activeSub;
-			activeSub = c;
-			++enterDepth;
-			try {
-				vals[c >> 2] = (fnTab[c >> 3] as () => unknown)();
-			} finally {
-				--enterDepth;
-				activeSub = prevSub;
-				M[c + C.FLAGS] &= ~C.RECURSED_CHECK;
-			}
-		}
-
-		// Slow twin of computedRead for the sentinel paths: carries the
-		// handle-owned evaluator and installs it on subscription.
-		function computedReadWith(c: number, getter: (previousValue?: unknown) => unknown): unknown {
-			if (D[(c >> 1) + 3] === epoch) {
-				const fastSub = activeSub;
-				if (fastSub !== 0) {
-					link(c, fastSub, cycle);
-					// A first subscription can arrive THROUGH this fast path
-					// (the node was evaluated by an untracked read, stamped,
-					// and nothing has been written since). The engine must
-					// borrow the getter here exactly as the slow tail does,
-					// or the node is subscribed with no evaluator installed
-					// and later propagation walks cannot update it.
-					if (!(M[c + C.FLAGS] & C.FN_INSTALLED)) {
-						fnTab[c >> 3] = getter;
-						M[c + C.FLAGS] |= C.FN_INSTALLED;
-					}
-				}
-				return vals[c >> 2];
-			}
-			// Guard-free fast path above: a retired engine's arena is zeroed,
-			// so its stamps can never hit and every call lands here.
-			if (retired) {
-				return shared.inner!.computedReadWith(c, getter);
-			}
-			const entryEpoch = epoch;
-			const flags = M[c + C.FLAGS];
-			if (
-				flags & C.DIRTY
-				|| (
-					flags & C.PENDING
-					&& (
-						checkDirty(M[c + C.DEPS], c)
-						|| (M[c + C.FLAGS] = flags & ~C.PENDING, false)
-					)
-				)
-			) {
-				if (updateComputed(c, getter)) {
-					const subs = M[c + C.SUBS];
-					if (subs !== 0) {
-						shallowPropagate(subs);
-					}
-				}
-			} else if (flags === C.K_COMPUTED) { // upstream `!flags`: never evaluated
-				coldEvalWith(c, getter);
-			}
-			const sub = activeSub;
-			if (sub !== 0) {
-				link(c, sub, cycle);
-				// First subscription borrows the handle's getter into the fns
-				// column so graph walks (checkDirty -> update) can evaluate
-				// this node without the handle on the stack. Dropped again at
-				// unwatched. Subscribed implies installed.
-				if (!(M[c + C.FLAGS] & C.FN_INSTALLED)) {
-					fnTab[c >> 3] = getter;
-					M[c + C.FLAGS] |= C.FN_INSTALLED;
-				}
-			}
-			// Stamp tracked reads too — see computedRead for the epoch
-			// argument; the write->flush->read pattern consumes these stamps.
-			D[(c >> 1) + 3] = entryEpoch;
-			return vals[c >> 2];
-		}
-
 		// Upstream index.ts trigger(): run `fn` under a temporary watching sub,
 		// then re-notify every dependency it read as if written. The temp node
 		// is kindless: it is never notified (the propagate ladder masks its
@@ -3001,7 +1877,10 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 				shared.scheduleMaintenance();
 				--enterDepth;
 				if (!--batchDepth) {
-					flush();
+					const hostFlush = shared.hostFlush;
+					if (hostFlush !== undefined) {
+						hostFlush();
+					}
 				}
 			}
 		}
