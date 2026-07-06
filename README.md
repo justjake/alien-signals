@@ -45,6 +45,34 @@ classDiagram
 
 Node records (signals, computeds, effects, scopes) and link records (the edges between them) interleave in the same plane, handed out by one bump pointer and recycled through free lists. Ids are pre-multiplied (`id = recordIndex × 8`) so every field access is a single indexed load, `M[id + SLOT]`, and record 0 is burned as *null* so every "is there a link?" check is `x !== 0`. Two side arrays indexed by the same id hold the only GC-visible parts: `values` (two slots per record — current value, plus staged value or effect cleanup) and `fns` (the getter or callback). The graph itself is invisible to the garbage collector.
 
+The `FLAGS` slot packs a node's state and its type into one bitfield:
+
+```mermaid
+---
+config:
+  packet:
+    bitsPerRow: 4
+    bitWidth: 150
+---
+packet-beta
+0: "MUTABLE"
+1: "WATCHING"
+2: "RECURSED_CHECK"
+3: "RECURSED"
+4: "DIRTY"
+5: "PENDING"
+6: "HAS_CHILD_EFFECT"
+7: "K_SIGNAL"
+8: "K_COMPUTED"
+9: "K_EFFECT"
+10: "K_SCOPE"
+11: "ORPHANED"
+12: "FN_INSTALLED"
+13-15: "unused"
+```
+
+Bits 0–5 are upstream's `ReactiveFlags`, values unchanged — the push-pull protocol below runs on `DIRTY` and `PENDING`. Bits 7–10 say which primitive the record is, so type dispatch (upstream checks like `'getter' in node`) becomes a bit test on a word already loaded for the state check. Bits 11–12 are engine-internal lifecycle: the record's handle was garbage-collected while still subscribed, and a handle-owned getter is currently installed in `fns`. Bits 0–6 (`PUBLIC_MASK`) are what `getActiveSub()` exposes; everything above — and bits 16–31 — is engine-owned.
+
 Here's how our modified algorithm works:
 
 **The primitives.** A **signal** is a box holding a value: `s()` reads it, `s(1)` writes it. A **computed** derives a new value from whatever it reads, and caches the result. An **effect** is a callback that does something visible — render, log, write — and must re-run when a value it read changes. While a computed or effect runs, the engine records an edge from everything it reads: dependencies are discovered, never declared. The records above are these nodes and edges:
