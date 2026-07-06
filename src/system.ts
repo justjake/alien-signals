@@ -488,66 +488,77 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			effectSrc = String(engine.makeEffect(noop));
 			scopeSrc = String(engine.makeScope(noop));
 		}
-		// Seed the engine's user-callback call sites (cold eval, recompute,
-		// effect run) past V8's megamorphic threshold (>4 shapes) before any
-		// real work. When such a site has seen four or fewer shapes, V8
-		// speculates on the exact call targets and compiles them inline; the
-		// first workload that pushes the site past the threshold then
-		// deoptimizes the engine's hot functions and pays reoptimization
-		// cycles mid-run (measured at 20-35% on pull-heavy graphs when
-		// several distinct workloads share one process). Generic-from-birth
-		// call sites cost a hair per call but keep performance flat as an
-		// application's callback shapes diversify. The handles are dropped
-		// immediately and self-reclaim through the registry. Skipped on tiny
-		// configured planes (tests, embedded uses), where the ~30 transient
-		// records would be a real bite out of capacity and a single-workload
-		// process is the norm anyway.
-		if (configuredRecords >= 4096) {
-			const s0 = engine.makeSignal(0);
-			const read = s0 as () => number;
-			const c1 = engine.makeComputed(() => read() + 1);
-			const c2 = engine.makeComputed((p) => (p === undefined ? 0 : (p as number)) + read());
-			const c3 = engine.makeComputed(() => {
-				const v = read();
-				return v * 2;
-			});
-			const c4 = engine.makeComputed(() => read() - 1);
-			const c5 = engine.makeComputed(() => (read() & 1) + read());
-			const cs = [c1, c2, c3, c4, c5];
-			const e1 = engine.makeEffect(() => {
-				c1();
-			});
-			const e2 = engine.makeEffect(() => {
-				c2();
-				c3();
-			});
-			const e3 = engine.makeEffect(() => {
-				c4();
-			});
-			const e4 = engine.makeEffect(() => {
-				void c5();
-			});
-			const e5 = engine.makeEffect(() => {
-				for (const c of cs) {
-					c();
-				}
-			});
-			const write = s0 as (v: number) => void;
-			for (let round = 1; round <= 3; round++) {
-				write(round);
-				c1();
-				c2();
-				c3();
-				c4();
-				c5();
-			}
-			e1();
-			e2();
-			e3();
-			e4();
-			e5();
-		}
 		return engine;
+	}
+
+
+	// Seed the engine's user-callback call sites (cold eval, recompute,
+	// effect run) past V8's megamorphic threshold (>4 shapes). When such a
+	// site has seen four or fewer shapes, V8 speculates on the exact call
+	// targets and compiles them inline; a workload that later pushes the
+	// site past the threshold deoptimizes the engine's hot functions and
+	// pays reoptimization cycles mid-run (measured at 20-35% on pull-heavy
+	// graphs when several distinct workloads share one process).
+	//
+	// Seeding is LAZY: it fires when the 33rd node is created rather than
+	// at engine startup. A tiny dedicated loop over a handful of nodes —
+	// the shape of a hot micro-kernel — never seeds and keeps V8's full
+	// single-target speculation (which is worth ~10% there); anything
+	// resembling an application crosses 33 nodes while still building its
+	// first graph, so the flat-behavior insurance is in place before any
+	// steady state forms. Also skipped on tiny configured planes, where
+	// the ~30 transient records would be a real bite out of capacity.
+	let mintCount = 0;
+	let seeded = false;
+	function maybeSeed(): void {
+		if (seeded || ++mintCount < 33 || configuredRecords < 4096) {
+			return;
+		}
+		seeded = true;
+		const engine = inner!;
+		const s0 = engine.makeSignal(0);
+		const read = s0 as () => number;
+		const c1 = engine.makeComputed(() => read() + 1);
+		const c2 = engine.makeComputed((p) => (p === undefined ? 0 : (p as number)) + read());
+		const c3 = engine.makeComputed(() => {
+			const v = read();
+			return v * 2;
+		});
+		const c4 = engine.makeComputed(() => read() - 1);
+		const c5 = engine.makeComputed(() => (read() & 1) + read());
+		const cs = [c1, c2, c3, c4, c5];
+		const e1 = engine.makeEffect(() => {
+			c1();
+		});
+		const e2 = engine.makeEffect(() => {
+			c2();
+			c3();
+		});
+		const e3 = engine.makeEffect(() => {
+			c4();
+		});
+		const e4 = engine.makeEffect(() => {
+			void c5();
+		});
+		const e5 = engine.makeEffect(() => {
+			for (const c of cs) {
+				c();
+			}
+		});
+		const write = s0 as (v: number) => void;
+		for (let round = 1; round <= 3; round++) {
+			write(round);
+			c1();
+			c2();
+			c3();
+			c4();
+			c5();
+		}
+		e1();
+		e2();
+		e3();
+		e4();
+		e5();
 	}
 
 	// ---- operation boundaries: reclamation + growth ---------------------------
@@ -670,6 +681,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		// channel for index.ts's isSignal/isComputed/isEffect/isEffectScope.
 
 		function makeSignal(initialValue: unknown): SignalHandle {
+			maybeSeed();
 			maybeBoundary();
 			const id = newSignal(initialValue);
 			const oper = anon(((...value: [unknown?]): unknown => {
@@ -692,6 +704,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		// -> handle), making the FinalizationRegistry unable to ever fire —
 		// upstream has no such anchor because its whole graph is GC-traceable.
 		function makeComputed(getter: (previousValue?: unknown) => unknown): () => unknown {
+			maybeSeed();
 			maybeBoundary();
 			const id = allocNode(C.K_COMPUTED);
 			// Registration is deferred to the first evaluation (see
@@ -704,6 +717,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		}
 
 		function makeEffect(fn: () => (() => void) | void): () => void {
+			maybeSeed();
 			maybeBoundary();
 			const id = newEffect(fn);
 			const gen = M[id + C.GEN];
@@ -713,6 +727,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		}
 
 		function makeScope(fn: () => void): () => void {
+			maybeSeed();
 			maybeBoundary();
 			const id = newScope(fn);
 			const gen = M[id + C.GEN];
@@ -1354,6 +1369,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		// ---- operations dispatched from the public system object --------------
 
 		function newSignal(value: unknown): number {
+			maybeSeed();
 			const id = allocNode(C.K_SIGNAL | C.MUTABLE);
 			const v = id >> 2;
 			vals[v] = value; // currentValue
@@ -1362,12 +1378,14 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		}
 
 		function newComputed(getter: (previousValue?: unknown) => unknown): number {
+			maybeSeed();
 			const id = allocNode(C.K_COMPUTED);
 			fnTab[id >> 3] = getter;
 			return id;
 		}
 
 		function newEffect(fn: () => (() => void) | void): number {
+			maybeSeed();
 			const e = allocNode(C.K_EFFECT | C.WATCHING | C.RECURSED_CHECK);
 			fnTab[e >> 3] = fn;
 			const prevSub = activeSub;
@@ -1390,6 +1408,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		}
 
 		function newScope(fn: () => void): number {
+			maybeSeed();
 			const e = allocNode(C.K_SCOPE | C.MUTABLE);
 			const prevSub = activeSub;
 			activeSub = e;
