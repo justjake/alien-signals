@@ -2,7 +2,7 @@ import { expect, test } from 'vitest';
 import { makeMiniLib } from './helpers/miniLib';
 
 test('reset() rewinds the arena and the system keeps working', () => {
-	const lib = makeMiniLib({ initialRecords: 4096 });
+	const lib = makeMiniLib({ initialCapacity: 4096 });
 	const s = lib.signal(1);
 	let seen = 0;
 	lib.effect(() => {
@@ -24,7 +24,7 @@ test('reset() rewinds the arena and the system keeps working', () => {
 });
 
 test('reset() restores capacity consumed by a dead generation', () => {
-	const lib = makeMiniLib({ initialRecords: 256 });
+	const lib = makeMiniLib({ initialCapacity: 256 });
 	for (let i = 0; i < 100; i++) {
 		lib.signal(i);
 	}
@@ -34,7 +34,7 @@ test('reset() restores capacity consumed by a dead generation', () => {
 });
 
 test('reset() during an active operation throws', () => {
-	const lib = makeMiniLib({ initialRecords: 4096 });
+	const lib = makeMiniLib({ initialCapacity: 4096 });
 	const s = lib.signal(0);
 	let threw: Error | undefined;
 	lib.effect(() => {
@@ -49,7 +49,7 @@ test('reset() during an active operation throws', () => {
 });
 
 test('pre-reset finalizations cannot reclaim post-reset records', async () => {
-	const lib = makeMiniLib({ initialRecords: 4096 });
+	const lib = makeMiniLib({ initialCapacity: 4096 });
 	// Owner-registered node whose owner dies before reset: the stale
 	// finalizer must self-disarm after reset replaces the registry.
 	(() => {

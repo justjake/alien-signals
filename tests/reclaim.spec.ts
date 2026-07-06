@@ -15,7 +15,7 @@ async function drainFinalizers(): Promise<void> {
 // The mini library registers each handle closure as its node's owner.
 test('records of collected owners are reclaimed', async () => {
 	expect(typeof gc).toBe('function'); // vitest.config.ts sets --expose-gc
-	const lib = makeMiniLib({ initialRecords: 4096 });
+	const lib = makeMiniLib({ initialCapacity: 4096 });
 	const makeBatch = () => {
 		for (let i = 0; i < 400; i++) {
 			const s = lib.signal(i);
@@ -32,7 +32,7 @@ test('records of collected owners are reclaimed', async () => {
 
 test('an orphaned-but-subscribed node survives until unwatched', async () => {
 	expect(typeof gc).toBe('function');
-	const lib = makeMiniLib({ initialRecords: 4096 });
+	const lib = makeMiniLib({ initialCapacity: 4096 });
 	const s = lib.signal(1);
 	let seen = 0;
 	let stop: (() => void) | undefined;

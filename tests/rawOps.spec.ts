@@ -20,7 +20,7 @@ function minter(sys: ReactiveSystem): (hostBits?: number) => SignalId {
 
 test('link returns the edge id; the same pair dedupes; unlink removes', () => {
 	const sys = createReactiveSystem({
-		initialRecords: 4096,
+		initialCapacity: 4096,
 		update: () => true,
 		notify: () => {},
 	});
@@ -39,7 +39,7 @@ test('link returns the edge id; the same pair dedupes; unlink removes', () => {
 test('propagate marks downstream pending and notifies watchers', () => {
 	const notified: number[] = [];
 	const sys = createReactiveSystem({
-		initialRecords: 4096,
+		initialCapacity: 4096,
 		update: () => true,
 		notify: (id) => {
 			notified.push(id);
@@ -73,7 +73,7 @@ test('propagate marks downstream pending and notifies watchers', () => {
 test('checkDirty resolves staleness through the update seam', () => {
 	const updated: number[] = [];
 	const sys = createReactiveSystem({
-		initialRecords: 4096,
+		initialCapacity: 4096,
 		update: (id, flags) => {
 			updated.push(id);
 			// Host contract: reset the word (walks stop revisiting), report changed.
@@ -98,7 +98,7 @@ test('checkDirty resolves staleness through the update seam', () => {
 test('watched fires on first subscriber only; unwatched on last unlink with state', () => {
 	const events: string[] = [];
 	const sys = createReactiveSystem({
-		initialRecords: 4096,
+		initialCapacity: 4096,
 		update: () => true,
 		notify: () => {},
 		watched: (id) => {
@@ -127,7 +127,7 @@ test('watched fires on first subscriber only; unwatched on last unlink with stat
 test('unwatched survives writes and recomputes of the watched node', () => {
 	const events: string[] = [];
 	const lib = makeMiniLib({
-		initialRecords: 4096,
+		initialCapacity: 4096,
 		watched: () => {
 			events.push('start');
 			return undefined;
@@ -155,7 +155,7 @@ test('unwatched survives writes and recomputes of the watched node', () => {
 test('reset() delivers unwatched for every watched node, newest first', () => {
 	const stops: number[] = [];
 	const sys = createReactiveSystem({
-		initialRecords: 4096,
+		initialCapacity: 4096,
 		update: () => true,
 		notify: () => {},
 		watched: (id) => id,
@@ -176,7 +176,7 @@ test('reset() delivers unwatched for every watched node, newest first', () => {
 test('unwatched is delivered even when watched is not defined', () => {
 	const stops: number[] = [];
 	const sys = createReactiveSystem({
-		initialRecords: 4096,
+		initialCapacity: 4096,
 		update: () => true,
 		notify: () => {},
 		unwatched: (id) => {
@@ -193,7 +193,7 @@ test('unwatched is delivered even when watched is not defined', () => {
 
 test('free(id, gen): explicit lifetime; stale gens are no-ops', () => {
 	const sys = createReactiveSystem({
-		initialRecords: 4096,
+		initialCapacity: 4096,
 		update: () => true,
 		notify: () => {},
 	});

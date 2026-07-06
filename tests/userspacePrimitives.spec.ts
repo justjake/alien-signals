@@ -10,7 +10,7 @@ import { makeMiniLib } from './helpers/miniLib';
 // (upstream parity), with src/index.ts as the packaged default.
 
 function makeUserspace() {
-	const lib = makeMiniLib({ initialRecords: 1 << 16 });
+	const lib = makeMiniLib({ initialCapacity: 1 << 16 });
 	const batch = (fn: () => void) => {
 		lib.startBatch();
 		try {

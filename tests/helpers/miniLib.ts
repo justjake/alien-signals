@@ -22,6 +22,16 @@ export function makeMiniLib(options?: Omit<ReactiveSystemOptions, 'update' | 'no
 	let globalVersion = 1;
 	let draining = false;
 
+	// Bound by the allocated callback — which fires DURING createReactiveSystem
+	// (allocation is eager), so these are declared first.
+	let M!: Int32Array;
+	let D!: Float64Array;
+	let link!: ReactiveArena['link'];
+	let unlink!: ReactiveArena['unlink'];
+	let propagate!: ReactiveArena['propagate'];
+	let checkDirty!: ReactiveArena['checkDirty'];
+	let shallowPropagate!: ReactiveArena['shallowPropagate'];
+
 	const sys = createReactiveSystem({
 		...options,
 		allocated(arena) {
@@ -63,18 +73,6 @@ export function makeMiniLib(options?: Omit<ReactiveSystemOptions, 'update' | 'no
 			queue.push([id, gen]);
 		},
 	});
-
-	// The arena views and the five ops, bound by the allocated callback at
-	// materialization and after every growth. Materialize eagerly — fine
-	// for tests.
-	let M!: Int32Array;
-	let D!: Float64Array;
-	let link!: ReactiveArena['link'];
-	let unlink!: ReactiveArena['unlink'];
-	let propagate!: ReactiveArena['propagate'];
-	let checkDirty!: ReactiveArena['checkDirty'];
-	let shallowPropagate!: ReactiveArena['shallowPropagate'];
-	sys.configure();
 
 	function purgeDeps(sub: SignalId): void {
 		const depsTail = M[sub + NodeSlot.DepsTail] as LinkId;

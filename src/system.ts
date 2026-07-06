@@ -47,9 +47,9 @@
  * retired arena is zeroed, so its version snapshots can never hit), and read/write
  * fold the check into kind bits of a flags word they already load.
  * Capacity is virtual until touched (large typed arrays are lazily-mapped
- * zero pages), defaults to 8M records (256 MB virtual), and the STARTING
- * size is set per system with configure({ initialRecords }) BEFORE first
- * use. A second instantiation of the engine literals (growth, or another
+ * zero pages); the STARTING size is the required initialCapacity option of
+ * createReactiveSystem, and growCapacity(records) raises it explicitly.
+ * A second instantiation of the engine literals (growth, or another
  * system in the process) would permanently disable V8's function-context
  * specialization — the const-M embedding — so generations after the first
  * are compiled from String(createEngine) via new Function when the host
@@ -250,21 +250,9 @@ export const enum Flag {
 	PublicMask = 127,
 }
 
-// Default STARTING capacity: 8M records x 32 B = 256 MB of mostly-untouched
-// (lazily mapped) zero pages — physical memory tracks records actually
-// touched. A given arena never grows or moves, which is what lets every
-// handle closure capture `const M` directly and reach the engine with zero
-// indirection (the measured alternative — growable buffers behind any
-// mutable binding or segment table — costs 26-83% on hot walks; see the
-// header note). The system grows past this by engine migration (see the
-// CAPACITY header note). Override per system via configure({ initialRecords })
-// or createReactiveSystem({ initialRecords }) BEFORE the first primitive is
-// created — nothing is allocated until then.
-const DEFAULT_RECORDS = 1 << 23;
-
 function normalizeRecords(n: number): number {
-	if (typeof n !== 'number' || !Number.isFinite(n)) {
-		throw new TypeError('dalien-signals: initialRecords must be a finite number');
+	if (typeof n !== 'number' || !Number.isFinite(n) || n <= 0) {
+		throw new TypeError('dalien-signals: capacity must be a positive finite number of records');
 	}
 	return Math.max(16, Math.ceil(n));
 }
@@ -351,16 +339,13 @@ export interface ReactiveSystem {
 	 */
 	readonly arena: ReactiveArena;
 	/**
-	 * Set the record arena's STARTING capacity and allocate it now (the
-	 * arena grows by engine migration when the live graph outgrows it).
-	 * Buffers are otherwise allocated lazily on the first primitive
-	 * creation, so this must be called before any signal/computed/effect/
-	 * effectScope/trigger of this system exists — afterwards it throws.
-	 * Works in any host (browser included); there is no environment-variable
-	 * path. Capacity is virtual until touched (large typed arrays are
-	 * lazily-mapped zero pages).
+	 * Raise the arena's capacity to at least `records` 32-byte records
+	 * (no-op if already that big; throws on a non-positive or non-finite
+	 * request). Grows immediately when the system is idle; a request made
+	 * mid-operation (inside an effect or getter) is stashed and applied at
+	 * the next operation boundary, where growth is safe.
 	 */
-	configure(options?: ReactiveSystemOptions): void;
+	growCapacity(records: number): void;
 	/**
 	 * Bulk arena teardown for generation-scoped lifecycles (per-request
 	 * graphs, worker pools, benchmark harness cleanup): rewinds the record
@@ -410,8 +395,13 @@ export interface ReactiveSystem {
 }
 
 export interface ReactiveSystemOptions {
-	/** Arena STARTING capacity in 32-byte records (default 2^23; grows). */
-	initialRecords?: number;
+	/**
+	 * Arena STARTING capacity in 32-byte records, allocated when the system
+	 * is created. Capacity is virtual until touched (typed arrays are
+	 * lazily-mapped zero pages); a graph outgrowing it migrates to a bigger
+	 * arena automatically, and growCapacity() raises it explicitly.
+	 */
+	initialCapacity: number;
 	/**
 	 * The effect scheduler (upstream's `notify` seam, id-shaped): the
 	 * propagation wave reports each Watching node here exactly once,
@@ -455,11 +445,10 @@ export interface ReactiveSystemOptions {
 	watched?: (id: SignalId) => unknown;
 	unwatched?: (id: SignalId, state: unknown) => void;
 	/**
-	 * Runs when an arena generation comes into being: once at
-	 * materialization (the first mint, or configure()), and again after
+	 * Runs when an arena generation comes into being: once inside
+	 * createReactiveSystem (the arena is allocated eagerly), and again after
 	 * every growth. Bind your views of {@link ReactiveSystem.arena} here —
-	 * it fires before any node can observe the new arena, so hosts need no
-	 * lazy-capture checks anywhere else.
+	 * it fires before any node can observe the new arena.
 	 */
 	allocated?: (arena: ReactiveArena) => void;
 }
@@ -627,13 +616,10 @@ interface Engine extends ReactiveArena {
  * Create an independent reactive graph with its own arena, queues, and
  * dependency-tracking state.
  */
-export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveSystem {
-	// LAZY MATERIALIZATION: importing/creating a system allocates nothing.
-	// The arena + scratch stacks come into being at the first primitive
-	// creation, or when configure() is called — whichever happens first.
-	let configuredRecords = options?.initialRecords !== undefined
-		? normalizeRecords(options.initialRecords)
-		: DEFAULT_RECORDS;
+export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSystem {
+	let configuredRecords = normalizeRecords(options.initialCapacity);
+	// An explicit growCapacity() target; grow() honors it over doubling.
+	let requestedRecords = 0;
 
 	// Everything engine generations share: stable array identities plus
 	// cold-path mutable slots (see EngineShared). Hot counters live inside
@@ -664,10 +650,6 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		scheduleMaintenance,
 	};
 	const hostState = shared.hostState;
-
-	function ensureEngine(): Engine {
-		return shared.inner !== undefined ? shared.inner : materialize();
-	}
 
 	// Each registry's callback disarms itself once the registry is no longer
 	// current: reset() replaces the registry, but cleanups already enqueued
@@ -726,9 +708,11 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 
 	function grow(): void {
 		shared.growPending = false;
+		const target = requestedRecords > configuredRecords ? requestedRecords : configuredRecords * 2;
+		requestedRecords = 0;
 		const prev = shared.inner!;
-		const next = instantiateEngine(configuredRecords * 2, prev.memory, prev.state(), shared);
-		configuredRecords *= 2;
+		const next = instantiateEngine(target, prev.memory, prev.state(), shared);
+		configuredRecords = target;
 		shared.inner = next;
 		prev.retire();
 		// Hosts re-bind to the new arena now, before any node can observe it.
@@ -772,43 +756,32 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 	// ---- the public system object (stable across engine rebuilds) -------------
 	// `e` mirrors `inner` (materialize/boundaryWork reassign both) so hot call
 	// sites reach the engine with one property load; everything else is cold
-	// delegation through ensureEngine(), which materializes on first use.
+	// delegation through shared.inner (always materialized: creation is eager).
 
 	const facade: ReactiveSystem = {
 		// Materializes on first access: callers never see a pre-allocation
 		// state. The IDENTITY still changes on growth — bind in `allocated`.
 		get arena(): ReactiveArena {
-			return ensureEngine();
+			return shared.inner!;
 		},
-		configure(configureOptions?: ReactiveSystemOptions): void {
-			if (shared.inner !== undefined) {
-				throw new Error('dalien-signals: configure() must be called before the first signal/computed/effect/effectScope is created');
+		growCapacity(records: number): void {
+			const target = normalizeRecords(records);
+			if (target <= configuredRecords) {
+				return; // already that big
 			}
-			if (configureOptions?.initialRecords !== undefined) {
-				configuredRecords = normalizeRecords(configureOptions.initialRecords);
+			requestedRecords = target;
+			if (shared.inner!.busy()) {
+				// Mid-operation: growth would move the arena under live
+				// frames. Stash the request; maintenance applies it at the
+				// next operation boundary.
+				shared.growPending = true;
+				shared.scheduleMaintenance();
+				return;
 			}
-			if (configureOptions?.notify !== undefined) {
-				shared.hostNotify = configureOptions.notify;
-			}
-			if (configureOptions?.update !== undefined) {
-				shared.hostUpdate = configureOptions.update;
-			}
-			if (configureOptions?.watched !== undefined) {
-				shared.hostWatched = configureOptions.watched;
-			}
-			if (configureOptions?.unwatched !== undefined) {
-				shared.hostUnwatched = configureOptions.unwatched;
-			}
-			if (configureOptions?.allocated !== undefined) {
-				allocatedCallbacks.push(configureOptions.allocated);
-			}
-			materialize();
+			grow();
 		},
 		reset(): void {
-			const engine = shared.inner;
-			if (engine === undefined) {
-				return; // nothing materialized, nothing to reset
-			}
+			const engine = shared.inner!;
 			engine.resetGuard();
 			// Bulk arena teardown: rewind the record arena and drop the whole
 			// FinalizationRegistry, so a dead generation is reclaimed by the
@@ -838,20 +811,20 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			shared.registry = mintRegistry();
 		},
 		createReactiveNode(owner: WeakKey, hostBits?: number): SignalId {
-			const engine = ensureEngine();
+			const engine = shared.inner!;
 			engine.maybeBoundary();
 			const id = engine.newCustom(hostBits ?? 0);
 			shared.registry!.register(owner, id);
 			return id;
 		},
 		free(id: SignalId, gen: number): void {
-			ensureEngine().free(id, gen);
+			shared.inner!.free(id, gen);
 		},
 		gen(id: SignalId): SignalGen {
-			return ensureEngine().memory[id + NodeSlot.Gen] as SignalGen;
+			return shared.inner!.memory[id + NodeSlot.Gen] as SignalGen;
 		},
 		stats() {
-			const engine = ensureEngine();
+			const engine = shared.inner!;
 			const { freeNodeRecords, freeLinkRecords } = engine.freeRecordCounts();
 			return {
 				capacityRecords: engine.memory.length / 8,
@@ -863,6 +836,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			};
 		},
 	};
+	materialize();
 	return facade;
 }
 
@@ -1064,7 +1038,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			} else {
 				id = recNext;
 				if (id >= M.length) {
-					throw new Error('dalien-signals: record arena exhausted inside one operation (growth runs between operations); configure({ initialRecords }) with more capacity');
+					throw new Error('dalien-signals: record arena exhausted inside one operation (growth runs between operations); growCapacity() or a larger initialCapacity is needed');
 				}
 				recNext = id + 8;
 				if (recNext > growAt && !shared.growPending) {
@@ -1106,7 +1080,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			} else {
 				id = recNext;
 				if (id >= M.length) {
-					throw new Error('dalien-signals: record arena exhausted inside one operation (growth runs between operations); configure({ initialRecords }) with more capacity');
+					throw new Error('dalien-signals: record arena exhausted inside one operation (growth runs between operations); growCapacity() or a larger initialCapacity is needed');
 				}
 				recNext = id + 8;
 				if (recNext > growAt && !shared.growPending) {

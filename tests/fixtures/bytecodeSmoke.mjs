@@ -63,7 +63,7 @@ d2();
 // Exercise the kindless seam + the raw graph ops directly.
 const nodes = [];
 const sys = createReactiveSystem({
-	initialRecords: 4096,
+	initialCapacity: 4096,
 	update(id, flags) {
 		const st = nodes[id >> 3];
 		sys.arena.memory[id] = flags & ~48; // clear Dirty|Pending (slot 0 = flags)

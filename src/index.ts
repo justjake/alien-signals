@@ -116,6 +116,11 @@ let shallowPropagate!: (subsLink: LinkId) => void;
 // ---- the system, driven by this library's update/notify/unwatched seams -----
 
 const system = createReactiveSystem({
+	// 1M records x 32 B = 32 MB of virtual address space, allocated at
+	// import (physical memory tracks records actually touched). The arena
+	// grows automatically when the graph outgrows it; growCapacity() raises
+	// it up front.
+	initialCapacity: 1 << 20,
 	allocated(arena: ReactiveArena): void {
 		M = arena.memory;
 		D = arena.versions;
@@ -186,8 +191,6 @@ const system = createReactiveSystem({
 		}
 	},
 });
-
-const { configure: systemConfigure } = system;
 
 // ---- update behaviors (upstream index.ts, transliterated) -------------------
 
@@ -441,22 +444,21 @@ export function setFlags(id: SignalId, flags: number): void {
 }
 
 /**
- * Set the fixed capacity of the default system and allocate its arena.
- *
- * Call this before creating a signal, computed, effect, or effect scope.
- * `initialRecords` counts 32-byte node and dependency records. It defaults
- * to 8,388,608 records (256 MB of virtual address space). The arena grows
- * automatically between operations once 3/4 full; a single callback that
- * allocates past the remaining headroom in one go throws.
+ * Raise the default system's arena capacity to at least `records` 32-byte
+ * node and dependency records (no-op if already that big; throws on an
+ * invalid request). The default is 1,048,576 records (32 MB of virtual
+ * address space), and the arena also grows automatically once 3/4 full —
+ * call this before a bulk load to pay for one migration instead of several.
+ * Safe to call at any time: a request made inside an effect or getter is
+ * applied at the next operation boundary.
  *
  * @example
  * ```ts
- * configure({ initialRecords: 1 << 20 });
- * const count = signal(0);
+ * growCapacity(1 << 22);
  * ```
  */
-export function configure(options?: { initialRecords?: number }): void {
-	systemConfigure(options);
+export function growCapacity(records: number): void {
+	system.growCapacity(records);
 }
 
 /** Return the number of currently open batches. */

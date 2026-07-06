@@ -9,7 +9,7 @@
 import { createReactiveSystem } from '../esm/system.mjs';
 
 const MODE = process.env.MODE ?? 'grow';
-const sys = createReactiveSystem({ initialRecords: MODE === 'grow' ? 8192 : 1 << 20 });
+const sys = createReactiveSystem({ initialCapacity: MODE === 'grow' ? 8192 : 1 << 20 });
 
 const src = sys.makeSignal(1);
 let last = src;
