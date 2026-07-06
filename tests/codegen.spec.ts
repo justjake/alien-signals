@@ -106,3 +106,11 @@ test('handle brands survive cloned generations', async () => {
 	expect(isSignal(s as () => void)).toBe(true);
 	expect(isComputed(c as () => void)).toBe(true);
 });
+
+test('the BUILT artifact supports engine cloning (const enums inlined)', async () => {
+	// The src-transform path may legitimately fall back (some transforms keep
+	// runtime enum references); the published build must not. Import the
+	// build output the same way bytecode.spec depends on it existing.
+	const built = await import(new URL('../esm/system.mjs', import.meta.url).href) as typeof import('../src/system');
+	expect(built.codegenSupported()).toBe(true);
+});

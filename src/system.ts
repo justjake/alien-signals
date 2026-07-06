@@ -499,17 +499,83 @@ export const codegenAvailable = (() => {
 
 let engineInstantiations = 0; // process-wide: feedback slots are per-literal
 let engineSourceText: string | undefined;
+// Cloning also requires the RUNTIME source to be self-contained: toolchains
+// that inline the const enums (esbuild bundling — the published build; most
+// transforms) produce closed source, but a transform that keeps runtime enum
+// references leaves clones unresolvable — and new Function parses lazily, so
+// the ReferenceError would surface deep inside engine operation. Verdict by
+// eager smoke-execution, once per process: compile a clone, push one signal
+// through it against a throwaway shared. Failure downgrades to the static
+// literal (correct, pays the documented despecialization).
+let engineCloneVerdict: boolean | undefined;
+
+function cloneWorks(): boolean {
+	try {
+		const compile = new Function(engineSourceText + '0') as () => typeof createEngine;
+		const dummy: EngineShared = {
+			values: [undefined, undefined],
+			fns: [undefined],
+			queued: [],
+			pendingFree: [],
+			pendingFnClear: [],
+			hostState: [],
+			inner: undefined,
+			registry: undefined,
+			hostNotify: undefined,
+			hostStart: undefined,
+			hostStop: undefined,
+			growPending: false,
+			boundaryPending: false,
+			maybeSeed: noop,
+			grow: noop,
+			boundaryWork: noop,
+			scheduleMaintenance: noop,
+		};
+		const probe = compile()(64, undefined, {
+			recNext: 8,
+			nodeFreeHead: 0,
+			linkFreeHead: 0,
+			epoch: 1,
+			cycle: 0,
+			batchDepth: 0,
+			notifyIndex: 0,
+			queuedLength: 0,
+		}, dummy);
+		dummy.inner = probe;
+		const handle = probe.makeSignal(1) as unknown as { (): unknown; (v: unknown): void };
+		handle(2);
+		return handle() === 2;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Whether engine generations can be compiled from source in this
+ * environment: runtime codegen is permitted AND the engine's runtime source
+ * is self-contained (const enums inlined by the toolchain). The published
+ * build satisfies the second condition by construction; some dev/test
+ * transforms do not, and fall back to the static literal.
+ */
+export function codegenSupported(): boolean {
+	if (!codegenAvailable) {
+		return false;
+	}
+	engineSourceText ??= 'return (' + String(createEngine) + ');//gen';
+	return (engineCloneVerdict ??= cloneWorks());
+}
 
 function instantiateEngine(records: number, from: Int32Array | undefined, boot: EngineState, shared: EngineShared): Engine {
 	if (++engineInstantiations > 1 && codegenAvailable) {
-		// Every generation is compiled from its own source text (the trailing
-		// generation comment defeats V8's eval compilation cache), so every
-		// generation gets its own function identities — and with them its own
-		// context specialization. Falling back to the static literal is
-		// correct but pays the process-wide despecialization documented above.
 		engineSourceText ??= 'return (' + String(createEngine) + ');//gen';
-		const compile = new Function(engineSourceText + engineInstantiations) as () => typeof createEngine;
-		return compile()(records, from, boot, shared);
+		if (engineCloneVerdict ??= cloneWorks()) {
+			// Every generation is compiled from its own source text (the
+			// trailing generation comment defeats V8's eval compilation
+			// cache), so every generation gets its own function identities —
+			// and with them its own context specialization.
+			const compile = new Function(engineSourceText + engineInstantiations) as () => typeof createEngine;
+			return compile()(records, from, boot, shared);
+		}
 	}
 	return createEngine(records, from, boot, shared);
 }
