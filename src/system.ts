@@ -271,10 +271,6 @@ function normalizeRecords(n: number): number {
 
 function noop(): void {}
 
-function uninitialized(): never {
-	throw new Error('dalien-signals: system not materialized — create a signal/computed/effect or call configure() first');
-}
-
 
 
 /**
@@ -349,10 +345,11 @@ export interface ReactiveArena {
 export interface ReactiveSystem {
 	/**
 	 * The current arena generation (memory, version snapshots, the five
-	 * graph ops). Assigned at materialization and REPLACED on growth: bind
-	 * to it in the `allocated` callback, not at creation time.
+	 * graph ops). Reading it allocates the arena if none exists yet; the
+	 * object is REPLACED on growth, so bind to it in the `allocated`
+	 * callback rather than caching it.
 	 */
-	arena: ReactiveArena;
+	readonly arena: ReactiveArena;
 	/**
 	 * Set the record arena's STARTING capacity and allocate it now (the
 	 * arena grows by engine migration when the live graph outgrows it).
@@ -697,7 +694,6 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			linkFreeHead: 0,
 		}, shared);
 		shared.inner = engine;
-		facade.arena = engine;
 		for (let i = 0; i < allocatedCallbacks.length; i++) {
 			allocatedCallbacks[i](engine);
 		}
@@ -734,7 +730,6 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		const next = instantiateEngine(configuredRecords * 2, prev.memory, prev.state(), shared);
 		configuredRecords *= 2;
 		shared.inner = next;
-		facade.arena = next;
 		prev.retire();
 		// Hosts re-bind to the new arena now, before any node can observe it.
 		for (let i = 0; i < allocatedCallbacks.length; i++) {
@@ -779,22 +774,12 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 	// sites reach the engine with one property load; everything else is cold
 	// delegation through ensureEngine(), which materializes on first use.
 
-	// `system.arena` before materialization: empty views, throwing ops (ids
-	// can only come from a materialized system).
-	const bootArena: ReactiveArena = {
-		memory: new Int32Array(0),
-		versions: new Float64Array(0),
-		newCustom: uninitialized,
-		free: uninitialized,
-		link: uninitialized,
-		unlink: uninitialized,
-		propagate: uninitialized,
-		checkDirty: uninitialized,
-		shallowPropagate: uninitialized,
-	};
-
 	const facade: ReactiveSystem = {
-		arena: bootArena,
+		// Materializes on first access: callers never see a pre-allocation
+		// state. The IDENTITY still changes on growth — bind in `allocated`.
+		get arena(): ReactiveArena {
+			return ensureEngine();
+		},
 		configure(configureOptions?: ReactiveSystemOptions): void {
 			if (shared.inner !== undefined) {
 				throw new Error('dalien-signals: configure() must be called before the first signal/computed/effect/effectScope is created');
