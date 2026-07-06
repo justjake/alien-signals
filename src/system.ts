@@ -91,8 +91,8 @@
 // Public flags enum: a REGULAR enum (not const) so it exists at runtime for
 // every consumer toolchain (vitest/esbuild transform mode, stripped builds).
 // Values match upstream alien-signals exactly. Hot code never touches this
-// object — it uses the same-file `const enum C` below, which every toolchain
-// inlines as numeric literals.
+// object — it uses the same-file `const enum Flag` below, which every
+// toolchain inlines as numeric literals.
 /** Public update-state bits exposed by {@link ReactiveNode.flags}. */
 export enum ReactiveFlags {
 	/** No update-state bits are set. */
@@ -203,54 +203,49 @@ export const enum SysSlot {
 	EpochF64 = 3,
 }
 
-const enum C {
-	// Aliases of the public layout (single source of truth above); the
-	// engine keeps its short internal names.
-	FLAGS = NodeSlot.Flags,
-	DEPS = NodeSlot.Deps,
-	DEPS_TAIL = NodeSlot.DepsTail,
-	SUBS = NodeSlot.Subs,
-	SUBS_TAIL = NodeSlot.SubsTail,
-	GEN = NodeSlot.Gen,
-	VERSION = LinkSlot.Version,
-	DEP = LinkSlot.Dep,
-	SUB = LinkSlot.Sub,
-	PREV_SUB = LinkSlot.PrevSub,
-	NEXT_SUB = LinkSlot.NextSub,
-	PREV_DEP = LinkSlot.PrevDep,
-	NEXT_DEP = LinkSlot.NextDep,
-	FREE_NEXT = LinkSlot.FreeNext,
-	ENTER_DEPTH = SysSlot.EnterDepth,
-	CYCLE = SysSlot.Cycle,
-	EPOCH_F64 = SysSlot.EpochF64,
-
-	// Flags (upstream ReactiveFlags + HasChildEffect + kind bits).
-	MUTABLE = 1,
-	WATCHING = 2,
-	RECURSED_CHECK = 4,
-	RECURSED = 8,
-	DIRTY = 16,
-	PENDING = 32,
-	// The record holds a live node (set by alloc, cleared by free): the
-	// engine's only notion of "kind" — everything else is host bits.
-	LIVE = 128,
-	// The record's handle was garbage-collected (FinalizationRegistry fired)
-	// while subscribers still existed; reclaim when the last subscriber
-	// unlinks. Engine-internal, outside PUBLIC_MASK.
-	ORPHANED = 2048,
-	// The host's start() lifecycle callback ran for this node and its stop()
-	// has not (see ReactiveSystemOptions.start/stop). Engine-internal.
-	HOST_STARTED = 8192,
-	// Bits 16-27 belong to the HOST: custom kinds plant their dispatch tags
-	// here at mint (custom(hostBits)); the engine never touches them and
-	// preserves them across every state rewrite (see STICKY).
-	HOST_SHIFT = 16,
-	HOST_MASK = 0x0FFF0000,
-	// Engine-internal + host bits that every absolute FLAGS store preserves.
-	STICKY = ORPHANED | HOST_STARTED | HOST_MASK,
-	// Bits visible through the public ReactiveNode view (semantic bits +
-	// HasChildEffect, which upstream also kept in the public flags word).
-	PUBLIC_MASK = 127,
+/**
+ * Flag bits of a node's state word (M[id + NodeSlot.Flags]), as a same-file
+ * const enum so every toolchain inlines them into the engine's hot paths
+ * (and into compiled engine clones). The low bits match upstream
+ * alien-signals' ReactiveFlags exactly.
+ */
+const enum Flag {
+	Mutable = 1,
+	Watching = 2,
+	RecursedCheck = 4,
+	Recursed = 8,
+	Dirty = 16,
+	Pending = 32,
+	/**
+	 * The record holds a live node (set by alloc, cleared by free): the
+	 * engine's only notion of "kind" — everything else is host bits.
+	 */
+	Live = 128,
+	/**
+	 * The record's handle was garbage-collected (FinalizationRegistry fired)
+	 * while subscribers still existed; reclaim when the last subscriber
+	 * unlinks. Engine-internal, outside PublicMask.
+	 */
+	Orphaned = 2048,
+	/**
+	 * The host's start() lifecycle callback ran for this node and its stop()
+	 * has not (see ReactiveSystemOptions.start/stop). Engine-internal.
+	 */
+	HostStarted = 8192,
+	/**
+	 * Bits 16-27 belong to the HOST: custom kinds plant their dispatch tags
+	 * here at mint (custom(hostBits)); the engine never touches them and
+	 * preserves them across every state rewrite (see Sticky).
+	 */
+	HostShift = 16,
+	HostMask = 0x0FFF0000,
+	/** Engine-internal + host bits every absolute flags store preserves. */
+	Sticky = Orphaned | HostStarted | HostMask,
+	/**
+	 * Bits visible through the public ReactiveNode view (semantic bits +
+	 * HasChildEffect, which upstream also kept in the public flags word).
+	 */
+	PublicMask = 127,
 }
 
 // Default STARTING capacity: 8M records x 32 B = 256 MB of mostly-untouched
@@ -945,8 +940,8 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			// callbacks must not touch reactive state mid-reset.
 			const M = engine.buffer();
 			for (let id = engine.state().recNext - 8; id >= 8; id -= 8) {
-				const flags = M[id + C.FLAGS];
-				if (flags & C.HOST_STARTED) {
+				const flags = M[id + NodeSlot.Flags];
+				if (flags & Flag.HostStarted) {
 					const state = hostState[id >> 3];
 					hostState[id >> 3] = undefined;
 					if (shared.hostStop !== undefined) {
@@ -1011,7 +1006,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			ensureEngine().shallowPropagateNode(id);
 		},
 		gen(id: number): number {
-			return ensureEngine().buffer()[id + C.GEN];
+			return ensureEngine().buffer()[id + NodeSlot.Gen];
 		},
 		trigger(fn: () => void): void {
 			const engine = ensureEngine();
@@ -1090,7 +1085,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		M.set(from.subarray(0, boot.recNext));
 	} else {
 		// The write epoch starts at 1 so a zeroed stamp can never equal it.
-		D[C.EPOCH_F64] = 1;
+		D[SysSlot.EpochF64] = 1;
 	}
 	// Ask for growth once the bump pointer passes 3/4 of the arena
 	// (records * 8 slots * 3/4). The remaining quarter is headroom for
@@ -1099,21 +1094,21 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 
 	// Hot per-generation counters, handed off through boot/state().
 	let recNext = boot.recNext; // bump pointer, nodes and links (record 0 burned)
-	let nodeFreeHead = boot.nodeFreeHead; // free list threaded through M[id + C.DEPS]
-	let linkFreeHead = boot.linkFreeHead; // free list threaded through M[id + C.NEXT_DEP]
+	let nodeFreeHead = boot.nodeFreeHead; // free list threaded through M[id + NodeSlot.Deps]
+	let linkFreeHead = boot.linkFreeHead; // free list threaded through M[id + LinkSlot.NextDep]
 	// The global write epoch (quiet-read fast path) lives in record 0 as
-	// D[C.EPOCH_F64] — an arena slot, not a local — so a trusted host bumps
+	// D[SysSlot.EpochF64] — an arena slot, not a local — so a trusted host bumps
 	// and compares it directly, zero crossings (see SysSlot.EpochF64). It is
 	// bumped by every committed write and trigger(); a node whose stamp
 	// equals it is provably current. One float64 (2^53 never wraps).
 	// The tracking-pass counter (upstream's cycle) lives in record 0 as
-	// M[C.CYCLE] for the same reason (see SysSlot.Cycle).
+	// M[SysSlot.Cycle] for the same reason (see SysSlot.Cycle).
 	let batchDepth = boot.batchDepth;
 	// Always neutral at a generation boundary:
 	let activeSub = 0;
 	let runDepth = 0;
 	// Enter depth (live engine frames holding the arena; 0 = op boundary)
-	// lives in record 0 as M[C.ENTER_DEPTH] so trusted hosts bracket their
+	// lives in record 0 as M[SysSlot.EnterDepth] so trusted hosts bracket their
 	// own user-code frames with it (see SysSlot.EnterDepth).
 
 	function snapshot(): EngineState {
@@ -1124,7 +1119,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 	// (or use the inline twin in write()) or stamped computeds keep serving
 	// their cached values.
 	function bumpEpoch(): void {
-		++D[C.EPOCH_F64];
+		++D[SysSlot.EpochF64];
 	}
 
 	// Persistent scratch stacks (upstream's cons-cell Stack<T>). Re-entrant
@@ -1160,7 +1155,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 	function retire(): void {
 		retired = true;
 		M.fill(0, 0, recNext);
-		D[C.EPOCH_F64] = Number.NaN;
+		D[SysSlot.EpochF64] = Number.NaN;
 	}
 
 	// Local aliases for the shared side arrays (stable identities): one load
@@ -1213,7 +1208,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 	// ---- allocation ----------------------------------------------------------
 
 		function busy(): boolean {
-			return M[C.ENTER_DEPTH] !== 0;
+			return M[SysSlot.EnterDepth] !== 0;
 		}
 
 		function startBatch(): void {
@@ -1257,7 +1252,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		// May grow — retiring THIS engine — so mint paths re-check `retired`
 		// right after calling it.
 		function maybeBoundary(): void {
-			if (M[C.ENTER_DEPTH] !== 0) {
+			if (M[SysSlot.EnterDepth] !== 0) {
 				return;
 			}
 			if (shared.growPending) {
@@ -1269,7 +1264,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		}
 
 		function resetGuard(): void {
-			if (M[C.ENTER_DEPTH] !== 0 || activeSub !== 0 || batchDepth !== 0 || runDepth !== 0) {
+			if (M[SysSlot.EnterDepth] !== 0 || activeSub !== 0 || batchDepth !== 0 || runDepth !== 0) {
 				throw new Error('dalien-signals: reset() called during an active operation (inside an effect, computed, batch, or trigger)');
 			}
 		}
@@ -1278,11 +1273,11 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		// this generation's counters. The factory handles the side columns,
 		// the registry, and host-lifecycle stops.
 		function resetState(): void {
-			const liveEpoch = D[C.EPOCH_F64];
-			const liveCycle = M[C.CYCLE];
+			const liveEpoch = D[SysSlot.EpochF64];
+			const liveCycle = M[SysSlot.Cycle];
 			M.fill(0, 0, recNext);
-			D[C.EPOCH_F64] = liveEpoch;
-			M[C.CYCLE] = liveCycle;
+			D[SysSlot.EpochF64] = liveEpoch;
+			M[SysSlot.Cycle] = liveCycle;
 			recNext = 8;
 			nodeFreeHead = 0;
 			linkFreeHead = 0;
@@ -1301,7 +1296,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			// nature (MUTABLE for value nodes so walks update them and waves
 			// traverse them; WATCHING for effect-likes so notify fires;
 			// neither for wave-opaque bookkeeping nodes).
-			return allocNode(hostBits & (C.HOST_MASK | C.PUBLIC_MASK));
+			return allocNode(hostBits & (Flag.HostMask | Flag.PublicMask));
 		}
 
 		// Generic, gen-guarded free for ANY node id: the explicit-lifetime
@@ -1312,22 +1307,22 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 				shared.inner!.free(id, gen);
 				return;
 			}
-			if (M[id + C.GEN] !== gen) {
+			if (M[id + NodeSlot.Gen] !== gen) {
 				return; // already reclaimed (and possibly reused)
 			}
-			const flags = M[id + C.FLAGS];
-			if (!(flags & C.LIVE)) {
+			const flags = M[id + NodeSlot.Flags];
+			if (!(flags & Flag.Live)) {
 				return; // already freed
 			}
-			if (flags & C.HOST_STARTED) {
+			if (flags & Flag.HostStarted) {
 				hostStopNode(id);
 			}
-			M[id + C.FLAGS] = 0;
+			M[id + NodeSlot.Flags] = 0;
 			disposeAllDepsInReverse(id);
-			let sub = M[id + C.SUBS];
+			let sub = M[id + NodeSlot.Subs];
 			while (sub !== 0) {
 				unlink(sub);
-				sub = M[id + C.SUBS];
+				sub = M[id + NodeSlot.Subs];
 			}
 			pendingFree.push(id);
 			shared.boundaryPending = true;
@@ -1342,25 +1337,25 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			if (retired) {
 				return shared.inner!.verify(id);
 			}
-			const flags = M[id + C.FLAGS];
-			if (flags & C.DIRTY) {
+			const flags = M[id + NodeSlot.Flags];
+			if (flags & Flag.Dirty) {
 				return true;
 			}
-			if (!(flags & C.PENDING)) {
+			if (!(flags & Flag.Pending)) {
 				return false;
 			}
-			const entryEpoch = D[C.EPOCH_F64];
-			if (checkDirty(M[id + C.DEPS], id)) {
+			const entryEpoch = D[SysSlot.EpochF64];
+			if (checkDirty(M[id + NodeSlot.Deps], id)) {
 				return true;
 			}
-			M[id + C.FLAGS] &= ~C.PENDING;
+			M[id + NodeSlot.Flags] &= ~Flag.Pending;
 			D[(id >> 1) + 3] = entryEpoch;
 			return false;
 		}
 
 		/** One f64 compare: may the caller skip verification entirely? */
 		function verified(id: number): boolean {
-			return D[(id >> 1) + 3] === D[C.EPOCH_F64];
+			return D[(id >> 1) + 3] === D[SysSlot.EpochF64];
 		}
 
 		// The re-track bracket (upstream's startTracking/endTracking): a
@@ -1371,10 +1366,10 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 				shared.inner!.beginTracking(id);
 				return;
 			}
-			++M[C.ENTER_DEPTH];
-			++M[C.CYCLE];
-			M[id + C.DEPS_TAIL] = 0;
-			M[id + C.FLAGS] = (M[id + C.FLAGS] & ~(C.DIRTY | C.PENDING | C.RECURSED)) | C.RECURSED_CHECK;
+			++M[SysSlot.EnterDepth];
+			++M[SysSlot.Cycle];
+			M[id + NodeSlot.DepsTail] = 0;
+			M[id + NodeSlot.Flags] = (M[id + NodeSlot.Flags] & ~(Flag.Dirty | Flag.Pending | Flag.Recursed)) | Flag.RecursedCheck;
 		}
 
 		function endTracking(id: number): void {
@@ -1382,13 +1377,13 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 				shared.inner!.endTracking(id);
 				return;
 			}
-			M[id + C.FLAGS] &= ~C.RECURSED_CHECK;
+			M[id + NodeSlot.Flags] &= ~Flag.RecursedCheck;
 			purgeDeps(id);
-			--M[C.ENTER_DEPTH];
+			--M[SysSlot.EnterDepth];
 		}
 
 		function nodeFlagsOf(id: number): number {
-			return retired ? shared.inner!.nodeFlags(id) : M[id + C.FLAGS];
+			return retired ? shared.inner!.nodeFlags(id) : M[id + NodeSlot.Flags];
 		}
 
 		function setNodeFlagsOf(id: number, flags: number): void {
@@ -1396,8 +1391,8 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 				shared.inner!.setNodeFlags(id, flags);
 				return;
 			}
-			M[id + C.FLAGS] = (M[id + C.FLAGS] & ~(C.PUBLIC_MASK | C.HOST_MASK))
-				| (flags & (C.PUBLIC_MASK | C.HOST_MASK));
+			M[id + NodeSlot.Flags] = (M[id + NodeSlot.Flags] & ~(Flag.PublicMask | Flag.HostMask))
+				| (flags & (Flag.PublicMask | Flag.HostMask));
 			D[(id >> 1) + 3] = 0;
 		}
 
@@ -1410,16 +1405,16 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			}
 			const prevSub = activeSub;
 			activeSub = id;
-			++M[C.ENTER_DEPTH];
-			++M[C.CYCLE];
-			M[id + C.DEPS_TAIL] = 0;
-			M[id + C.FLAGS] = (M[id + C.FLAGS] & ~(C.DIRTY | C.PENDING | C.RECURSED)) | C.RECURSED_CHECK;
+			++M[SysSlot.EnterDepth];
+			++M[SysSlot.Cycle];
+			M[id + NodeSlot.DepsTail] = 0;
+			M[id + NodeSlot.Flags] = (M[id + NodeSlot.Flags] & ~(Flag.Dirty | Flag.Pending | Flag.Recursed)) | Flag.RecursedCheck;
 			try {
 				return fn(arg);
 			} finally {
-				M[id + C.FLAGS] &= ~C.RECURSED_CHECK;
+				M[id + NodeSlot.Flags] &= ~Flag.RecursedCheck;
 				purgeDeps(id);
-				--M[C.ENTER_DEPTH];
+				--M[SysSlot.EnterDepth];
 				activeSub = prevSub;
 			}
 		}
@@ -1430,7 +1425,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 				shared.inner!.markDirty(id);
 				return;
 			}
-			M[id + C.FLAGS] |= C.DIRTY;
+			M[id + NodeSlot.Flags] |= Flag.Dirty;
 			D[(id >> 1) + 3] = 0;
 		}
 
@@ -1441,9 +1436,9 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 				return shared.inner!.track(id);
 			}
 			if (activeSub !== 0) {
-				link(id, activeSub, M[C.CYCLE]);
+				link(id, activeSub, M[SysSlot.Cycle]);
 			}
-			return M[id + C.FLAGS];
+			return M[id + NodeSlot.Flags];
 		}
 
 		// The fused read protocol for value-kinds: stamp gate, reentrancy
@@ -1453,47 +1448,47 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		// returned as-is; 1 when the caller must update (recompute, then
 		// shallowPropagate on change, then track).
 		function pull(id: number): number {
-			if (D[(id >> 1) + 3] === D[C.EPOCH_F64]) {
+			if (D[(id >> 1) + 3] === D[SysSlot.EpochF64]) {
 				if (activeSub !== 0) {
-					link(id, activeSub, M[C.CYCLE]);
+					link(id, activeSub, M[SysSlot.Cycle]);
 				}
 				return 0;
 			}
 			if (retired) {
 				return shared.inner!.pull(id);
 			}
-			const flags = M[id + C.FLAGS];
-			if (flags & C.RECURSED_CHECK) {
+			const flags = M[id + NodeSlot.Flags];
+			if (flags & Flag.RecursedCheck) {
 				// Re-entrant self-read mid-recompute: stale read by contract.
 				if (activeSub !== 0) {
-					link(id, activeSub, M[C.CYCLE]);
+					link(id, activeSub, M[SysSlot.Cycle]);
 				}
 				return 0;
 			}
-			if (flags & C.DIRTY) {
+			if (flags & Flag.Dirty) {
 				return 1;
 			}
-			if (flags & C.PENDING) {
-				const entryEpoch = D[C.EPOCH_F64];
-				if (checkDirty(M[id + C.DEPS], id)) {
+			if (flags & Flag.Pending) {
+				const entryEpoch = D[SysSlot.EpochF64];
+				if (checkDirty(M[id + NodeSlot.Deps], id)) {
 					return 1;
 				}
-				M[id + C.FLAGS] &= ~C.PENDING;
+				M[id + NodeSlot.Flags] &= ~Flag.Pending;
 				D[(id >> 1) + 3] = entryEpoch;
 			}
 			if (activeSub !== 0) {
-				link(id, activeSub, M[C.CYCLE]);
+				link(id, activeSub, M[SysSlot.Cycle]);
 			}
 			return 0;
 		}
 
 		function freeRecordCounts(): { freeNodeRecords: number; freeLinkRecords: number } {
 			let freeNodeRecords = 0;
-			for (let id = nodeFreeHead; id !== 0; id = M[id + C.DEPS]) {
+			for (let id = nodeFreeHead; id !== 0; id = M[id + NodeSlot.Deps]) {
 				++freeNodeRecords;
 			}
 			let freeLinkRecords = 0;
-			for (let id = linkFreeHead; id !== 0; id = M[id + C.FREE_NEXT]) {
+			for (let id = linkFreeHead; id !== 0; id = M[id + LinkSlot.FreeNext]) {
 				++freeLinkRecords;
 			}
 			return { freeNodeRecords, freeLinkRecords };
@@ -1503,8 +1498,8 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			let id: number;
 			if (nodeFreeHead !== 0) {
 				id = nodeFreeHead;
-				nodeFreeHead = M[id + C.DEPS];
-				M[id + C.DEPS] = 0;
+				nodeFreeHead = M[id + NodeSlot.Deps];
+				M[id + NodeSlot.Deps] = 0;
 			} else {
 				id = recNext;
 				if (id >= M.length) {
@@ -1516,18 +1511,18 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 					shared.scheduleMaintenance();
 				}
 			}
-			M[id + C.FLAGS] = flags | C.LIVE;
+			M[id + NodeSlot.Flags] = flags | Flag.Live;
 			return id;
 		}
 
 		function freeNode(id: number): void {
 			D[(id >> 1) + 3] = 0;
-			M[id + C.FLAGS] = 0;
-			M[id + C.DEPS_TAIL] = 0;
-			M[id + C.SUBS] = 0;
-			M[id + C.SUBS_TAIL] = 0;
-			++M[id + C.GEN];
-			M[id + C.DEPS] = nodeFreeHead;
+			M[id + NodeSlot.Flags] = 0;
+			M[id + NodeSlot.DepsTail] = 0;
+			M[id + NodeSlot.Subs] = 0;
+			M[id + NodeSlot.SubsTail] = 0;
+			++M[id + NodeSlot.Gen];
+			M[id + NodeSlot.Deps] = nodeFreeHead;
 			nodeFreeHead = id;
 		}
 
@@ -1546,7 +1541,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			let id: number;
 			if (linkFreeHead !== 0) {
 				id = linkFreeHead;
-				linkFreeHead = M[id + C.FREE_NEXT];
+				linkFreeHead = M[id + LinkSlot.FreeNext];
 			} else {
 				id = recNext;
 				if (id >= M.length) {
@@ -1562,58 +1557,58 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		}
 
 		function freeLink(id: number): void {
-			M[id + C.FREE_NEXT] = linkFreeHead;
+			M[id + LinkSlot.FreeNext] = linkFreeHead;
 			linkFreeHead = id;
 		}
 
 		// ---- graph kernel (upstream system.ts, transliterated) ----------------
 
 		function link(dep: number, sub: number, version: number): number {
-			const prevDep = M[sub + C.DEPS_TAIL];
-			if (prevDep !== 0 && M[prevDep + C.DEP] === dep) {
+			const prevDep = M[sub + NodeSlot.DepsTail];
+			if (prevDep !== 0 && M[prevDep + LinkSlot.Dep] === dep) {
 				return prevDep;
 			}
-			const nextDep = prevDep !== 0 ? M[prevDep + C.NEXT_DEP] : M[sub + C.DEPS];
-			if (nextDep !== 0 && M[nextDep + C.DEP] === dep) {
-				M[nextDep + C.VERSION] = version;
-				M[sub + C.DEPS_TAIL] = nextDep;
+			const nextDep = prevDep !== 0 ? M[prevDep + LinkSlot.NextDep] : M[sub + NodeSlot.Deps];
+			if (nextDep !== 0 && M[nextDep + LinkSlot.Dep] === dep) {
+				M[nextDep + LinkSlot.Version] = version;
+				M[sub + NodeSlot.DepsTail] = nextDep;
 				return nextDep;
 			}
 			linkInsert(dep, sub, version, prevDep, nextDep);
 			// Insert and its dedup fast path both leave the edge as the
 			// dep's subscriber tail.
-			return M[dep + C.SUBS_TAIL];
+			return M[dep + NodeSlot.SubsTail];
 		}
 
 		// Insertion tail of link(): kept out of line so the steady-state
 		// re-track fast path above stays under V8's inlining bytecode budget.
 		function linkInsert(dep: number, sub: number, version: number, prevDep: number, nextDep: number): void {
-			const prevSub = M[dep + C.SUBS_TAIL];
-			if (prevSub !== 0 && M[prevSub + C.VERSION] === version && M[prevSub + C.SUB] === sub) {
+			const prevSub = M[dep + NodeSlot.SubsTail];
+			if (prevSub !== 0 && M[prevSub + LinkSlot.Version] === version && M[prevSub + LinkSlot.Sub] === sub) {
 				return;
 			}
 			const newLink = allocLink();
-			M[sub + C.DEPS_TAIL] = newLink;
-			M[dep + C.SUBS_TAIL] = newLink;
-			M[newLink + C.VERSION] = version;
-			M[newLink + C.DEP] = dep;
-			M[newLink + C.SUB] = sub;
-			M[newLink + C.PREV_DEP] = prevDep;
-			M[newLink + C.NEXT_DEP] = nextDep;
-			M[newLink + C.PREV_SUB] = prevSub;
-			M[newLink + C.NEXT_SUB] = 0;
+			M[sub + NodeSlot.DepsTail] = newLink;
+			M[dep + NodeSlot.SubsTail] = newLink;
+			M[newLink + LinkSlot.Version] = version;
+			M[newLink + LinkSlot.Dep] = dep;
+			M[newLink + LinkSlot.Sub] = sub;
+			M[newLink + LinkSlot.PrevDep] = prevDep;
+			M[newLink + LinkSlot.NextDep] = nextDep;
+			M[newLink + LinkSlot.PrevSub] = prevSub;
+			M[newLink + LinkSlot.NextSub] = 0;
 			if (nextDep !== 0) {
-				M[nextDep + C.PREV_DEP] = newLink;
+				M[nextDep + LinkSlot.PrevDep] = newLink;
 			}
 			if (prevDep !== 0) {
-				M[prevDep + C.NEXT_DEP] = newLink;
+				M[prevDep + LinkSlot.NextDep] = newLink;
 			} else {
-				M[sub + C.DEPS] = newLink;
+				M[sub + NodeSlot.Deps] = newLink;
 			}
 			if (prevSub !== 0) {
-				M[prevSub + C.NEXT_SUB] = newLink;
+				M[prevSub + LinkSlot.NextSub] = newLink;
 			} else {
-				M[dep + C.SUBS] = newLink;
+				M[dep + NodeSlot.Subs] = newLink;
 				// First subscriber: watched-lifecycle start (out of the common
 				// re-subscribe path; one context compare on first-link only).
 				if (shared.hostStart !== undefined) {
@@ -1622,31 +1617,31 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			}
 		}
 
-		function unlink(id: number, sub = M[id + C.SUB]): number {
-			const dep = M[id + C.DEP];
-			const prevDep = M[id + C.PREV_DEP];
-			const nextDep = M[id + C.NEXT_DEP];
-			const nextSub = M[id + C.NEXT_SUB];
-			const prevSub = M[id + C.PREV_SUB];
+		function unlink(id: number, sub = M[id + LinkSlot.Sub]): number {
+			const dep = M[id + LinkSlot.Dep];
+			const prevDep = M[id + LinkSlot.PrevDep];
+			const nextDep = M[id + LinkSlot.NextDep];
+			const nextSub = M[id + LinkSlot.NextSub];
+			const prevSub = M[id + LinkSlot.PrevSub];
 			if (nextDep !== 0) {
-				M[nextDep + C.PREV_DEP] = prevDep;
+				M[nextDep + LinkSlot.PrevDep] = prevDep;
 			} else {
-				M[sub + C.DEPS_TAIL] = prevDep;
+				M[sub + NodeSlot.DepsTail] = prevDep;
 			}
 			if (prevDep !== 0) {
-				M[prevDep + C.NEXT_DEP] = nextDep;
+				M[prevDep + LinkSlot.NextDep] = nextDep;
 			} else {
-				M[sub + C.DEPS] = nextDep;
+				M[sub + NodeSlot.Deps] = nextDep;
 			}
 			if (nextSub !== 0) {
-				M[nextSub + C.PREV_SUB] = prevSub;
+				M[nextSub + LinkSlot.PrevSub] = prevSub;
 			} else {
-				M[dep + C.SUBS_TAIL] = prevSub;
+				M[dep + NodeSlot.SubsTail] = prevSub;
 			}
 			freeLink(id);
 			if (prevSub !== 0) {
-				M[prevSub + C.NEXT_SUB] = nextSub;
-			} else if (!(M[dep + C.SUBS] = nextSub)) {
+				M[prevSub + LinkSlot.NextSub] = nextSub;
+			} else if (!(M[dep + NodeSlot.Subs] = nextSub)) {
 				unwatched(dep);
 			}
 			return nextDep;
@@ -1661,7 +1656,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			if (retired) {
 				return shared.inner!.linkNode(dep, sub);
 			}
-			return link(dep, sub, M[C.CYCLE]);
+			return link(dep, sub, M[SysSlot.Cycle]);
 		}
 
 		function unlinkEdge(linkId: number): void {
@@ -1677,7 +1672,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 				shared.inner!.propagateNode(id, innerWrite);
 				return;
 			}
-			const subs = M[id + C.SUBS];
+			const subs = M[id + NodeSlot.Subs];
 			if (subs !== 0) {
 				bumpEpoch();
 				propagate(subs, innerWrite ?? runDepth !== 0);
@@ -1692,7 +1687,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 				shared.inner!.shallowPropagateNode(id);
 				return;
 			}
-			const subs = M[id + C.SUBS];
+			const subs = M[id + NodeSlot.Subs];
 			if (subs !== 0) {
 				bumpEpoch();
 				shallowPropagate(subs);
@@ -1707,17 +1702,17 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		// Inline delivery, like upstream's unwatched: callbacks run inside
 		// graph operations and are treated like effect-cleanup code.
 		function hostStartNode(id: number): void {
-			const flags = M[id + C.FLAGS];
-			if (flags & C.HOST_STARTED) {
+			const flags = M[id + NodeSlot.Flags];
+			if (flags & Flag.HostStarted) {
 				return;
 			}
-			M[id + C.FLAGS] = flags | C.HOST_STARTED;
+			M[id + NodeSlot.Flags] = flags | Flag.HostStarted;
 			hostState[id >> 3] = shared.hostStart!(id);
 		}
 
 		function hostStopNode(id: number): void {
-			const flags = M[id + C.FLAGS] & ~C.HOST_STARTED;
-			M[id + C.FLAGS] = flags;
+			const flags = M[id + NodeSlot.Flags] & ~Flag.HostStarted;
+			M[id + NodeSlot.Flags] = flags;
 			const state = hostState[id >> 3];
 			hostState[id >> 3] = undefined;
 			if (shared.hostStop !== undefined) {
@@ -1730,36 +1725,36 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			// queues), so it cannot throw and always drains the stack back to
 			// its base.
 			let cur = startLink;
-			let next = M[cur + C.NEXT_SUB];
-			const markBits = innerWrite ? C.PENDING | C.RECURSED : C.PENDING;
+			let next = M[cur + LinkSlot.NextSub];
+			const markBits = innerWrite ? Flag.Pending | Flag.Recursed : Flag.Pending;
 			const stackBase = propSp;
 
 			top: do {
-				const sub = M[cur + C.SUB];
-				let flags = M[sub + C.FLAGS];
+				const sub = M[cur + LinkSlot.Sub];
+				let flags = M[sub + NodeSlot.Flags];
 
-				if (!(flags & (C.RECURSED_CHECK | C.RECURSED | C.DIRTY | C.PENDING))) {
-					M[sub + C.FLAGS] = flags | markBits;
-				} else if (!(flags & (C.RECURSED_CHECK | C.RECURSED))) {
+				if (!(flags & (Flag.RecursedCheck | Flag.Recursed | Flag.Dirty | Flag.Pending))) {
+					M[sub + NodeSlot.Flags] = flags | markBits;
+				} else if (!(flags & (Flag.RecursedCheck | Flag.Recursed))) {
 					flags = 0;
-				} else if (!(flags & C.RECURSED_CHECK)) {
-					M[sub + C.FLAGS] = (flags & ~C.RECURSED) | C.PENDING;
-				} else if (!(flags & (C.DIRTY | C.PENDING)) && isValidLink(cur, sub)) {
-					M[sub + C.FLAGS] = flags | (C.RECURSED | C.PENDING);
-					flags &= C.MUTABLE;
+				} else if (!(flags & Flag.RecursedCheck)) {
+					M[sub + NodeSlot.Flags] = (flags & ~Flag.Recursed) | Flag.Pending;
+				} else if (!(flags & (Flag.Dirty | Flag.Pending)) && isValidLink(cur, sub)) {
+					M[sub + NodeSlot.Flags] = flags | (Flag.Recursed | Flag.Pending);
+					flags &= Flag.Mutable;
 				} else {
 					flags = 0;
 				}
 
-				if (flags & C.WATCHING) {
+				if (flags & Flag.Watching) {
 					notify(sub);
 				}
 
-				if (flags & C.MUTABLE) {
-					const subSubs = M[sub + C.SUBS];
+				if (flags & Flag.Mutable) {
+					const subSubs = M[sub + NodeSlot.Subs];
 					if (subSubs !== 0) {
 						cur = subSubs;
-						const nextSub = M[cur + C.NEXT_SUB];
+						const nextSub = M[cur + LinkSlot.NextSub];
 						if (nextSub !== 0) {
 							if (propSp === propStack.length) {
 								growPropStack();
@@ -1772,14 +1767,14 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 				}
 
 				if ((cur = next) !== 0) {
-					next = M[cur + C.NEXT_SUB];
+					next = M[cur + LinkSlot.NextSub];
 					continue;
 				}
 
 				while (propSp > stackBase) {
 					cur = propStack[--propSp];
 					if (cur !== 0) {
-						next = M[cur + C.NEXT_SUB];
+						next = M[cur + LinkSlot.NextSub];
 						continue top;
 					}
 				}
@@ -1801,43 +1796,43 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			// stack machinery and the try/finally for the hottest walks;
 			// anything deeper (pending deps, more links) falls through to
 			// the general loop unchanged.
-			if (M[startSub + C.FLAGS] & C.DIRTY) {
+			if (M[startSub + NodeSlot.Flags] & Flag.Dirty) {
 				return true;
 			}
-			const dep = M[startLink + C.DEP];
-			const depFlags = M[dep + C.FLAGS];
-			if ((depFlags & (C.MUTABLE | C.DIRTY)) === (C.MUTABLE | C.DIRTY)) {
-				if (updateAndShallow(dep, M[dep + C.SUBS])) {
+			const dep = M[startLink + LinkSlot.Dep];
+			const depFlags = M[dep + NodeSlot.Flags];
+			if ((depFlags & (Flag.Mutable | Flag.Dirty)) === (Flag.Mutable | Flag.Dirty)) {
+				if (updateAndShallow(dep, M[dep + NodeSlot.Subs])) {
 					// Same disposed-sub guard as the loop's return: update()
 					// may run user code that disposes the sub mid-walk.
-					return M[startSub + C.FLAGS] !== 0;
+					return M[startSub + NodeSlot.Flags] !== 0;
 				}
-				const nextDep = M[startLink + C.NEXT_DEP];
+				const nextDep = M[startLink + LinkSlot.NextDep];
 				if (!nextDep) {
 					return false;
 				}
 				startLink = nextDep;
-			} else if ((depFlags & (C.MUTABLE | C.PENDING)) === (C.MUTABLE | C.PENDING)) {
+			} else if ((depFlags & (Flag.Mutable | Flag.Pending)) === (Flag.Mutable | Flag.Pending)) {
 				// Two-level degenerate case: the pending dep has exactly one
 				// dep of its own and it is directly dirty — the shape of
 				// every effect one computed away from a written signal. The
 				// sequence mirrors the loop's descend-then-unwind for this
 				// shape: update the inner node (subs captured first), then
 				// either recompute the pending dep or clear its Pending.
-				const innerLink = M[dep + C.DEPS];
-				const inner = M[innerLink + C.DEP];
+				const innerLink = M[dep + NodeSlot.Deps];
+				const inner = M[innerLink + LinkSlot.Dep];
 				if (
-					!M[innerLink + C.NEXT_DEP]
-					&& (M[inner + C.FLAGS] & (C.MUTABLE | C.DIRTY)) === (C.MUTABLE | C.DIRTY)
+					!M[innerLink + LinkSlot.NextDep]
+					&& (M[inner + NodeSlot.Flags] & (Flag.Mutable | Flag.Dirty)) === (Flag.Mutable | Flag.Dirty)
 				) {
-					if (updateAndShallow(inner, M[inner + C.SUBS])) {
-						if (updateAndShallow(dep, M[dep + C.SUBS])) {
-							return M[startSub + C.FLAGS] !== 0;
+					if (updateAndShallow(inner, M[inner + NodeSlot.Subs])) {
+						if (updateAndShallow(dep, M[dep + NodeSlot.Subs])) {
+							return M[startSub + NodeSlot.Flags] !== 0;
 						}
 					} else {
-						M[dep + C.FLAGS] &= ~C.PENDING;
+						M[dep + NodeSlot.Flags] &= ~Flag.Pending;
 					}
-					const nextDep = M[startLink + C.NEXT_DEP];
+					const nextDep = M[startLink + LinkSlot.NextDep];
 					if (!nextDep) {
 						return false;
 					}
@@ -1850,10 +1845,10 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			// needs no traversal stack — the descent is unbranched, and the
 			// unwind path is recoverable by climbing each node's unique
 			// subscriber link. deep/grid/island cones are exactly this shape.
-			if (!M[startLink + C.NEXT_DEP]) {
+			if (!M[startLink + LinkSlot.NextDep]) {
 				const r = chainCheck(startLink);
 				if (r >= 0) {
-					return r !== 0 && M[startSub + C.FLAGS] !== 0;
+					return r !== 0 && M[startSub + NodeSlot.Flags] !== 0;
 				}
 			}
 			const stackBase = checkSp;
@@ -1869,7 +1864,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		// (the re-track may rebuild the list), exactly as upstream.
 		function updateAndShallow(node: number, subs: number): boolean {
 			if (update(node)) {
-				if (M[subs + C.NEXT_SUB] !== 0) {
+				if (M[subs + LinkSlot.NextSub] !== 0) {
 					shallowPropagate(subs);
 				}
 				return true;
@@ -1889,20 +1884,20 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			let depth = 0;
 			let dep = 0;
 			while (true) {
-				dep = M[link + C.DEP];
-				const flags = M[dep + C.FLAGS];
-				if ((flags & (C.MUTABLE | C.DIRTY)) === (C.MUTABLE | C.DIRTY)) {
+				dep = M[link + LinkSlot.Dep];
+				const flags = M[dep + NodeSlot.Flags];
+				if ((flags & (Flag.Mutable | Flag.Dirty)) === (Flag.Mutable | Flag.Dirty)) {
 					break; // dirty base found
 				}
-				if ((flags & (C.MUTABLE | C.PENDING)) !== (C.MUTABLE | C.PENDING)) {
+				if ((flags & (Flag.Mutable | Flag.Pending)) !== (Flag.Mutable | Flag.Pending)) {
 					return -1; // clean or non-mutable dep: not a resolvable chain
 				}
-				const depDeps = M[dep + C.DEPS];
-				if (!depDeps || M[depDeps + C.NEXT_DEP] !== 0) {
+				const depDeps = M[dep + NodeSlot.Deps];
+				if (!depDeps || M[depDeps + LinkSlot.NextDep] !== 0) {
 					return -1; // branching deps
 				}
-				const depSubs = M[dep + C.SUBS];
-				if (!depSubs || M[depSubs + C.NEXT_SUB] !== 0) {
+				const depSubs = M[dep + NodeSlot.Subs];
+				if (!depSubs || M[depSubs + LinkSlot.NextSub] !== 0) {
 					return -1; // shared node: the climb needs a unique subscriber
 				}
 				link = depDeps;
@@ -1911,15 +1906,15 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			if (!depth) {
 				return -1; // directly-dirty first dep: the shallow paths own this
 			}
-			let changed = updateAndShallow(dep, M[dep + C.SUBS]);
+			let changed = updateAndShallow(dep, M[dep + NodeSlot.Subs]);
 			let node = dep;
 			while (depth--) {
-				const up = M[node + C.SUBS];
-				const sub = M[up + C.SUB];
+				const up = M[node + NodeSlot.Subs];
+				const sub = M[up + LinkSlot.Sub];
 				if (changed) {
-					changed = updateAndShallow(sub, M[sub + C.SUBS]);
+					changed = updateAndShallow(sub, M[sub + NodeSlot.Subs]);
 				} else {
-					M[sub + C.FLAGS] &= ~C.PENDING;
+					M[sub + NodeSlot.Flags] &= ~Flag.Pending;
 				}
 				node = sub;
 			}
@@ -1931,28 +1926,28 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			let dirty = false;
 
 			top: do {
-				const dep = M[cur + C.DEP];
-				const depFlags = M[dep + C.FLAGS];
+				const dep = M[cur + LinkSlot.Dep];
+				const depFlags = M[dep + NodeSlot.Flags];
 
-				if (M[sub + C.FLAGS] & C.DIRTY) {
+				if (M[sub + NodeSlot.Flags] & Flag.Dirty) {
 					dirty = true;
-				} else if ((depFlags & (C.MUTABLE | C.DIRTY)) === (C.MUTABLE | C.DIRTY)) {
-					if (updateAndShallow(dep, M[dep + C.SUBS])) {
+				} else if ((depFlags & (Flag.Mutable | Flag.Dirty)) === (Flag.Mutable | Flag.Dirty)) {
+					if (updateAndShallow(dep, M[dep + NodeSlot.Subs])) {
 						dirty = true;
 					}
-				} else if ((depFlags & (C.MUTABLE | C.PENDING)) === (C.MUTABLE | C.PENDING)) {
+				} else if ((depFlags & (Flag.Mutable | Flag.Pending)) === (Flag.Mutable | Flag.Pending)) {
 					if (checkSp === checkStack.length) {
 						growCheckStack();
 					}
 					checkStack[checkSp++] = cur;
-					cur = M[dep + C.DEPS];
+					cur = M[dep + NodeSlot.Deps];
 					sub = dep;
 					++checkDepth;
 					continue;
 				}
 
 				if (!dirty) {
-					const nextDep = M[cur + C.NEXT_DEP];
+					const nextDep = M[cur + LinkSlot.NextDep];
 					if (nextDep !== 0) {
 						cur = nextDep;
 						continue;
@@ -1962,16 +1957,16 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 				while (checkDepth--) {
 					cur = checkStack[--checkSp];
 					if (dirty) {
-						if (updateAndShallow(sub, M[sub + C.SUBS])) {
-							sub = M[cur + C.SUB];
+						if (updateAndShallow(sub, M[sub + NodeSlot.Subs])) {
+							sub = M[cur + LinkSlot.Sub];
 							continue;
 						}
 						dirty = false;
 					} else {
-						M[sub + C.FLAGS] &= ~C.PENDING;
+						M[sub + NodeSlot.Flags] &= ~Flag.Pending;
 					}
-					sub = M[cur + C.SUB];
-					const nextDep = M[cur + C.NEXT_DEP];
+					sub = M[cur + LinkSlot.Sub];
+					const nextDep = M[cur + LinkSlot.NextDep];
 					if (nextDep !== 0) {
 						cur = nextDep;
 						continue top;
@@ -1981,31 +1976,31 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 				// Upstream: `dirty && !!sub.flags` — a live node always has
 				// its kind bits set; flags reads 0 only if sub was disposed
 				// (record zeroed) by re-entrant user code during update().
-				return dirty && M[sub + C.FLAGS] !== 0;
+				return dirty && M[sub + NodeSlot.Flags] !== 0;
 			} while (true);
 		}
 
 		function shallowPropagate(startLink: number): void {
 			let cur = startLink;
 			do {
-				const sub = M[cur + C.SUB];
-				const flags = M[sub + C.FLAGS];
-				if ((flags & (C.PENDING | C.DIRTY)) === C.PENDING) {
-					M[sub + C.FLAGS] = flags | C.DIRTY;
-					if ((flags & (C.WATCHING | C.RECURSED_CHECK)) === C.WATCHING) {
+				const sub = M[cur + LinkSlot.Sub];
+				const flags = M[sub + NodeSlot.Flags];
+				if ((flags & (Flag.Pending | Flag.Dirty)) === Flag.Pending) {
+					M[sub + NodeSlot.Flags] = flags | Flag.Dirty;
+					if ((flags & (Flag.Watching | Flag.RecursedCheck)) === Flag.Watching) {
 						notify(sub);
 					}
 				}
-			} while ((cur = M[cur + C.NEXT_SUB]) !== 0);
+			} while ((cur = M[cur + LinkSlot.NextSub]) !== 0);
 		}
 
 		function isValidLink(checkLink: number, sub: number): boolean {
-			let cur = M[sub + C.DEPS_TAIL];
+			let cur = M[sub + NodeSlot.DepsTail];
 			while (cur !== 0) {
 				if (cur === checkLink) {
 					return true;
 				}
-				cur = M[cur + C.PREV_DEP];
+				cur = M[cur + LinkSlot.PrevDep];
 			}
 			return false;
 		}
@@ -2017,9 +2012,9 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		// captured BEFORE the host code runs: a write from inside it moves
 		// the epoch past entryEpoch, so the stamp can only miss, never lie.
 		function update(node: number): boolean {
-			const flags = M[node + C.FLAGS];
-			const entryEpoch = D[C.EPOCH_F64];
-			M[node + C.FLAGS] = (flags & (C.WATCHING | C.STICKY | C.LIVE | C.PUBLIC_MASK & ~C.DIRTY & ~C.PENDING)) | C.MUTABLE;
+			const flags = M[node + NodeSlot.Flags];
+			const entryEpoch = D[SysSlot.EpochF64];
+			M[node + NodeSlot.Flags] = (flags & (Flag.Watching | Flag.Sticky | Flag.Live | Flag.PublicMask & ~Flag.Dirty & ~Flag.Pending)) | Flag.Mutable;
 			const changed = shared.hostUpdate === undefined ? true : shared.hostUpdate(node, flags);
 			D[(node >> 1) + 3] = entryEpoch;
 			return changed;
@@ -2029,17 +2024,17 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		// the propagation ladder lands here for WATCHING nodes; clearing the
 		// bit is the dedup (one notification until the host re-arms it).
 		function notify(e: number): void {
-			M[e + C.FLAGS] &= ~C.WATCHING;
+			M[e + NodeSlot.Flags] &= ~Flag.Watching;
 			const hostNotify = shared.hostNotify;
 			if (hostNotify !== undefined) {
-				hostNotify(e, M[e + C.GEN]);
+				hostNotify(e, M[e + NodeSlot.Gen]);
 			}
 		}
 
 		function unwatched(node: number): void {
-			if (M[node + C.FLAGS] & C.HOST_STARTED) {
+			if (M[node + NodeSlot.Flags] & Flag.HostStarted) {
 				hostStopNode(node);
-				if (M[node + C.SUBS] !== 0) {
+				if (M[node + NodeSlot.Subs] !== 0) {
 					return; // stop() re-subscribed the node; it is watched again
 				}
 			}
@@ -2047,7 +2042,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			// invalidations, so its cached verification must not be trusted
 			// if something re-subscribes later.
 			D[(node >> 1) + 3] = 0;
-			if (M[node + C.FLAGS] & C.ORPHANED) {
+			if (M[node + NodeSlot.Flags] & Flag.Orphaned) {
 				reclaimOrphan(node); // owner already collected; nothing can re-subscribe
 			}
 		}
@@ -2072,12 +2067,12 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 				shared.inner!.orphan(id);
 				return;
 			}
-			const flags = M[id + C.FLAGS];
-			if (!(flags & C.LIVE)) {
+			const flags = M[id + NodeSlot.Flags];
+			if (!(flags & Flag.Live)) {
 				return; // already reclaimed
 			}
-			if (M[id + C.SUBS] !== 0) {
-				M[id + C.FLAGS] = flags | C.ORPHANED;
+			if (M[id + NodeSlot.Subs] !== 0) {
+				M[id + NodeSlot.Flags] = flags | Flag.Orphaned;
 			} else {
 				reclaimOrphan(id);
 			}
@@ -2087,7 +2082,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		// record's edges and queue it for the free list. Zero-flags-first
 		// mirrors disposeInner's re-entrancy guard.
 		function reclaimOrphan(id: number): void {
-			M[id + C.FLAGS] = 0;
+			M[id + NodeSlot.Flags] = 0;
 			disposeAllDepsInReverse(id);
 			pendingFree.push(id);
 			shared.boundaryPending = true;
@@ -2095,17 +2090,17 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		}
 
 		function disposeAllDepsInReverse(sub: number): void {
-			let cur = M[sub + C.DEPS_TAIL];
+			let cur = M[sub + NodeSlot.DepsTail];
 			while (cur !== 0) {
-				const prev = M[cur + C.PREV_DEP];
+				const prev = M[cur + LinkSlot.PrevDep];
 				unlink(cur, sub);
 				cur = prev;
 			}
 		}
 
 		function purgeDeps(sub: number): void {
-			const depsTail = M[sub + C.DEPS_TAIL];
-			let dep = depsTail !== 0 ? M[depsTail + C.NEXT_DEP] : M[sub + C.DEPS];
+			const depsTail = M[sub + NodeSlot.DepsTail];
+			let dep = depsTail !== 0 ? M[depsTail + LinkSlot.NextDep] : M[sub + NodeSlot.Deps];
 			while (dep !== 0) {
 				dep = unlink(dep, sub);
 			}
@@ -2123,22 +2118,22 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 				shared.inner!.trigger(fn);
 				return;
 			}
-			const sub = allocNode(C.WATCHING | C.RECURSED_CHECK);
+			const sub = allocNode(Flag.Watching | Flag.RecursedCheck);
 			const prevSub = activeSub;
 			activeSub = sub;
 			++batchDepth;
-			++M[C.ENTER_DEPTH];
+			++M[SysSlot.EnterDepth];
 			try {
 				fn();
 			} finally {
 				activeSub = prevSub;
-				++D[C.EPOCH_F64];
-				M[sub + C.FLAGS] = 0;
-				let cur = M[sub + C.DEPS];
+				++D[SysSlot.EpochF64];
+				M[sub + NodeSlot.Flags] = 0;
+				let cur = M[sub + NodeSlot.Deps];
 				while (cur !== 0) {
-					const dep = M[cur + C.DEP];
+					const dep = M[cur + LinkSlot.Dep];
 					cur = unlink(cur, sub);
-					const subs = M[dep + C.SUBS];
+					const subs = M[dep + NodeSlot.Subs];
 					if (subs !== 0) {
 						propagate(subs, runDepth !== 0);
 						shallowPropagate(subs);
@@ -2147,7 +2142,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 				pendingFree.push(sub);
 				shared.boundaryPending = true;
 				shared.scheduleMaintenance();
-				--M[C.ENTER_DEPTH];
+				--M[SysSlot.EnterDepth];
 				if (!--batchDepth) {
 					const hostFlush = shared.hostFlush;
 					if (hostFlush !== undefined) {
