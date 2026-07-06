@@ -1,5 +1,5 @@
 {
-	"name": "dalien-signals",
+	"name": "dalien-signals-userspace",
 	"version": "3.2.1",
 	"license": "MIT",
 	"description": "alien-signals with a data-oriented memory layout.",
