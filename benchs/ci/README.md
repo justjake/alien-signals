@@ -49,7 +49,7 @@ To update the patch after changing the harness fork locally:
 `pull-run.mjs` syncs a green CI run into the repo — data, charts, and README:
 
 ```sh
-node benchs/ci/pull-run.mjs --run <run-id> [--repo justjake/alien-signals] [--dry]
+node benchs/ci/pull-run.mjs --run <run-id> [--repo justjake/dalien-signals] [--dry]
 ```
 
 It downloads the run's `benchmark-<runtime>` artifacts, copies each results

@@ -5,7 +5,7 @@
 // `<!-- benchmark:<name>:end -->`).
 //
 // Usage:
-//   node benchs/ci/pull-run.mjs --run <run-id> [--repo justjake/alien-signals]
+//   node benchs/ci/pull-run.mjs --run <run-id> [--repo justjake/dalien-signals]
 //                               [--dry] [--no-readme]
 //
 // --dry writes everything under /tmp/pull-run-<id>/ instead of the repo, so
@@ -26,7 +26,7 @@ const flag = (name) => {
 	return args[i + 1];
 };
 const RUN = flag('--run');
-const REPO = flag('--repo') ?? 'justjake/alien-signals';
+const REPO = flag('--repo') ?? 'justjake/dalien-signals';
 const DRY = args.includes('--dry');
 const NO_README = args.includes('--no-readme');
 if (!RUN) {
