@@ -139,6 +139,17 @@ const system = createReactiveSystem({
 		checkDirty = arena.checkDirty;
 		shallowPropagate = arena.shallowPropagate;
 		freeNode = arena.freeNode;
+		// Presize the side columns to the arena's record capacity: a
+		// mint-heavy burst then never pays incremental backing-store
+		// doubling (and the copying it implies) on its own clock.
+		const cap = arena.memory.length >> Arena.NodeIndexShift;
+		if (currentVals.length < cap) {
+			currentVals.length = cap;
+			pendingVals.length = cap;
+			fns.length = cap;
+			cleanups.length = cap;
+			owned.length = cap;
+		}
 	},
 	update: function updateNode(id, flags): boolean {
 		if ((flags & Host.KindMask) === Host.Signal) {
@@ -475,11 +486,19 @@ export function growCapacity(records: number): void {
  */
 export function reset(): void {
 	system.reset();
+	// Truncate-then-represize: drops every held value while keeping the
+	// columns at capacity (no regrow tax on the next mint burst).
+	const cap = M.length >> Arena.NodeIndexShift;
 	currentVals.length = 0;
 	pendingVals.length = 0;
 	fns.length = 0;
 	cleanups.length = 0;
 	owned.length = 0;
+	currentVals.length = cap;
+	pendingVals.length = cap;
+	fns.length = cap;
+	cleanups.length = cap;
+	owned.length = cap;
 	pendingRegions.length = 0;
 	queued.length = 0;
 	queuedGens.length = 0;
