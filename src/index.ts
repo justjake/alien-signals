@@ -455,21 +455,16 @@ export function computed<T>(getter: (previousValue?: T) => T): () => T {
 		children: [],
 	};
 	const oper = anon((): T => {
-		if (!e.verified(id)) {
-			if (e.nodeFlags(id) & ReactiveFlags.RecursedCheck) {
-				// Re-entrant self-read during our own recompute: hand back
-				// the stale value instead of recursing (upstream parity).
-			} else if (e.verify(id)) {
-				if (recompute(id, st)) {
-					e.shallowPropagate(id);
-				}
-				st.evaluated = true;
-			} else if (!st.evaluated) {
-				st.evaluated = true;
-				recompute(id, st);
+		if (!st.evaluated) {
+			st.evaluated = true;
+			recompute(id, st);
+			e.track(id);
+		} else if (e.pull(id) !== 0) {
+			if (recompute(id, st)) {
+				e.shallowPropagate(id);
 			}
+			e.track(id);
 		}
-		e.track(id);
 		return st.value as T;
 	});
 	const id = system.custom(Kind.Computed | ReactiveFlags.Mutable, oper);

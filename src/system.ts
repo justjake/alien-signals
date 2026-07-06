@@ -237,8 +237,14 @@ export interface ReactiveEngine {
 	endTracking(id: NodeId): void;
 	/** Mark definitely-changed and kill the quiet-read stamp. */
 	markDirty(id: NodeId): void;
-	/** Link `id` to the active subscriber, if anything is tracking. */
-	track(id: NodeId): void;
+	/** Link `id` to the active subscriber (if tracking); returns its flags. */
+	track(id: NodeId): number;
+	/**
+	 * The fused value-read protocol: stamp gate, reentrancy guard,
+	 * verification, tracking, clean-path stamping. 0 = return the cached
+	 * value; 1 = update, shallowPropagate on change, then track.
+	 */
+	pull(id: NodeId): number;
 	/**
 	 * Run `fn(arg)` as `id`'s tracked evaluation: the fused equivalent of
 	 * setActiveSub + beginTracking + fn + endTracking + restore.
@@ -325,8 +331,14 @@ export interface ReactiveSystem {
 	endTracking(id: NodeId): void;
 	/** Mark definitely-changed and kill the quiet-read stamp. */
 	markDirty(id: NodeId): void;
-	/** Link `id` to the active subscriber, if anything is tracking. */
-	track(id: NodeId): void;
+	/** Link `id` to the active subscriber (if tracking); returns its flags. */
+	track(id: NodeId): number;
+	/**
+	 * The fused value-read protocol: stamp gate, reentrancy guard,
+	 * verification, tracking, clean-path stamping. 0 = return the cached
+	 * value; 1 = update, shallowPropagate on change, then track.
+	 */
+	pull(id: NodeId): number;
 	/**
 	 * Run `fn(arg)` as `id`'s tracked evaluation: the fused equivalent of
 	 * setActiveSub + beginTracking + fn + endTracking + restore.
@@ -749,6 +761,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		endTracking: uninitialized,
 		markDirty: uninitialized,
 		track: uninitialized,
+		pull: uninitialized,
 		runTracked: uninitialized,
 		nodeFlags: uninitialized,
 		setNodeFlags: uninitialized,
@@ -841,8 +854,11 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		markDirty(id: NodeId): void {
 			ensureEngine().markDirty(id);
 		},
-		track(id: NodeId): void {
-			ensureEngine().track(id);
+		track(id: NodeId): number {
+			return ensureEngine().track(id);
+		},
+		pull(id: NodeId): number {
+			return ensureEngine().pull(id);
 		},
 		runTracked(id: NodeId, fn: (arg: unknown) => unknown, arg: unknown): unknown {
 			return ensureEngine().runTracked(id, fn, arg);
@@ -1024,6 +1040,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		endTracking,
 		markDirty,
 		track,
+		pull,
 		runTracked,
 		nodeFlags: nodeFlagsOf,
 		setNodeFlags: setNodeFlagsOf,
@@ -1255,15 +1272,57 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			D[(id >> 1) + 3] = 0;
 		}
 
-		/** Link `id` to the active subscriber, if anything is tracking. */
-		function track(id: number): void {
+		// Link `id` to the active subscriber (if tracking) and hand back the
+		// flags word in the same frame: a userspace signal read is ONE call.
+		function track(id: number): number {
 			if (retired) {
-				shared.inner!.track(id);
-				return;
+				return shared.inner!.track(id);
 			}
 			if (activeSub !== 0) {
 				link(id, activeSub, cycle);
 			}
+			return M[id + C.FLAGS];
+		}
+
+		// The fused read protocol for value-kinds: stamp gate, reentrancy
+		// guard, verification, tracking, and clean-path stamping in one
+		// frame — the loads stay in registers instead of being re-derived
+		// across verb boundaries. Returns 0 when the cached value may be
+		// returned as-is; 1 when the caller must update (recompute, then
+		// shallowPropagate on change, then track).
+		function pull(id: number): number {
+			if (D[(id >> 1) + 3] === epoch) {
+				if (activeSub !== 0) {
+					link(id, activeSub, cycle);
+				}
+				return 0;
+			}
+			if (retired) {
+				return shared.inner!.pull(id);
+			}
+			const flags = M[id + C.FLAGS];
+			if (flags & C.RECURSED_CHECK) {
+				// Re-entrant self-read mid-recompute: stale read by contract.
+				if (activeSub !== 0) {
+					link(id, activeSub, cycle);
+				}
+				return 0;
+			}
+			if (flags & C.DIRTY) {
+				return 1;
+			}
+			if (flags & C.PENDING) {
+				const entryEpoch = epoch;
+				if (checkDirty(M[id + C.DEPS], id)) {
+					return 1;
+				}
+				M[id + C.FLAGS] &= ~C.PENDING;
+				D[(id >> 1) + 3] = entryEpoch;
+			}
+			if (activeSub !== 0) {
+				link(id, activeSub, cycle);
+			}
+			return 0;
 		}
 
 		function freeRecordCounts(): { freeNodeRecords: number; freeLinkRecords: number } {
