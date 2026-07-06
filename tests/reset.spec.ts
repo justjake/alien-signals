@@ -39,7 +39,7 @@ test('reset() rewinds the arena and the system keeps working', () => {
 
 test('reset() restores capacity consumed by a dead generation', () => {
 	const sys = createReactiveSystem({ initialRecords: 1 << 12 });
-	// Burn most of the plane across generations; without reset this throws.
+	// Burn most of the arena across generations; without reset this throws.
 	for (let generation = 0; generation < 20; generation++) {
 		for (let i = 0; i < 1000; i++) {
 			sys.makeSignal(i);

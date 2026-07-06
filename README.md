@@ -9,6 +9,14 @@
 
 # dalien-signals
 
+`dalien-signals` is a data-oriented fork of [alien-signals][], a fast [signals][tc39] reactivity library. Its reactive dependency graph is stored in a single `Int32Array` memory [arena][arena-wikipedia], like a contiguous array of structs in C.
+
+The default arena's backing `ArrayBuffer` is 256 MB. Large zero-filled buffers are typically demand-paged, or lazily committed: allocation reserves virtual address space, but resident physical memory grows only as pages are touched. An untouched 256 MB arena therefore does not usually occupy 256 MB of RAM. Exact behavior depends on the JavaScript engine and operating system.
+
+It implements the alien-signals 3.2.1 API directly; alien-signals is not a runtime dependency.
+
+## How signals work
+
 `dalien-signals` keeps calculations and callbacks in sync with changing values. It provides three main primitives:
 
 - A `signal` stores a value. Call it with no argument to read it, or with an argument to write it.
@@ -37,8 +45,6 @@ flowchart LR
 ```
 
 Arrows point from a value to the work that depends on it. Changing `count` reaches the effect through two paths, but queues it once. Each computed returns its current value when the effect reads it.
-
-`dalien-signals` is based on [alien-signals](https://github.com/stackblitz/alien-signals) 3.2.1. It implements the same operations with a different storage engine; alien-signals is not a dependency.
 
 ## How updates work
 
@@ -89,7 +95,7 @@ export declare function setActiveSub(
 ): ReactiveNode | undefined;
 
 /**
- * Set the fixed arena capacity before creating any reactive values.
+ * Set the arena's starting capacity before creating any reactive values.
  * `initialRecords` defaults to 8,388,608 32-byte records.
  *
  * @example
@@ -307,7 +313,8 @@ Other performance details:
 
 ## Constraints
 
-- The arena does not grow. Call `configure({ initialRecords })` before creating reactive values to change its capacity. By default, it asks the operating system for a 256 MB address range holding 8,388,608 records; physical memory is consumed only for records that are touched. Running out of records throws.
+- The arena grows between operations. Once 3/4 full, the engine is rebuilt over an arena twice the size; every record is copied and IDs survive, so functions created before a growth keep working. Measured cost: benchmark totals within noise, and reads that hit the epoch fast path pay nothing.
+- Growth cannot move the arena under a running callback. A single effect or computed callback that allocates past the remaining quarter of the arena throws; `configure({ initialRecords })` sets a larger starting capacity for allocation-heavy paths. By default the arena asks the operating system for a 256 MB address range holding 8,388,608 records; physical memory is consumed only for records that are touched.
 - The JavaScript runtime must support `FinalizationRegistry`, which is part of ES2021.
 - The original `alien-signals` can be faster when repeatedly updating one tiny graph or a long single chain. This arena performs better when one write updates many dependents, and it allocates fewer graph objects for the garbage collector. See `benchs/propagateSustained.mjs`, `benchs/crossover.mjs`, and `benchs/memoryUsage.mjs`.
 
@@ -416,4 +423,8 @@ The final chart uses another [js-reactivity-benchmark fork](https://github.com/t
 
 ## Origin
 
-This package is a data-oriented fork of [alien-signals](https://github.com/stackblitz/alien-signals). Its repository contains the original algorithm history, ports, and related projects.
+The [alien-signals][] repository contains the original algorithm history, ports, and related projects.
+
+[alien-signals]: https://github.com/stackblitz/alien-signals
+[tc39]: https://github.com/tc39/proposal-signals
+[arena-wikipedia]: https://en.wikipedia.org/wiki/Region-based_memory_management

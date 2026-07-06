@@ -10,7 +10,7 @@ async function drainFinalizers(): Promise<void> {
 	}
 }
 
-// A plane of 4096 records holds ~1300 signal+computed+link triples. Three
+// A arena of 4096 records holds ~1300 signal+computed+link triples. Three
 // batches only fit if records from collected handles are reclaimed; without
 // the FinalizationRegistry path the third batch throws capacity-exhausted.
 test('records of collected signal/computed handles are reclaimed', async () => {

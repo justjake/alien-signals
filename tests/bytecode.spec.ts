@@ -42,7 +42,7 @@ const BUDGETS: Record<string, number> = {
 	unlinkChildEffects: 200,
 	// public operations
 	read: 160,
-	write: 160,
+	write: 200, // +19 bytecodes for the retired-engine forward guard (arena growth)
 	computedRead: INLINE_LIMIT, // id-level / reclaim-off entry point
 	computedReadWith: INLINE_LIMIT, // reclaim-mode handle entry point (carries the getter)
 	// scheduler

@@ -1,17 +1,17 @@
-/**
+/*
  * dalien-signals system: the alien-signals v3.2.x algorithm on a
- * data-oriented, interleaved Int32Array record plane.
+ * data-oriented, interleaved Int32Array record arena.
  *
  * This replaces the upstream object-graph kernel (ReactiveNode/Link objects,
  * cons-cell traversal stacks) with the layout proven in this repo's research
  * program (libs/arena, 179/179 reactive-framework-test-suite conformance;
  * see research/RESEARCH.md §7b and research/packed-structs-guide.md):
  *
- * - Nodes and links are integer ids into ONE flat Int32Array plane (M),
+ * - Nodes and links are integer ids into ONE flat Int32Array arena (M),
  *   stride 8; ids are pre-multiplied record offsets (id = recordIndex * 8) so
  *   field access is `M[id + FIELD]`. Nodes and links interleave in the same
- *   plane: single base register, single bump pointer, two free lists (plane
- *   merge measured -2% deep / -8% diamond vs split planes). Record 0 is
+ *   arena: single base register, single bump pointer, two free lists (arena
+ *   merge measured -2% deep / -8% diamond vs split arenas). Record 0 is
  *   burned as NULL, so every `x !== undefined` upstream becomes `x !== 0`.
  * - Values and functions live in packed side arrays indexed off the id
  *   (`values` holds two slots per record: current/computed value + signal
@@ -29,25 +29,34 @@
  *   kExceedsBytecodeLimit) and never inlined into the read paths; the split
  *   measured deep -8% / broad -10% / diamond -13%.
  *
- * CAPACITY (fixed plane, zero-indirection handles): the whole engine —
- * including every user-facing handle closure — closes over `const M`
- * (TurboFan embeds the base address; measured at exact const parity — see
- * the v8-growable-buffer-bindings note cited in RESEARCH.md §7). The plane
- * is FIXED CAPACITY and never moves: that is what makes it safe for handles
- * to capture M directly and call the engine's read/write/computedRead as
- * direct closure-scope calls (upstream-parity hop count). Capacity is
- * virtual until touched (large typed arrays are lazily-mapped zero pages),
- * defaults to 8M records (256 MB virtual), and is set per system with
- * configure({ initialRecords }) BEFORE first use; exhausting it throws a
- * loud, actionable error. Buffers are allocated LAZILY: importing the
- * library costs nothing; the plane comes into being at the first primitive
- * creation or when `configure()` is called, whichever happens first
- * (configure() is the browser-friendly sizing knob — there is deliberately
- * no environment-variable path, matching upstream's zero use of
- * `process.env`). Rejected alternatives (measured, do not relitigate):
- * growth via segment tables, resizable ArrayBuffers, mutable `let` buffer
- * bindings, per-function const aliases — every growth-support mechanism
- * puts a tax on the read path.
+ * CAPACITY (immovable arena, zero-indirection handles, growth by
+ * migration): the whole engine — including every user-facing handle
+ * closure — closes over `const M` (TurboFan embeds the base address;
+ * measured at exact const parity — see the v8-growable-buffer-bindings
+ * note cited in RESEARCH.md §7). A given arena NEVER grows or moves: that
+ * is what makes it safe for handles to capture M directly and call the
+ * engine's read/write/computedRead as direct closure-scope calls
+ * (upstream-parity hop count). The SYSTEM grows anyway — by migration:
+ * when the bump pointer passes 3/4 of capacity, the factory (at the next
+ * operation boundary, enterDepth === 0) builds a new engine over an arena
+ * twice the size, copies the live prefix (ids are arena-relative offsets,
+ * so every id survives), and retires the old engine; retired entry points
+ * forward to the current engine, so pre-growth handles keep working one
+ * hop behind. Measured cost of the forwarding guards: suite-total within
+ * noise (+0.4%); the quiet-read fast paths carry no guard at all (a
+ * retired arena is zeroed, so its stamps can never hit), and read/write
+ * fold the check into kind bits of a flags word they already load.
+ * Capacity is virtual until touched (large typed arrays are lazily-mapped
+ * zero pages), defaults to 8M records (256 MB virtual), and the STARTING
+ * size is set per system with configure({ initialRecords }) BEFORE first
+ * use. Exhausting the headroom quarter INSIDE one operation (a single
+ * effect/computed body minting that many nodes mid-run) still throws: no
+ * live frame may hold a retired arena. Buffers are allocated LAZILY:
+ * importing the library costs nothing. Rejected growth alternatives
+ * (measured, do not relitigate): segment tables, resizable ArrayBuffers,
+ * mutable `let` buffer bindings, per-function const aliases — each taxes
+ * every hot-walk access; migration confines the cost to public entry of
+ * retired engines.
  *
  * RECLAMATION: effect/effectScope disposal returns node records to the free
  * list (deferred to the next operation boundary so a mid-flush dispose can
@@ -72,20 +81,28 @@
 // Values match upstream alien-signals exactly. Hot code never touches this
 // object — it uses the same-file `const enum C` below, which every toolchain
 // inlines as numeric literals.
+/** Public update-state bits exposed by {@link ReactiveNode.flags}. */
 export enum ReactiveFlags {
+	/** No update-state bits are set. */
 	None = 0,
+	/** Changes can continue through this node to its dependents. */
 	Mutable = 1,
+	/** This node is an effect that should be queued when reached. */
 	Watching = 2,
+	/** The engine is watching for a write that loops back into the active callback. */
 	RecursedCheck = 4,
+	/** A recursive write reached this node. */
 	Recursed = 8,
+	/** This node is known to need an update. */
 	Dirty = 16,
+	/** An earlier dependency may require this node to update. */
 	Pending = 32,
 }
 
 /**
- * The subscriber view handed out by index.ts's getActiveSub(): the semantic
- * flags word of a live node. Reading/writing `flags` goes straight to the
- * record plane (kind bits are engine-owned and masked out of this view).
+ * A live view of the node currently recording dependency reads.
+ * Reading or writing `flags` accesses its public update-state bits directly;
+ * node-type and memory-management bits are hidden.
  */
 export interface ReactiveNode {
 	flags: ReactiveFlags;
@@ -99,7 +116,7 @@ export interface ReactiveNode {
 // Same-file const enum members are inlined as numeric literals by esbuild
 // (transform AND bundle modes), tsx, vitest, and tsc alike.
 const enum C {
-	// Node fields (M plane, stride 8; ids are pre-multiplied: id = record * 8).
+	// Node fields (M arena, stride 8; ids are pre-multiplied: id = record * 8).
 	FLAGS = 0,
 	DEPS = 1, // doubles as the free-list next pointer for freed node records
 	DEPS_TAIL = 2,
@@ -112,7 +129,7 @@ const enum C {
 	VSTAMP_HI = 6,
 	VSTAMP_LO = 7,
 
-	// Link fields (M plane, stride 8; link records share the plane with nodes).
+	// Link fields (M arena, stride 8; link records share the arena with nodes).
 	VERSION = 0,
 	DEP = 1,
 	SUB = 2,
@@ -152,13 +169,14 @@ const enum C {
 	PUBLIC_MASK = 127,
 }
 
-// Default plane capacity: 8M records x 32 B = 256 MB of mostly-untouched
+// Default STARTING capacity: 8M records x 32 B = 256 MB of mostly-untouched
 // (lazily mapped) zero pages — physical memory tracks records actually
-// touched. The plane is FIXED CAPACITY: it never grows or moves, which is
-// what lets every handle closure capture `const M` directly and reach the
-// engine with zero indirection (the measured alternative — growable buffers
-// behind any mutable binding or segment table — costs 26-83% on hot walks;
-// see the header note). Override per system via configure({ initialRecords })
+// touched. A given arena never grows or moves, which is what lets every
+// handle closure capture `const M` directly and reach the engine with zero
+// indirection (the measured alternative — growable buffers behind any
+// mutable binding or segment table — costs 26-83% on hot walks; see the
+// header note). The system grows past this by engine migration (see the
+// CAPACITY header note). Override per system via configure({ initialRecords })
 // or createReactiveSystem({ initialRecords }) BEFORE the first primitive is
 // created — nothing is allocated until then.
 const DEFAULT_RECORDS = 1 << 23;
@@ -240,10 +258,11 @@ function uninitialized(): never {
 
 /**
  * Id-level operations of the live engine, exposed as {@link ReactiveSystem.e}.
- * Assigned at materialization and stable thereafter (the plane is fixed
- * capacity, so the engine is never rebuilt). Handles returned by the make*
- * methods do NOT go through this object — they are closures minted inside
- * the engine over `const M`, calling these functions directly.
+ * Reassigned when the arena grows (the engine is rebuilt over the larger
+ * arena); stale references keep working — retired engines forward to the
+ * current one. Handles returned by the make* methods do NOT go through this
+ * object — they are closures minted inside the engine over `const M`,
+ * calling these functions directly.
  */
 export interface ReactiveEngine {
 	read(id: number): unknown;
@@ -268,11 +287,13 @@ export type SignalHandle = {
 export interface ReactiveSystem {
 	/**
 	 * The live engine (id-level entry points). Assigned at materialization,
-	 * stable thereafter.
+	 * reassigned on arena growth; stale references forward to the current
+	 * engine.
 	 */
 	e: ReactiveEngine;
 	/**
-	 * Set the record-plane CAPACITY (it does not grow) and allocate it now.
+	 * Set the record arena's STARTING capacity and allocate it now (the
+	 * arena grows by engine migration when the live graph outgrows it).
 	 * Buffers are otherwise allocated lazily on the first primitive
 	 * creation, so this must be called before any signal/computed/effect/
 	 * effectScope/trigger of this system exists — afterwards it throws.
@@ -284,7 +305,7 @@ export interface ReactiveSystem {
 	/**
 	 * Bulk arena teardown for generation-scoped lifecycles (per-request
 	 * graphs, worker pools, benchmark harness cleanup): rewinds the record
-	 * plane, truncates the value/callback tables, and replaces the
+	 * arena, truncates the value/callback tables, and replaces the
 	 * FinalizationRegistry, so an entire dead generation is reclaimed by the
 	 * GC as a few large objects instead of one weak cell per handle. Every
 	 * handle created before the reset is invalid afterwards — calling one is
@@ -305,7 +326,7 @@ export interface ReactiveSystem {
 	signal(initialValue?: unknown): number;
 	/** Allocate a computed record over `getter`. Returns its id. */
 	computed(getter: (previousValue?: unknown) => unknown): number;
-	/** Allocate an effect record and run `fn` inside it (alien semantics). */
+	/** Allocate an effect record, run `fn` immediately, and return its id. */
 	effect(fn: () => (() => void) | void): number;
 	/** Allocate an effect scope record and run `fn` inside it. */
 	effectScope(fn: () => void): number;
@@ -329,7 +350,7 @@ export interface ReactiveSystem {
 	nodeFlags(id: number): number;
 	/** Overwrite the PUBLIC (semantic) flag bits of a node; kind bits keep. */
 	setNodeFlags(id: number, flags: number): void;
-	/** The live record plane (debugging/tooling only). */
+	/** The live record arena (debugging/tooling only). */
 	buffer(): Int32Array;
 	/** Allocation accounting (debugging/tests): walks the free lists, O(free). */
 	stats(): {
@@ -343,10 +364,14 @@ export interface ReactiveSystem {
 }
 
 export interface ReactiveSystemOptions {
-	/** Plane CAPACITY in 32-byte records (fixed; default 2^23). */
+	/** Arena CAPACITY in 32-byte records (fixed; default 2^23). */
 	initialRecords?: number;
 }
 
+/**
+ * Create an independent reactive graph with its own arena, queues, and
+ * dependency-tracking state.
+ */
 export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveSystem {
 	// ---- shared mutable state (survives engine rebuilds) ----------------------
 	// Scalar heads/counters live at factory level so a rebuilt engine resumes
@@ -392,7 +417,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 
 	// Persistent scratch stacks (upstream's cons-cell Stack<T>). Re-entrant
 	// walks push above the caller's base and restore it on exit. Allocated by
-	// materialize() together with the plane; walks can only run once an
+	// materialize() together with the arena; walks can only run once an
 	// engine (and therefore a node) exists.
 	let propStack: Int32Array = EMPTY_I32;
 	let propSp = 0;
@@ -415,6 +440,8 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 
 	interface Engine extends ReactiveEngine {
 		buffer(): Int32Array;
+		computedReadWith(c: number, getter: (previousValue?: unknown) => unknown): unknown;
+		retire(): void;
 		newSignal(value: unknown): number;
 		newComputed(getter: (previousValue?: unknown) => unknown): number;
 		newEffect(fn: () => (() => void) | void): number;
@@ -433,7 +460,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 	}
 
 	// LAZY MATERIALIZATION: importing/creating a system allocates nothing.
-	// The plane + scratch stacks come into being at the first primitive
+	// The arena + scratch stacks come into being at the first primitive
 	// creation, or when configure() is called — whichever happens first.
 	let configuredRecords = options?.initialRecords !== undefined
 		? normalizeRecords(options.initialRecords)
@@ -507,7 +534,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 	// single-target speculation (which is worth ~10% there); anything
 	// resembling an application crosses 33 nodes while still building its
 	// first graph, so the flat-behavior insurance is in place before any
-	// steady state forms. Also skipped on tiny configured planes, where
+	// steady state forms. Also skipped on tiny configured arenas, where
 	// the ~30 transient records would be a real bite out of capacity.
 	//
 	// 33 sits in the middle of a measured zero-regret plateau, not on a
@@ -578,6 +605,26 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 	// drain only fires when a long fully-synchronous burst piles work past
 	// the caps, keeping memory bounded without taxing the common op.
 	let maintenanceScheduled = false;
+	let growPending = false; // recNext crossed the growth threshold; grow at next boundary
+
+	// Grow-by-migration: allocate an arena twice the current capacity, copy the
+	// live prefix (ids are arena-relative offsets, so every id survives
+	// verbatim), rebuild the engine over the new `const M`, and retire the old
+	// engine — its public entry points forward to the current engine, so
+	// handles minted before the growth keep working at the cost of one extra
+	// hop. All other state (side arrays, free lists, queues, epoch, registry)
+	// lives at factory scope and is shared by construction. Only runs at
+	// operation boundaries (enterDepth === 0): no live frame holds the old
+	// arena, so nothing can write through it afterwards.
+	function grow(): void {
+		growPending = false;
+		const prev = inner!;
+		const next = createEngine(configuredRecords * 2, prev.buffer());
+		configuredRecords *= 2;
+		inner = next;
+		facade.e = next;
+		prev.retire();
+	}
 
 	function scheduleMaintenance(): void {
 		if (!maintenanceScheduled) {
@@ -588,12 +635,18 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 
 	function runMaintenance(): void {
 		maintenanceScheduled = false;
+		if (growPending && !enterDepth) {
+			grow();
+		}
 		if (boundaryPending && !enterDepth) {
 			boundaryWork();
 		}
 	}
 
 	function maybeBoundary(): void {
+		if (growPending && !enterDepth) {
+			grow();
+		}
 		if (boundaryPending && !enterDepth
 			&& (pendingFree.length > 8192 || pendingFnClear.length > 8192)) {
 			boundaryWork();
@@ -630,6 +683,12 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		const queue = queued;
 		try {
 			while (notifyIndex < queuedLength) {
+				// Effects mint nodes; between two runs no frame holds M, so a
+				// long flush can grow here instead of risking hard exhaustion.
+				// `engine` then names a retired engine whose run() forwards.
+				if (growPending && !enterDepth) {
+					grow();
+				}
 				const e = queue[notifyIndex];
 				queue[notifyIndex++] = 0;
 				engine.run(e);
@@ -647,8 +706,29 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 
 	// ---- the engine (rebuilt on growth; M is closure-const) -------------------
 
-	function createEngine(records: number): Engine {
+	function createEngine(records: number, from?: Int32Array): Engine {
 		const M = new Int32Array(records * 8);
+		if (from !== undefined) {
+			// Growth migration: ids are arena-relative offsets, so copying the
+			// live prefix preserves every id, edge, generation, and stamp.
+			M.set(from.subarray(0, recNext));
+		}
+		// Ask for growth once the bump pointer passes 3/4 of the arena
+		// (records * 8 slots * 3/4). The remaining quarter is headroom for
+		// allocations made mid-operation, where growing is unsafe.
+		const growAt = records * 6;
+		// A retired engine's public entry points forward to the factory's
+		// current `inner`: handles minted before a growth keep working at one
+		// extra hop. Set at most once, at an operation boundary. Zeroing the
+		// old arena makes every quiet-read stamp miss (a zeroed stamp can
+		// never equal the live epoch: epochHi starts at 1 and only grows), so
+		// computedRead/computedReadWith keep their stamp-hit fast paths
+		// guard-free and check `retired` only in the slow tail.
+		let retired = false;
+		function retire(): void {
+			retired = true;
+			M.fill(0, 0, recNext);
+		}
 		// Function-scope aliases for the factory-level side arrays: esbuild
 		// bundling demotes module/factory-scope `const` to mutable `var` only at
 		// module scope; these locals fold via the same one-closure-cell context
@@ -659,6 +739,8 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 
 		return {
 			buffer: () => M,
+			computedReadWith,
+			retire,
 			newSignal,
 			newComputed,
 			newEffect,
@@ -691,7 +773,10 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 
 		function makeSignal(initialValue: unknown): SignalHandle {
 			maybeSeed();
-			maybeBoundary();
+			maybeBoundary(); // may grow, retiring this engine
+			if (retired) {
+				return inner!.makeSignal(initialValue);
+			}
 			const id = newSignal(initialValue);
 			const oper = anon(((...value: [unknown?]): unknown => {
 				if (value.length) {
@@ -714,20 +799,26 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		// upstream has no such anchor because its whole graph is GC-traceable.
 		function makeComputed(getter: (previousValue?: unknown) => unknown): () => unknown {
 			maybeSeed();
-			maybeBoundary();
+			maybeBoundary(); // may grow, retiring this engine
+			if (retired) {
+				return inner!.makeComputed(getter);
+			}
 			const id = allocNode(C.K_COMPUTED);
 			// Registration is deferred to the first evaluation (see
 			// coldEvalWith): an unevaluated computed has no value and no
 			// engine-side closure anchor (getters are handle-owned), so there
 			// is nothing GC-visible to reclaim — and create-heavy workloads
 			// skip the registry entirely for computeds they never use. A
-			// dropped never-read computed leaks only its 32-byte plane record.
+			// dropped never-read computed leaks only its 32-byte arena record.
 			return anon(() => computedReadWith(id, getter));
 		}
 
 		function makeEffect(fn: () => (() => void) | void): () => void {
 			maybeSeed();
-			maybeBoundary();
+			maybeBoundary(); // may grow, retiring this engine
+			if (retired) {
+				return inner!.makeEffect(fn);
+			}
 			const id = newEffect(fn);
 			const gen = M[id + C.GEN];
 			return () => {
@@ -737,7 +828,10 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 
 		function makeScope(fn: () => void): () => void {
 			maybeSeed();
-			maybeBoundary();
+			maybeBoundary(); // may grow, retiring this engine
+			if (retired) {
+				return inner!.makeScope(fn);
+			}
 			const id = newScope(fn);
 			const gen = M[id + C.GEN];
 			// disposeScope wraps dispose: the distinct callee NAME keeps this
@@ -759,9 +853,13 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			} else {
 				id = recNext;
 				if (id >= M.length) {
-					throw new Error('dalien-signals: record plane capacity exhausted; configure({ initialRecords }) with a larger capacity before first use');
+					throw new Error('dalien-signals: record arena exhausted inside one operation (growth runs between operations); configure({ initialRecords }) with more capacity');
 				}
 				recNext = id + 8;
+				if (recNext > growAt && !growPending) {
+					growPending = true;
+					scheduleMaintenance();
+				}
 				// Size the side columns for a fresh record only (recycled ids
 				// are already inside the sized region). push keeps the arrays
 				// PACKED; a store past length would go HOLEY permanently.
@@ -794,6 +892,10 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		}
 
 		function sweepPendingFree(): void {
+			if (retired) {
+				inner!.sweepPendingFree();
+				return;
+			}
 			for (let i = 0; i < pendingFree.length; ++i) {
 				freeNode(pendingFree[i]);
 			}
@@ -805,6 +907,10 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		// or recycled record is skipped (or, for a make* computed, harmlessly
 		// re-installed on its next tracked read).
 		function sweepFnClears(): void {
+			if (retired) {
+				inner!.sweepFnClears();
+				return;
+			}
 			for (let i = 0; i < pendingFnClear.length; ++i) {
 				const id = pendingFnClear[i];
 				const flags = M[id + C.FLAGS];
@@ -827,9 +933,13 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			} else {
 				id = recNext;
 				if (id >= M.length) {
-					throw new Error('dalien-signals: record plane capacity exhausted; configure({ initialRecords }) with a larger capacity before first use');
+					throw new Error('dalien-signals: record arena exhausted inside one operation (growth runs between operations); configure({ initialRecords }) with more capacity');
 				}
 				recNext = id + 8;
+				if (recNext > growAt && !growPending) {
+					growPending = true;
+					scheduleMaintenance();
+				}
 			}
 			return id;
 		}
@@ -1271,6 +1381,14 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 
 		function run(e: number): void {
 			const flags = M[e + C.FLAGS];
+			// Kind-bit piggyback: kindless means disposed-while-queued (skip,
+			// as before) or a retired engine's zeroed arena (forward).
+			if (!(flags & C.KIND_MASK)) {
+				if (retired) {
+					inner!.run(e);
+				}
+				return;
+			}
 			if (
 				flags & C.DIRTY
 				|| (flags & C.PENDING && checkDirty(M[e + C.DEPS], e))
@@ -1310,6 +1428,8 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		function requeueAbort(e: number): void {
 			if (M[e + C.FLAGS] & C.KIND_MASK) {
 				M[e + C.FLAGS] |= C.WATCHING | C.RECURSED;
+			} else if (retired) {
+				inner!.requeueAbort(e);
 			}
 		}
 
@@ -1361,6 +1481,10 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		}
 
 		function dispose(e: number, gen: number): void {
+			if (retired) {
+				inner!.dispose(e, gen);
+				return;
+			}
 			if (M[e + C.GEN] !== gen) {
 				return; // record already reclaimed (and possibly reused)
 			}
@@ -1378,6 +1502,10 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		// Invalidate the quiet-read stamp (public flag surgery via
 		// setNodeFlags may mark Dirty/Pending without a write).
 		function clearStamp(id: number): void {
+			if (retired) {
+				inner!.clearStamp(id);
+				return;
+			}
 			M[id + C.VSTAMP_LO] = 0;
 			M[id + C.VSTAMP_HI] = 0;
 		}
@@ -1388,6 +1516,10 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		// unlinks (unwatched). Only make* handles register, and only this path
 		// frees signal/computed records, so the id cannot be stale here.
 		function orphan(id: number): void {
+			if (retired) {
+				inner!.orphan(id);
+				return;
+			}
 			const flags = M[id + C.FLAGS];
 			if (!(flags & (C.K_SIGNAL | C.K_COMPUTED))) {
 				return; // already reclaimed
@@ -1430,6 +1562,9 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		// ---- operations dispatched from the public system object --------------
 
 		function newSignal(value: unknown): number {
+			if (retired) {
+				return inner!.newSignal(value);
+			}
 			maybeSeed();
 			const id = allocNode(C.K_SIGNAL | C.MUTABLE);
 			const v = id >> 2;
@@ -1439,6 +1574,9 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		}
 
 		function newComputed(getter: (previousValue?: unknown) => unknown): number {
+			if (retired) {
+				return inner!.newComputed(getter);
+			}
 			maybeSeed();
 			const id = allocNode(C.K_COMPUTED);
 			fnTab[id >> 3] = getter;
@@ -1446,6 +1584,9 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		}
 
 		function newEffect(fn: () => (() => void) | void): number {
+			if (retired) {
+				return inner!.newEffect(fn);
+			}
 			maybeSeed();
 			const e = allocNode(C.K_EFFECT | C.WATCHING | C.RECURSED_CHECK);
 			fnTab[e >> 3] = fn;
@@ -1469,6 +1610,9 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		}
 
 		function newScope(fn: () => void): number {
+			if (retired) {
+				return inner!.newScope(fn);
+			}
 			maybeSeed();
 			const e = allocNode(C.K_SCOPE | C.MUTABLE);
 			const prevSub = activeSub;
@@ -1487,9 +1631,19 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			return e;
 		}
 
-		// signalOper read path.
+		// signalOper read path. The retired check piggybacks on the kind bits
+		// of the flags word the function loads anyway: a live signal always
+		// carries K_SIGNAL, a retired engine's arena is zeroed, so the cold
+		// branch is the only place that pays the `retired` context load.
 		function read(s: number): unknown {
-			if (M[s + C.FLAGS] & C.DIRTY) {
+			const flags = M[s + C.FLAGS];
+			if (!(flags & C.K_SIGNAL)) {
+				if (retired) {
+					return inner!.read(s);
+				}
+				return vals[s >> 2]; // freed record: contract-violating read, kept harmless
+			}
+			if (flags & C.DIRTY) {
 				if (updateSignal(s)) {
 					const subs = M[s + C.SUBS];
 					if (subs !== 0) {
@@ -1506,6 +1660,14 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		// signalOper write path. flush() (factory-level) starts with a boundary
 		// check, so growth still happens between queued effects at top level.
 		function write(s: number, value: unknown): void {
+			// Same kind-bit piggyback as read(): the staging store below must
+			// not run for a retired engine (vals is the shared current truth).
+			if (!(M[s + C.FLAGS] & C.K_SIGNAL)) {
+				if (retired) {
+					inner!.write(s, value);
+				}
+				return; // freed record: contract-violating write, dropped
+			}
 			const p = (s >> 2) + 1;
 			if (vals[p] !== (vals[p] = value)) {
 				M[s + C.FLAGS] = C.K_SIGNAL | C.MUTABLE | C.DIRTY;
@@ -1535,6 +1697,11 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 					link(c, fastSub, cycle);
 				}
 				return vals[c >> 2];
+			}
+			// Guard-free fast path above: a retired engine's arena is zeroed,
+			// so its stamps can never hit and every call lands here.
+			if (retired) {
+				return inner!.computedRead(c);
 			}
 			// Stamp with the epoch captured BEFORE the body: if user code run
 			// during verification writes a signal (bumping the epoch), the
@@ -1643,6 +1810,11 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 				}
 				return vals[c >> 2];
 			}
+			// Guard-free fast path above: a retired engine's arena is zeroed,
+			// so its stamps can never hit and every call lands here.
+			if (retired) {
+				return inner!.computedReadWith(c, getter);
+			}
 			const lo = epochLo;
 			const hi = epochHi;
 			const flags = M[c + C.FLAGS];
@@ -1690,6 +1862,10 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 		// Watching bit in every reachable branch), never a dep of anything, and
 		// is reclaimed at the next boundary.
 		function trigger(fn: () => void): void {
+			if (retired) {
+				inner!.trigger(fn);
+				return;
+			}
 			const sub = allocNode(C.WATCHING | C.RECURSED_CHECK);
 			const prevSub = activeSub;
 			activeSub = sub;
@@ -1776,7 +1952,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			if (enterDepth !== 0 || activeSub !== 0 || batchDepth !== 0 || runDepth !== 0) {
 				throw new Error('dalien-signals: reset() called during an active operation (inside an effect, computed, batch, or trigger)');
 			}
-			// Bulk arena teardown: rewind the record plane and drop the whole
+			// Bulk arena teardown: rewind the record arena and drop the whole
 			// FinalizationRegistry, so a dead generation is reclaimed by the
 			// GC as a few large objects instead of one weak cell per handle.
 			// Every handle minted before the reset is INVALID afterwards —
@@ -1788,6 +1964,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			nodeFreeHead = 0;
 			linkFreeHead = 0;
 			boundaryPending = false;
+			growPending = false; // capacity stays at its grown size
 			notifyIndex = 0;
 			queuedLength = 0;
 			queued.length = 0;
