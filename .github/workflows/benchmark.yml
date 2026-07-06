@@ -64,7 +64,11 @@ jobs:
         runtime: [node, bun]
         round: ${{ fromJSON(inputs.shards || '[1, 2, 3]') }}
     name: round-${{ matrix.runtime }}-${{ matrix.round }}
-    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    # Precedence: explicit dispatch input > the BENCH_RUNNER repo variable
+    # (Settings -> Secrets and variables -> Actions -> Variables) > free
+    # hosted runners. Set BENCH_RUNNER once after installing a runner
+    # provider and every run, including push-triggered ones, uses it.
+    runs-on: ${{ inputs.runner || vars.BENCH_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 150
     steps:
       # Recreate the local development layout so the harness's relative
