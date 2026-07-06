@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { computed, effect, getActiveSub, signal } from '../src';
+import { computed, effect, getActiveSub, getFlags, setFlags, signal } from '../src';
 import { ReactiveFlags } from '../src/system';
 
 test('should support custom recurse effect', () => {
@@ -8,7 +8,7 @@ test('should support custom recurse effect', () => {
 	let triggers = 0;
 
 	effect(() => {
-		getActiveSub()!.flags &= ~ReactiveFlags.RecursedCheck;
+		setFlags(getActiveSub(), getFlags(getActiveSub()) & ~ReactiveFlags.RecursedCheck);
 		triggers++;
 		src(Math.min(src() + 1, 5));
 	});

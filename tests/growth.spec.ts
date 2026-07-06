@@ -18,12 +18,12 @@ test('userspace nodes minted before growth keep working after it', () => {
 		seen = c();
 		runs++;
 	});
-	const before = lib.sys.buffer().length;
+	const before = lib.sys.arena.memory.length;
 	const extras: Array<() => number> = [];
 	for (let i = 0; i < 300; i++) {
 		extras.push(lib.signal(i));
 	}
-	expect(lib.sys.buffer().length).toBeGreaterThan(before);
+	expect(lib.sys.arena.memory.length).toBeGreaterThan(before);
 	expect(c()).toBe(10);
 	s(5);
 	expect(seen).toBe(50);
@@ -82,10 +82,10 @@ test('reset() after growth keeps the grown capacity and works', () => {
 	for (let i = 0; i < 300; i++) {
 		lib.signal(i);
 	}
-	const grown = lib.sys.buffer().length;
+	const grown = lib.sys.arena.memory.length;
 	expect(grown).toBeGreaterThan(64 * 8);
 	lib.sys.reset();
-	expect(lib.sys.buffer().length).toBe(grown);
+	expect(lib.sys.arena.memory.length).toBe(grown);
 	const s = lib.signal(1);
 	let seen = 0;
 	lib.effect(() => {
@@ -95,13 +95,13 @@ test('reset() after growth keeps the grown capacity and works', () => {
 	expect(seen).toBe(3);
 });
 
-test('system.e tracks the current generation; stale refs forward', () => {
+test('system.arena tracks the current generation; stale mint refs forward', () => {
 	const lib = makeMiniLib({ initialRecords: 64 });
-	const eBefore = lib.sys.e;
+	const arenaBefore = lib.sys.arena;
 	const s = lib.signal(5);
 	for (let i = 0; i < 300; i++) {
 		lib.signal(i);
 	}
-	expect(lib.sys.e).not.toBe(eBefore);
+	expect(lib.sys.arena).not.toBe(arenaBefore);
 	expect(s()).toBe(5); // pre-growth closure reaches the new generation
 });

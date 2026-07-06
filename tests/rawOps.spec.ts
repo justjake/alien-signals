@@ -1,16 +1,16 @@
 import { expect, test } from 'vitest';
-import { SignalIdKey, NodeSlot, ReactiveFlags, createReactiveSystem } from '../src/system';
+import { NodeSlot, ReactiveFlags, createReactiveSystem } from '../src/system';
 import type { LinkId, SignalId, ReactiveSystem } from '../src/system';
 import { makeMiniLib } from './helpers/miniLib';
 
-// Raw tests deal in plain ids; each minted owner is pinned in `owners` so
-// garbage collection cannot reclaim records mid-test.
+// Each minted owner is pinned in `owners` so garbage collection cannot
+// reclaim records mid-test.
 function minter(sys: ReactiveSystem): (hostBits?: number) => SignalId {
 	const owners: object[] = [];
 	return (hostBits?: number) => {
 		const owner = {};
 		owners.push(owner);
-		return sys.createReactiveNode(owner, hostBits)[SignalIdKey];
+		return sys.createReactiveNode(owner, hostBits);
 	};
 }
 
@@ -27,7 +27,7 @@ test('link returns the edge id; the same pair dedupes; unlink removes', () => {
 	const mint = minter(sys);
 	const dep = mint(1 << 16 | ReactiveFlags.Mutable);
 	const sub = mint(2 << 16 | ReactiveFlags.Mutable);
-	const { link, unlink } = sys.e;
+	const { link, unlink } = sys.arena;
 	const l1 = link(dep, sub, 1);
 	const l2 = link(dep, sub, 1);
 	expect(l1).toBe(l2);
@@ -48,8 +48,8 @@ test('propagate marks downstream pending and notifies watchers', () => {
 	const mint = minter(sys);
 	const src = mint(1 << 16 | ReactiveFlags.Mutable);
 	const watcher = mint(3 << 16 | ReactiveFlags.Watching);
-	const M = sys.buffer();
-	const { link, propagate, checkDirty } = sys.e;
+	const M = sys.arena.memory;
+	const { link, propagate, checkDirty } = sys.arena;
 	link(src, watcher, 1);
 	M[src + NodeSlot.Flags] |= ReactiveFlags.Dirty;
 	propagate(M[src + NodeSlot.Subs] as LinkId, false);
@@ -77,7 +77,7 @@ test('checkDirty resolves staleness through the update seam', () => {
 		update: (id, flags) => {
 			updated.push(id);
 			// Host contract: reset the word (walks stop revisiting), report changed.
-			sys.buffer()[id + NodeSlot.Flags] = flags & ~(ReactiveFlags.Dirty | ReactiveFlags.Pending);
+			sys.arena.memory[id + NodeSlot.Flags] = flags & ~(ReactiveFlags.Dirty | ReactiveFlags.Pending);
 			return true;
 		},
 		notify: () => {},
@@ -85,8 +85,8 @@ test('checkDirty resolves staleness through the update seam', () => {
 	const mint = minter(sys);
 	const src = mint(1 << 16 | ReactiveFlags.Mutable);
 	const mid = mint(2 << 16 | ReactiveFlags.Mutable);
-	const M = sys.buffer();
-	const { link, propagate, checkDirty } = sys.e;
+	const M = sys.arena.memory;
+	const { link, propagate, checkDirty } = sys.arena;
 	link(src, mid, 1);
 	M[src + NodeSlot.Flags] |= ReactiveFlags.Dirty;
 	propagate(M[src + NodeSlot.Subs] as LinkId, false);
@@ -113,7 +113,7 @@ test('watched fires on first subscriber only; unwatched on last unlink with stat
 	const dep = mint(1 << 16 | ReactiveFlags.Mutable);
 	const s1 = mint(2 << 16);
 	const s2 = mint(2 << 16);
-	const { link, unlink } = sys.e;
+	const { link, unlink } = sys.arena;
 	const l1 = link(dep, s1, 1);
 	expect(events).toEqual([`start:${dep}`]);
 	const l2 = link(dep, s2, 1);
@@ -167,8 +167,8 @@ test('reset() delivers unwatched for every watched node, newest first', () => {
 	const d1 = mint(1 << 16 | ReactiveFlags.Mutable);
 	const d2 = mint(1 << 16 | ReactiveFlags.Mutable);
 	const sub = mint(2 << 16);
-	sys.e.link(d1, sub, 1);
-	sys.e.link(d2, sub, 1);
+	sys.arena.link(d1, sub, 1);
+	sys.arena.link(d2, sub, 1);
 	sys.reset();
 	expect(stops).toEqual([d2, d1]);
 });
@@ -186,8 +186,8 @@ test('unwatched is delivered even when watched is not defined', () => {
 	const mint = minter(sys);
 	const dep = mint(1 << 16 | ReactiveFlags.Mutable);
 	const sub = mint(2 << 16);
-	const l = sys.e.link(dep, sub, 1);
-	sys.e.unlink(l, sub);
+	const l = sys.arena.link(dep, sub, 1);
+	sys.arena.unlink(l, sub);
 	expect(stops).toEqual([dep]);
 });
 

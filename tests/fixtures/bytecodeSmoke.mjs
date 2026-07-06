@@ -7,11 +7,13 @@ import {
 	effectScope,
 	endBatch,
 	getActiveSub,
+	getFlags,
+	setFlags,
 	signal,
 	startBatch,
 	trigger,
 } from '../../esm/index.mjs';
-import { SignalIdKey, ReactiveFlags, createReactiveSystem } from '../../esm/system.mjs';
+import { ReactiveFlags, createReactiveSystem } from '../../esm/system.mjs';
 
 const a = signal(1);
 const b = signal(2);
@@ -24,7 +26,7 @@ const d2 = effect(() => { c2(); });
 // Recursive write inside an effect: exercises isValidLink + the recurse arms.
 let recursed = 0;
 effect(() => {
-	getActiveSub().flags &= ~ReactiveFlags.RecursedCheck;
+	setFlags(getActiveSub(), getFlags(getActiveSub()) & ~ReactiveFlags.RecursedCheck);
 	recursed = Math.min(recursed + 1, 3);
 	a(Math.min(a() + 1, 5));
 });
@@ -64,22 +66,22 @@ const sys = createReactiveSystem({
 	initialRecords: 4096,
 	update(id, flags) {
 		const st = nodes[id >> 3];
-		sys.buffer()[id] = flags & ~48; // clear Dirty|Pending (slot 0 = flags)
+		sys.arena.memory[id] = flags & ~48; // clear Dirty|Pending (slot 0 = flags)
 		return st.current !== (st.current = st.pending);
 	},
 	notify() {},
 });
 const nsOwner = { current: 1, pending: 1 };
-const nsId = sys.createReactiveNode(nsOwner, 1 << 16 | ReactiveFlags.Mutable)[SignalIdKey];
+const nsId = sys.createReactiveNode(nsOwner, 1 << 16 | ReactiveFlags.Mutable);
 nodes[nsId >> 3] = nsOwner;
 const watcherOwner = {};
-const watcherId = sys.createReactiveNode(watcherOwner, 2 << 16 | ReactiveFlags.Watching)[SignalIdKey];
-const M = sys.buffer();
-const rawEdge = sys.e.link(nsId, watcherId, 1);
+const watcherId = sys.createReactiveNode(watcherOwner, 2 << 16 | ReactiveFlags.Watching);
+const M = sys.arena.memory;
+const rawEdge = sys.arena.link(nsId, watcherId, 1);
 nodes[nsId >> 3].pending = 2;
 M[nsId] |= ReactiveFlags.Dirty;
-sys.e.propagate(rawEdge, false);
-sys.e.checkDirty(M[watcherId + 1], watcherId); // slot 1 = deps head
-sys.e.unlink(rawEdge, watcherId);
+sys.arena.propagate(rawEdge, false);
+sys.arena.checkDirty(M[watcherId + 1], watcherId); // slot 1 = deps head
+sys.arena.unlink(rawEdge, watcherId);
 
 console.log('smoke ok', c3());

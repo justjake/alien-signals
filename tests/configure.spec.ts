@@ -21,7 +21,8 @@ test('configure throws once the system is materialized', () => {
 
 test('createReactiveSystem honors initialRecords (stride-8 arena)', () => {
 	const sys = createReactiveSystem({ initialRecords: 64 });
-	expect(sys.buffer().length).toBe(64 * 8);
+	sys.configure(); // materialize: `arena` is a plain property, not a lazy getter
+	expect(sys.arena.memory.length).toBe(64 * 8);
 });
 
 test('configure after a node exists throws (per-system)', () => {
@@ -37,7 +38,7 @@ test('initialRecords must be a finite number', () => {
 
 test('unmaterialized engine access fails loudly', () => {
 	const sys = createReactiveSystem();
-	expect(() => sys.e.newCustom(0)).toThrowError(/not materialized/);
+	expect(() => sys.arena.newCustom(0)).toThrowError(/not materialized/);
 });
 
 test('top-level allocation past capacity grows instead of throwing', () => {
@@ -48,5 +49,5 @@ test('top-level allocation past capacity grows instead of throwing', () => {
 	}
 	expect(handles[0]()).toBe(0);
 	expect(handles[499]()).toBe(499);
-	expect(lib.sys.buffer().length).toBeGreaterThan(16 * 8);
+	expect(lib.sys.arena.memory.length).toBeGreaterThan(16 * 8);
 });

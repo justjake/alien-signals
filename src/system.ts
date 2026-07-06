@@ -44,7 +44,7 @@
  * forward to the current engine, so pre-growth handles keep working one
  * hop behind. Measured cost of the forwarding guards: suite-total within
  * noise (+0.4%); the quiet-read fast paths carry no guard at all (a
- * retired arena is zeroed, so its stamps can never hit), and read/write
+ * retired arena is zeroed, so its version snapshots can never hit), and read/write
  * fold the check into kind bits of a flags word they already load.
  * Capacity is virtual until touched (large typed arrays are lazily-mapped
  * zero pages), defaults to 8M records (256 MB virtual), and the STARTING
@@ -132,12 +132,12 @@ export const enum Arena {
 	 */
 	NodeIndexShift = 3,
 	/**
-	 * A node's verification stamp as an index into the Float64Array view D:
-	 * `D[(id >> StampShift) + StampOffset]` — the stamp is ONE float64 in
-	 * slots 6-7 (byte offset 24; f64 index = id/2 + 3).
+	 * A node's version snapshot as an index into the arena's Float64Array
+	 * view: `versions[(id >> VersionShift) + VersionOffset]` — the snapshot
+	 * is ONE float64 in slots 6-7 (byte offset 24; f64 index = id/2 + 3).
 	 */
-	StampShift = 1,
-	StampOffset = 3,
+	VersionShift = 1,
+	VersionOffset = 3,
 }
 
 /** Node record slots. */
@@ -151,13 +151,14 @@ export const enum NodeSlot {
 	/** Generation counter: bumped on free; capture at mint to defuse stale ids. */
 	Gen = 5,
 	/**
-	 * Slots 6-7 hold ONE float64: the quiet-read verification stamp (the
-	 * write epoch at last verification), read through the Float64Array view
-	 * as D[(id >> Arena.StampShift) + Arena.StampOffset]. A stamp equal to the current epoch proves nothing
-	 * observed has been written since — skip all verification.
+	 * Slots 6-7 hold ONE float64: the node's version snapshot (the host's
+	 * globalVersion at last verification), read through the arena's
+	 * Float64Array view as versions[(id >> Arena.VersionShift) +
+	 * Arena.VersionOffset]. A snapshot equal to the current globalVersion
+	 * proves nothing observed has been written since — skip verification.
 	 */
-	StampHi = 6,
-	StampLo = 7,
+	VersionHi = 6,
+	VersionLo = 7,
 }
 
 /** Link (edge) record slots. */
@@ -277,26 +278,39 @@ function uninitialized(): never {
 
 
 /**
- * Id-level operations of the live engine, exposed as {@link ReactiveSystem.e}.
- * Reassigned when the arena grows (the engine is rebuilt over the larger
- * arena); mint/free forward from retired engines, but the five graph ops
- * do NOT — hosts re-capture this object from an onGrow callback.
+ * ONE arena generation's surface, exposed as {@link ReactiveSystem.arena}:
+ * the record memory, the per-node version snapshots, and the five graph
+ * algorithms compiled over exactly that memory. The whole object is replaced
+ * when the arena grows (ids and link ids survive verbatim; these views and
+ * closures do not) — re-capture it in the `allocated` callback, and never
+ * cache any of it in a local across a call that can allocate. mint/free
+ * forward from a retired arena; nothing else here does.
  */
-export interface ReactiveEngine {
-	/** Mint a host-kind node (see ReactiveSystem.custom). */
+export interface ReactiveArena {
+	/**
+	 * The record memory: 32-byte records, 8 int32 slots each, addressed as
+	 * memory[id + NodeSlot.X] / memory[linkId + LinkSlot.X].
+	 */
+	readonly memory: Int32Array;
+	/**
+	 * Float64 view over the same memory holding each node's version
+	 * snapshot: versions[(id >> Arena.VersionShift) + Arena.VersionOffset]
+	 * is the host's globalVersion at the node's last verification; equality
+	 * with the current globalVersion proves the node is current.
+	 */
+	readonly versions: Float64Array;
+	/** Mint a node record; `owner`'s collection frees it (see ReactiveSystem.createReactiveNode). */
 	newCustom(hostBits: number): SignalId;
 	/** Explicitly free any node id if `gen` still matches. */
 	free(id: SignalId, gen: number): void;
 
 	// ---- the five graph ops -----------------------------------------------
 	// The same algorithms upstream alien-signals' index.ts builds on, with
-	// the same shapes: the host reads M[id + NodeSlot.Subs]/Deps itself and
-	// passes LINK ids, owns its own tracking state (the active subscriber,
-	// its pass counter and write epoch), runs its own effect queue and
-	// batching, and brackets user-code frames with M[SysSlot.EnterDepth]++/--. These do not forward after
-	// arena growth: re-capture `system.e` (and buffer()/stampView()) from an
-	// onGrow callback, and never cache them in locals across a call that can
-	// allocate.
+	// the same shapes: the host reads memory[id + NodeSlot.Subs]/Deps itself
+	// and passes LINK ids, owns its own tracking state (the active
+	// subscriber, its pass counter, its globalVersion), runs its own effect
+	// queue and batching, and brackets user-code frames with
+	// memory[SysSlot.EnterDepth]++/--.
 
 	/**
 	 * Edge insert/refresh between `dep` and `sub` with the caller's
@@ -334,11 +348,11 @@ export interface ReactiveEngine {
 /** The self-contained reactive system returned by {@link createReactiveSystem}. */
 export interface ReactiveSystem {
 	/**
-	 * The live engine (id-level entry points). Assigned at materialization,
-	 * reassigned on arena growth; stale references forward to the current
-	 * engine.
+	 * The current arena generation (memory, version snapshots, the five
+	 * graph ops). Assigned at materialization and REPLACED on growth: bind
+	 * to it in the `allocated` callback, not at creation time.
 	 */
-	e: ReactiveEngine;
+	arena: ReactiveArena;
 	/**
 	 * Set the record arena's STARTING capacity and allocate it now (the
 	 * arena grows by engine migration when the live graph outgrows it).
@@ -371,13 +385,14 @@ export interface ReactiveSystem {
 	 * record lives until reset().
 	 */
 	/**
-	 * Turn `owner` into a reactive node: assigns the arena id and generation
-	 * onto it ([SignalIdKey]/[SignalGenKey]) and returns it. `hostBits` (masked
-	 * to the host-tag and public ranges) seed the node's flags word. The
-	 * node record is freed when `owner` is garbage collected — hold the
-	 * owner (or free() explicitly) to keep it alive.
+	 * Mint a node record and return its id. `owner` is the node's lifetime
+	 * token: the record is freed when `owner` is garbage collected, so pass
+	 * the object whose reachability should keep the node alive (a handle
+	 * closure, a state object) — or hold it and free() explicitly.
+	 * `hostBits` (masked to the host-tag and public ranges) seed the node's
+	 * flags word.
 	 */
-	createReactiveNode<T extends ReactiveNode = ReactiveNode>(owner: Omit<T, keyof ReactiveNode> & Partial<ReactiveNode>, hostBits?: number): T;
+	createReactiveNode(owner: WeakKey, hostBits?: number): SignalId;
 	/** Explicitly free any node id if `gen` still matches. */
 	free(id: SignalId, gen: SignalGen): void;
 	/**
@@ -386,18 +401,6 @@ export interface ReactiveSystem {
 	 * means the record was freed (and possibly reused) in the meantime.
 	 */
 	gen(id: SignalId): SignalGen;
-	/**
-	 * The live record arena. Trusted hosts address it directly through the
-	 * NodeSlot/LinkSlot/SysSlot layout; the identity changes on growth (see
-	 * onGrow). Everyone else: debugging/tooling only.
-	 */
-	buffer(): Int32Array;
-	/**
-	 * Float64 view over the same arena for the one-slot verification stamps:
-	 * a node's stamp is stampView()[(id >> Arena.StampShift) + Arena.StampOffset].
-	 * Same growth caveat as buffer().
-	 */
-	stampView(): Float64Array;
 	/** Allocation accounting (debugging/tests): walks the free lists, O(free). */
 	stats(): {
 		capacityRecords: number;
@@ -431,7 +434,8 @@ export interface ReactiveSystemOptions {
 	 * Resolve a node's update (upstream's `update` seam): the graph walks
 	 * hand over every Mutable node whose staleness resolved to Dirty, and
 	 * the host does EVERYTHING — reset the flags word (preserving the bits
-	 * outside ReactiveFlags), re-track dependencies, recompute, stamp — and
+	 * outside ReactiveFlags), re-track dependencies, recompute, snapshot the
+	 * version — and
 	 * returns whether the value changed (the equality cut-off). `flags` is
 	 * the node's word at entry; dispatch on your host bits.
 	 */
@@ -454,11 +458,13 @@ export interface ReactiveSystemOptions {
 	watched?: (id: SignalId) => unknown;
 	unwatched?: (id: SignalId, state: unknown) => void;
 	/**
-	 * Runs whenever the arena grows (a new engine generation over a bigger
-	 * arena): re-capture buffer(), stampView(), and `e` here. Fires at the
-	 * growth boundary, before any handle can observe the new arena.
+	 * Runs when an arena generation comes into being: once at
+	 * materialization (the first mint, or configure()), and again after
+	 * every growth. Bind your views of {@link ReactiveSystem.arena} here —
+	 * it fires before any node can observe the new arena, so hosts need no
+	 * lazy-capture checks anywhere else.
 	 */
-	onGrow?: () => void;
+	allocated?: (arena: ReactiveArena) => void;
 }
 
 // Branded number types: a SignalId is not a LinkId is not a generation, and
@@ -475,22 +481,6 @@ declare const SignalGenBrand: unique symbol;
 /** A node record's generation; stale (id, gen) pairs are harmless no-ops. */
 export type SignalGen = number & { readonly [SignalGenBrand]: true };
 
-/** Property key carrying a {@link ReactiveNode}'s arena id. */
-export const SignalIdKey: unique symbol = Symbol('dalien-signals.nodeId');
-/** Property key carrying a {@link ReactiveNode}'s mint-time generation. */
-export const SignalGenKey: unique symbol = Symbol('dalien-signals.nodeGen');
-
-/**
- * Any host object that IS a reactive node: createReactiveNode assigns the
- * arena id and generation onto the host's own object (a state record, a
- * handle closure — whatever the host's lifetime story is), so there is no
- * separate per-node wrapper to allocate. The node record is freed when this
- * object is garbage collected, or explicitly via free().
- */
-export interface ReactiveNode {
-	readonly [SignalIdKey]: SignalId;
-	readonly [SignalGenKey]: SignalGen;
-}
 
 // ---- engine generations and codegen cloning -------------------------------
 //
@@ -555,7 +545,7 @@ function cloneWorks(): boolean {
 		const a = probe.newCustom(1 << 16 | 1); // host tag + Mutable
 		const b = probe.newCustom(2 << 16 | 1);
 		const edge = probe.link(a, b, 1);
-		const M = probe.buffer();
+		const M = probe.memory;
 		M[a + NodeSlot.Flags] |= Flag.Dirty;
 		probe.propagate(edge, false);
 		return probe.checkDirty(M[b + NodeSlot.Deps] as LinkId, b) === true;
@@ -624,9 +614,7 @@ interface EngineShared {
 	scheduleMaintenance(): void;
 }
 
-interface Engine extends ReactiveEngine {
-	buffer(): Int32Array;
-	stampView(): Float64Array;
+interface Engine extends ReactiveArena {
 	retire(): void;
 	state(): EngineState;
 	busy(): boolean;
@@ -709,7 +697,10 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			linkFreeHead: 0,
 		}, shared);
 		shared.inner = engine;
-		facade.e = engine;
+		facade.arena = engine;
+		for (let i = 0; i < allocatedCallbacks.length; i++) {
+			allocatedCallbacks[i](engine);
+		}
 		return engine;
 	}
 
@@ -732,23 +723,22 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 	// minted before the growth keep working at one extra hop. Only runs at
 	// operation boundaries (the engine is not busy): no live frame holds the
 	// old arena, so nothing can write through it afterwards.
-	const growCallbacks: Array<() => void> = [];
-	if (options?.onGrow !== undefined) {
-		growCallbacks.push(options.onGrow);
+	const allocatedCallbacks: Array<(arena: ReactiveArena) => void> = [];
+	if (options?.allocated !== undefined) {
+		allocatedCallbacks.push(options.allocated);
 	}
 
 	function grow(): void {
 		shared.growPending = false;
 		const prev = shared.inner!;
-		const next = instantiateEngine(configuredRecords * 2, prev.buffer(), prev.state(), shared);
+		const next = instantiateEngine(configuredRecords * 2, prev.memory, prev.state(), shared);
 		configuredRecords *= 2;
 		shared.inner = next;
-		facade.e = next;
+		facade.arena = next;
 		prev.retire();
-		// Hosts re-capture buffer()/stampView()/e now, before any handle can
-		// observe the new arena.
-		for (let i = 0; i < growCallbacks.length; i++) {
-			growCallbacks[i]();
+		// Hosts re-bind to the new arena now, before any node can observe it.
+		for (let i = 0; i < allocatedCallbacks.length; i++) {
+			allocatedCallbacks[i](next);
 		}
 	}
 
@@ -789,9 +779,11 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 	// sites reach the engine with one property load; everything else is cold
 	// delegation through ensureEngine(), which materializes on first use.
 
-	// `system.e` before materialization: id-level operations throw (ids can
-	// only come from a materialized system).
-	const bootEngine: ReactiveEngine = {
+	// `system.arena` before materialization: empty views, throwing ops (ids
+	// can only come from a materialized system).
+	const bootArena: ReactiveArena = {
+		memory: new Int32Array(0),
+		versions: new Float64Array(0),
 		newCustom: uninitialized,
 		free: uninitialized,
 		link: uninitialized,
@@ -802,7 +794,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 	};
 
 	const facade: ReactiveSystem = {
-		e: bootEngine,
+		arena: bootArena,
 		configure(configureOptions?: ReactiveSystemOptions): void {
 			if (shared.inner !== undefined) {
 				throw new Error('dalien-signals: configure() must be called before the first signal/computed/effect/effectScope is created');
@@ -822,8 +814,8 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			if (configureOptions?.unwatched !== undefined) {
 				shared.hostUnwatched = configureOptions.unwatched;
 			}
-			if (configureOptions?.onGrow !== undefined) {
-				growCallbacks.push(configureOptions.onGrow);
+			if (configureOptions?.allocated !== undefined) {
+				allocatedCallbacks.push(configureOptions.allocated);
 			}
 			materialize();
 		},
@@ -843,7 +835,7 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			// Watched-lifecycle teardown: every started node gets its stop
 			// before the arena rewinds (newest records first, LIFO-ish). These
 			// callbacks must not touch reactive state mid-reset.
-			const M = engine.buffer();
+			const M = engine.memory;
 			for (let id = engine.state().recNext - 8; id >= 8; id -= 8) {
 				const flags = M[id + NodeSlot.Flags];
 				if (flags & Flag.HostStarted) {
@@ -860,33 +852,24 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 			shared.growPending = false; // capacity stays at its grown size
 			shared.registry = mintRegistry();
 		},
-		createReactiveNode<T extends ReactiveNode = ReactiveNode>(owner: Omit<T, keyof ReactiveNode> & Partial<ReactiveNode>, hostBits?: number): T {
+		createReactiveNode(owner: WeakKey, hostBits?: number): SignalId {
 			const engine = ensureEngine();
 			engine.maybeBoundary();
 			const id = engine.newCustom(hostBits ?? 0);
-			const node = owner as { [SignalIdKey]: SignalId; [SignalGenKey]: SignalGen };
-			node[SignalIdKey] = id;
-			node[SignalGenKey] = engine.buffer()[id + NodeSlot.Gen] as SignalGen;
-			shared.registry!.register(owner as WeakKey, id);
-			return owner as T;
+			shared.registry!.register(owner, id);
+			return id;
 		},
 		free(id: SignalId, gen: number): void {
 			ensureEngine().free(id, gen);
 		},
 		gen(id: SignalId): SignalGen {
-			return ensureEngine().buffer()[id + NodeSlot.Gen] as SignalGen;
-		},
-		buffer(): Int32Array {
-			return ensureEngine().buffer();
-		},
-		stampView(): Float64Array {
-			return ensureEngine().stampView();
+			return ensureEngine().memory[id + NodeSlot.Gen] as SignalGen;
 		},
 		stats() {
 			const engine = ensureEngine();
 			const { freeNodeRecords, freeLinkRecords } = engine.freeRecordCounts();
 			return {
-				capacityRecords: engine.buffer().length / 8,
+				capacityRecords: engine.memory.length / 8,
 				allocatedRecords: (engine.state().recNext - 8) / 8,
 				freeNodeRecords,
 				freeLinkRecords,
@@ -907,11 +890,12 @@ export function createReactiveSystem(options?: ReactiveSystemOptions): ReactiveS
 
 function createEngine(records: number, from: Int32Array | undefined, boot: EngineState, shared: EngineShared): Engine {
 	const M = new Int32Array(records * 8);
-	// Float64 view over the same plane for the one-slot epoch stamps.
+	// Float64 view over the same plane for the one-slot version snapshots.
 	const D = new Float64Array(M.buffer);
 	if (from !== undefined) {
 		// Growth migration: ids are arena-relative offsets, so copying the
-		// live prefix preserves every id, edge, generation, and stamp —
+		// live prefix preserves every id, edge, generation, and version
+		// snapshot —
 		// including record 0's system slots.
 		M.set(from.subarray(0, boot.recNext));
 	}
@@ -972,8 +956,8 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 	const hostState = shared.hostState;
 
 	return {
-		buffer: () => M,
-		stampView: () => D,
+		memory: M,
+		versions: D,
 		retire,
 		state: snapshot,
 		busy,
@@ -1027,8 +1011,8 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			nodeFreeHead = 0;
 			linkFreeHead = 0;
 			pendingFree.length = 0;
-			// The host's epoch/cycle counters keep counting: fresh records
-			// hold zeroed stamps/versions, which can never equal them.
+			// The host's globalVersion/cycle counters keep counting: fresh
+			// records hold zeroed snapshots, which can never equal them.
 		}
 
 		// ---- minting and freeing (see ReactiveSystemOptions.update) -----------
@@ -1108,7 +1092,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		}
 
 		function freeNode(id: number): void {
-			D[(id >> Arena.StampShift) + Arena.StampOffset] = 0;
+			D[(id >> Arena.VersionShift) + Arena.VersionOffset] = 0;
 			M[id + NodeSlot.Flags] = 0;
 			M[id + NodeSlot.DepsTail] = 0;
 			M[id + NodeSlot.Subs] = 0;
@@ -1552,7 +1536,8 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 
 		// The walks land here for every MUTABLE|DIRTY node: resolution is
 		// entirely the host's (see ReactiveSystemOptions.update) — the host
-		// resets the flags word, re-tracks, recomputes, and stamps, exactly
+		// resets the flags word, re-tracks, recomputes, and snapshots the
+		// version, exactly
 		// like upstream's updateComputed. Without a callback the node is just
 		// marked resolved so walks terminate.
 		function update(node: number): boolean {
@@ -1583,10 +1568,10 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 					return; // stop() re-subscribed the node; it is watched again
 				}
 			}
-			// Kill the quiet-read stamp: an unwatched node no longer receives
+			// Kill the version snapshot: an unwatched node no longer receives
 			// invalidations, so its cached verification must not be trusted
 			// if something re-subscribes later.
-			D[(node >> Arena.StampShift) + Arena.StampOffset] = 0;
+			D[(node >> Arena.VersionShift) + Arena.VersionOffset] = 0;
 			if (M[node + NodeSlot.Flags] & Flag.Orphaned) {
 				reclaimOrphan(node); // owner already collected; nothing can re-subscribe
 			}
