@@ -8,8 +8,8 @@ import { ADAPTERS } from './adapters.js';
 import { mountCounter, mountStepper, mountSheet } from './widgets.js';
 import { mountBench } from './bench.js';
 
-const WIDTH = 192;
-const DEPTH = 108;
+const WIDTH = 288;
+const DEPTH = 162;
 // The field can be driven by any of the adapter libraries; the page's own
 // state stays on dalien-signals regardless.
 const libName = signal('dalien-signals');
@@ -64,7 +64,13 @@ $('btn-invalidate').addEventListener('click', () => {
 	const g = graphSig();
 	timeFullPass(() => g.epoch.write(g.epoch.read() + 1));
 });
-$('lib-select').addEventListener('change', (e) => libName(e.target.value));
+$('lib-bar').addEventListener('click', (e) => {
+	const lib = e.target.dataset?.lib;
+	if (lib) libName(lib);
+});
+for (const b of $('lib-bar').querySelectorAll('button')) {
+	effect(() => b.classList.toggle('on', libName() === b.dataset.lib));
+}
 
 const canvas = $('grid');
 canvas.width = WIDTH;
@@ -128,10 +134,11 @@ function readAll() {
 		for (let i = 0; i < WIDTH; i++) {
 			const v = Math.max(0, Math.min(1, row[i].read()));
 			const p = (r * WIDTH + i) * 4;
-			// near-black -> indigo -> teal -> amber ramp
-			data[p] = v < 0.6 ? v * 60 : (v - 0.6) * 520;
-			data[p + 1] = v * v * 190;
-			data[p + 2] = 24 + v * (1.4 - v) * 300;
+			// navy -> cyan -> gold ramp with late-rising red
+			const warm = v > 0.55 ? (v - 0.55) * 2.2 : 0;
+			data[p] = warm * warm * 255 + v * 30;
+			data[p + 1] = v ** 1.6 * 235;
+			data[p + 2] = (0.16 + v * (1.25 - v)) * 235;
 			data[p + 3] = 255;
 		}
 	}

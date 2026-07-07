@@ -1,40 +1,51 @@
-// In-browser benchmarks. Every (workload, library) cell runs in a FRESH
-// Worker: a new JavaScript realm with its own copies of every module — no
-// JIT feedback, no arena, and no main-thread animation shared with the
-// page or with other cells. This is the browser equivalent of the CI
-// methodology's process-per-framework isolation. Numbers are still a
-// single round on whatever machine is viewing the page: indicative; the
-// README's CI runs are the scoreboard.
+// In-browser benchmarks: the milomg fork's actual suites (sbench, kairo,
+// cellx, dynamic) over its actual framework adapters. Every (suite,
+// library) cell runs in a FRESH Worker — a new realm with untrained
+// modules and, for dalien-signals, a fresh arena — the browser analogue of
+// the CI methodology's process-per-framework isolation. One round on the
+// viewing machine: indicative; the README's CI runs are the scoreboard.
 import { signal, effect } from 'dalien-signals';
-import { ADAPTERS } from './adapters.js';
-import { BENCHES } from './benchDefs.js';
 
-const LIBS = Object.keys(ADAPTERS);
+const LIBS = ['dalien-signals', 'alien-signals', '@preact/signals-core', '@reactively/core'];
+const SUITES = [
+	{ key: 'sbench', label: 'sbench: create & update' },
+	{ key: 'kairo', label: 'kairo: propagation shapes' },
+	{ key: 'cellx', label: 'cellx: layered grids' },
+	{ key: 'dynamic', label: 'dynamic: changing graphs' },
+];
 // Validated categorical palette (fixed order; color follows the library).
 const COLORS = { 'dalien-signals': '#2a78d6', 'alien-signals': '#1baf7a', '@preact/signals-core': '#eda100', '@reactively/core': '#008300' };
 
-function runCell(benchKey, lib) {
+function runCell(suite, lib, onTest) {
 	return new Promise((resolve, reject) => {
 		const worker = new Worker(new URL('./benchWorker.js', import.meta.url), { type: 'module' });
-		const timeout = setTimeout(() => { worker.terminate(); reject(new Error('bench timeout')); }, 30000);
+		const timeout = setTimeout(() => { worker.terminate(); reject(new Error('timeout')); }, 300000);
 		worker.onmessage = (e) => {
+			if (e.data.type === 'test') {
+				onTest(e.data);
+			} else if (e.data.type === 'done') {
+				clearTimeout(timeout);
+				worker.terminate();
+				resolve(e.data.totalMs);
+			} else {
+				clearTimeout(timeout);
+				worker.terminate();
+				reject(new Error(e.data.message));
+			}
+		};
+		worker.onerror = (err) => {
 			clearTimeout(timeout);
 			worker.terminate();
-			resolve(e.data.ms);
+			reject(err);
 		};
-		worker.onerror = (e) => {
-			clearTimeout(timeout);
-			worker.terminate();
-			reject(e);
-		};
-		worker.postMessage({ benchKey, lib });
+		worker.postMessage({ suite, lib });
 	});
 }
 
 export function mountBench(root) {
 	const running = signal(false);
 	const progress = signal('');
-	const results = signal(null);
+	const results = signal(null); // { suiteKey: { libName: totalMs } }
 
 	root.innerHTML = `
 		<div class="actions">
@@ -52,17 +63,20 @@ export function mountBench(root) {
 		running(true);
 		const out = {};
 		try {
-			for (const bench of BENCHES) {
-				out[bench.key] = {};
+			for (const suite of SUITES) {
+				out[suite.key] = {};
 				for (const lib of LIBS) {
-					progress(`${bench.label} — ${lib}`);
-					out[bench.key][lib] = await runCell(bench.key, lib);
+					progress(`${suite.label} — ${lib}`);
+					out[suite.key][lib] = await runCell(suite.key, lib, (t) => {
+						progress(`${suite.label} — ${lib} — ${t.test}: ${t.time.toFixed(0)} ms`);
+					});
 					results({ ...out });
 				}
 			}
 			progress('done — one fresh worker per cell, single round, this machine');
 		} catch (err) {
 			progress(`failed: ${err.message ?? err}`);
+			results({ ...out });
 		}
 		running(false);
 	});
@@ -74,15 +88,15 @@ export function mountBench(root) {
 			chartEl.innerHTML = '';
 			return;
 		}
-		const groups = BENCHES.filter((b) => res[b.key]);
+		const groups = SUITES.filter((s2) => res[s2.key] && Object.keys(res[s2.key]).length);
 		const rowH = 22;
 		const groupPad = 34;
 		let y = 8;
 		let body = '';
-		for (const bench of groups) {
-			const times = res[bench.key];
+		for (const suite of groups) {
+			const times = res[suite.key];
 			const best = Math.min(...Object.values(times));
-			body += `<text class="bench-name" x="0" y="${y + 12}">${bench.label}</text>`;
+			body += `<text class="bench-name" x="0" y="${y + 12}">${suite.label} — suite total</text>`;
 			y += 20;
 			for (const lib of LIBS) {
 				if (!(lib in times)) continue;
@@ -95,7 +109,7 @@ export function mountBench(root) {
 			}
 			y += groupPad - rowH + 8;
 		}
-		chartEl.innerHTML = `<svg viewBox="0 0 760 ${y}" role="img" aria-label="Benchmark times by library; bars show time relative to the fastest library per test, lower is better">${body}</svg>
-			<p class="hint">bars: time ÷ fastest per test (lower is better) · absolute times labelled · each cell = a fresh worker realm — see the README's CI methodology for stable numbers</p>`;
+		chartEl.innerHTML = `<svg viewBox="0 0 760 ${y}" role="img" aria-label="Suite totals by library; bars show time relative to the fastest library per suite, lower is better">${body}</svg>
+			<p class="hint">bars: suite total ÷ fastest (lower is better) · absolute totals labelled · each cell = a fresh worker realm, single round — the README's CI runs interleaved rounds and reports medians</p>`;
 	});
 }

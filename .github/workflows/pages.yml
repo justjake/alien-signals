@@ -16,27 +16,41 @@ concurrency:
   group: pages
   cancel-in-progress: true
 
+env:
+  # Same pinned harness as benchmark.yml: the example's benchmark worker
+  # imports the fork's suites and adapters from source.
+  MILOMG_REPO: https://github.com/milomg/js-reactivity-benchmark
+  MILOMG_SHA: 56eb45e84b3f6fcfa867840725e66b59a9b7467a
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: packages/dalien-signals
       - uses: actions/setup-node@v4
         with:
           node-version: 24
       - run: npm install -g pnpm
+      - name: Clone pinned harness (suites + adapters for the bench worker)
+        run: |
+          git clone --no-checkout "$MILOMG_REPO" milomg-reactivity-benchmark
+          git -C milomg-reactivity-benchmark checkout "$MILOMG_SHA"
+          git -C milomg-reactivity-benchmark apply "$GITHUB_WORKSPACE/packages/dalien-signals/benchs/ci/milomg-fork.patch"
       - name: Build dalien-signals
+        working-directory: packages/dalien-signals
         run: |
           pnpm install --ignore-workspace
           node build.js
       - name: Build the example site
-        working-directory: example
+        working-directory: packages/dalien-signals/example
         run: |
           pnpm install --ignore-workspace
           npx vite build --base=/dalien-signals/
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: example/dist
+          path: packages/dalien-signals/example/dist
   deploy:
     needs: build
     runs-on: ubuntu-latest

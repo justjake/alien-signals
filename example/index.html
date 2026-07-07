@@ -22,16 +22,17 @@
 			</header>
 
 			<section>
-				<h2>Demo: a 20,000-node graph</h2>
+				<h2>Demo: a 46,000-node graph</h2>
 				<p>
 					The top row of pixels is <code>signal</code>s; every pixel below
-					is a <code>computed</code> blending the three cells above —
-					about twenty thousand nodes. The emitters write a few signals per
-					frame; drag to write directly (right button writes darkness).
-					The pale shimmer marks cells that actually recomputed: a change
-					flows down a cone of dependents and the rest of the graph is not
-					touched. The selector rebuilds the same graph on other signal
-					libraries for comparison.
+					is a <code>computed</code> reading its three parents plus one
+					<em>hub</em> — a popular cell several rows up that dozens of
+					others also read. Subscriber counts vary by an order of
+					magnitude, and it shows: writes that stay on ordinary cells
+					cascade in narrow cones, writes that reach a hub flash across
+					whole regions. The emitters write a few signals per frame; drag
+					to write directly (right button writes darkness). The library
+					bar rebuilds the same graph on other signal implementations.
 				</p>
 				<canvas id="grid"></canvas>
 				<section id="hud">
@@ -45,14 +46,12 @@
 					<div class="stat"><span id="stat-heap">–</span><label>js heap</label></div>
 				</section>
 				<section id="controls">
-					<label class="libpick">library
-						<select id="lib-select">
-							<option value="dalien-signals" selected>dalien-signals</option>
-							<option value="alien-signals">alien-signals</option>
-							<option value="@preact/signals-core">@preact/signals-core</option>
-							<option value="@reactively/core">@reactively/core</option>
-						</select>
-					</label>
+					<span class="libpick" id="lib-bar" role="group" aria-label="library">
+						<button data-lib="dalien-signals">dalien-signals</button>
+						<button data-lib="alien-signals">alien-signals</button>
+						<button data-lib="@preact/signals-core">preact</button>
+						<button data-lib="@reactively/core">reactively</button>
+					</span>
 					<button id="btn-wave" class="on">wave</button>
 					<button id="btn-storm">storm</button>
 					<button id="btn-cutoff">equality cutoff: on</button>
@@ -192,13 +191,13 @@ count(2); // logs: 4 true</code></pre>
 			<section>
 				<h2>Benchmarks, in this tab</h2>
 				<p>
-					Four workloads — bulk creation, a deep chain, a wide fan-out,
-					the field's cone grid — across the selector's four libraries.
-					Each cell runs in a fresh Worker so no library inherits JIT
-					state, arena contents, or main-thread contention from the page
-					or from other cells. One round each: indicative only; published
-					numbers come from CI (interleaved rounds, isolated processes,
-					medians).
+					The milomg js-reactivity-benchmark suites — sbench, kairo,
+					cellx, dynamic — run against the selector's four libraries,
+					using the benchmark's own adapters. Each (suite, library) cell
+					runs in a fresh Worker, so no library inherits JIT state, arena
+					contents, or main-thread contention. One round each — expect a
+					few minutes; published numbers come from CI (interleaved
+					rounds, isolated processes, medians).
 				</p>
 				<div id="w-bench"></div>
 			</section>
