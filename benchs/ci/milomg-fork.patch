@@ -21,6 +21,657 @@ index 8e4a88e..6d0001b 100644
      "compostate": "^0.5.1",
      "esbuild": "^0.27.3",
      "mobx": "^6.15.0",
+diff --git a/packages/core/src/benches/cellxBench.ts b/packages/core/src/benches/cellxBench.ts
+index 01ada3e..bb93eb0 100644
+--- a/packages/core/src/benches/cellxBench.ts
++++ b/packages/core/src/benches/cellxBench.ts
+@@ -2,37 +2,53 @@
+ import { nextTick } from "../util/asyncUtil";
+ import { FrameworkInfo } from "../util/frameworkTypes";
+ import { PerfResultCallback } from "../util/perfLogging";
+-import { Computed, ReactiveFramework } from "../util/reactiveFramework";
++import { ReactiveFramework } from "../util/reactiveFramework";
+ 
+-const cellx = (framework: ReactiveFramework, layers: number) => {
++const cellx = <S>(framework: ReactiveFramework<S>, layers: number) => {
+   const iter = framework.withBuild(() => {
+     const start = {
+-      prop1: framework.signal(1),
+-      prop2: framework.signal(2),
+-      prop3: framework.signal(3),
+-      prop4: framework.signal(4),
++      prop1: framework.createSignal(1),
++      prop2: framework.createSignal(2),
++      prop3: framework.createSignal(3),
++      prop4: framework.createSignal(4),
+     };
+ 
+     let layer: {
+-      prop1: Computed<number>;
+-      prop2: Computed<number>;
+-      prop3: Computed<number>;
+-      prop4: Computed<number>;
++      prop1: S;
++      prop2: S;
++      prop3: S;
++      prop4: S;
+     } = start;
+ 
+     for (let i = layers; i > 0; i--) {
+       const m = layer;
+       const s = {
+-        prop1: framework.computed(() => m.prop2.read()),
+-        prop2: framework.computed(() => m.prop1.read() - m.prop3.read()),
+-        prop3: framework.computed(() => m.prop2.read() + m.prop4.read()),
+-        prop4: framework.computed(() => m.prop3.read()),
++        prop1: framework.createComputed(() => framework.readComputed(m.prop2)),
++        prop2: framework.createComputed(
++          () =>
++            (framework.readComputed(m.prop1) as number) -
++            (framework.readComputed(m.prop3) as number),
++        ),
++        prop3: framework.createComputed(
++          () =>
++            (framework.readComputed(m.prop2) as number) +
++            (framework.readComputed(m.prop4) as number),
++        ),
++        prop4: framework.createComputed(() => framework.readComputed(m.prop3)),
+       };
+ 
+-      framework.effect(() => s.prop1.read());
+-      framework.effect(() => s.prop2.read());
+-      framework.effect(() => s.prop3.read());
+-      framework.effect(() => s.prop4.read());
++      framework.effect(() => {
++        framework.readComputed(s.prop1);
++      });
++      framework.effect(() => {
++        framework.readComputed(s.prop2);
++      });
++      framework.effect(() => {
++        framework.readComputed(s.prop3);
++      });
++      framework.effect(() => {
++        framework.readComputed(s.prop4);
++      });
+ 
+       layer = s;
+     }
+@@ -43,24 +59,24 @@ const cellx = (framework: ReactiveFramework, layers: number) => {
+       const startTime = performance.now();
+ 
+       const before = [
+-        end.prop1.read(),
+-        end.prop2.read(),
+-        end.prop3.read(),
+-        end.prop4.read(),
++        framework.readComputed(end.prop1) as number,
++        framework.readComputed(end.prop2) as number,
++        framework.readComputed(end.prop3) as number,
++        framework.readComputed(end.prop4) as number,
+       ] as const;
+ 
+       framework.withBatch(() => {
+-        start.prop1.write(4);
+-        start.prop2.write(3);
+-        start.prop3.write(2);
+-        start.prop4.write(1);
++        framework.writeSignal(start.prop1, 4);
++        framework.writeSignal(start.prop2, 3);
++        framework.writeSignal(start.prop3, 2);
++        framework.writeSignal(start.prop4, 1);
+       });
+ 
+       const after = [
+-        end.prop1.read(),
+-        end.prop2.read(),
+-        end.prop3.read(),
+-        end.prop4.read(),
++        framework.readComputed(end.prop1) as number,
++        framework.readComputed(end.prop2) as number,
++        framework.readComputed(end.prop3) as number,
++        framework.readComputed(end.prop4) as number,
+       ] as const;
+ 
+       const endTime = performance.now();
+diff --git a/packages/core/src/benches/kairo/avoidable.ts b/packages/core/src/benches/kairo/avoidable.ts
+index 403d80d..545dc28 100644
+--- a/packages/core/src/benches/kairo/avoidable.ts
++++ b/packages/core/src/benches/kairo/avoidable.ts
+@@ -2,28 +2,36 @@ import { ReactiveFramework } from "../../util/reactiveFramework";
+ import { busy } from "./util";
+ 
+ /** avoidable change propagation  */
+-export function avoidablePropagation(bridge: ReactiveFramework) {
+-  let head = bridge.signal(0);
+-  let computed1 = bridge.computed(() => head.read());
+-  let computed2 = bridge.computed(() => (computed1.read(), 0));
+-  let computed3 = bridge.computed(() => (busy(), computed2.read() + 1)); // heavy computation
+-  let computed4 = bridge.computed(() => computed3.read() + 2);
+-  let computed5 = bridge.computed(() => computed4.read() + 3);
++export function avoidablePropagation<S>(bridge: ReactiveFramework<S>) {
++  let head = bridge.createSignal(0);
++  let computed1 = bridge.createComputed(() => bridge.readSignal(head));
++  let computed2 = bridge.createComputed(
++    () => (bridge.readComputed(computed1), 0),
++  );
++  let computed3 = bridge.createComputed(
++    () => (busy(), (bridge.readComputed(computed2) as number) + 1),
++  ); // heavy computation
++  let computed4 = bridge.createComputed(
++    () => (bridge.readComputed(computed3) as number) + 2,
++  );
++  let computed5 = bridge.createComputed(
++    () => (bridge.readComputed(computed4) as number) + 3,
++  );
+   bridge.effect(() => {
+-    computed5.read();
++    bridge.readComputed(computed5);
+     busy(); // heavy side effect
+   });
+ 
+   return () => {
+     bridge.withBatch(() => {
+-      head.write(1);
++      bridge.writeSignal(head, 1);
+     });
+-    console.assert(computed5.read() === 6);
++    console.assert(bridge.readComputed(computed5) === 6);
+     for (let i = 0; i < 1000; i++) {
+       bridge.withBatch(() => {
+-        head.write(i);
++        bridge.writeSignal(head, i);
+       });
+-      console.assert(computed5.read() === 6);
++      console.assert(bridge.readComputed(computed5) === 6);
+     }
+   };
+ }
+diff --git a/packages/core/src/benches/kairo/broad.ts b/packages/core/src/benches/kairo/broad.ts
+index b71e634..d8640c3 100644
+--- a/packages/core/src/benches/kairo/broad.ts
++++ b/packages/core/src/benches/kairo/broad.ts
+@@ -1,20 +1,20 @@
+ import { Counter } from "../../util/counter";
+-import { Computed, ReactiveFramework } from "../../util/reactiveFramework";
++import { ReactiveFramework } from "../../util/reactiveFramework";
+ 
+ /** broad propagation */
+-export function broadPropagation(bridge: ReactiveFramework) {
+-  let head = bridge.signal(0);
+-  let last = head as Computed<number>;
++export function broadPropagation<S>(bridge: ReactiveFramework<S>) {
++  let head = bridge.createSignal(0);
++  let last = head;
+   let callCounter = new Counter();
+   for (let i = 0; i < 50; i++) {
+-    let current = bridge.computed(() => {
+-      return head.read() + i;
++    let current = bridge.createComputed(() => {
++      return (bridge.readSignal(head) as number) + i;
+     });
+-    let current2 = bridge.computed(() => {
+-      return current.read() + 1;
++    let current2 = bridge.createComputed(() => {
++      return (bridge.readComputed(current) as number) + 1;
+     });
+     bridge.effect(() => {
+-      current2.read();
++      bridge.readComputed(current2);
+       callCounter.count++;
+     });
+     last = current2;
+@@ -22,15 +22,15 @@ export function broadPropagation(bridge: ReactiveFramework) {
+ 
+   return () => {
+     bridge.withBatch(() => {
+-      head.write(1);
++      bridge.writeSignal(head, 1);
+     });
+     const atleast = 50 * 50;
+     callCounter.count = 0;
+     for (let i = 0; i < 50; i++) {
+       bridge.withBatch(() => {
+-        head.write(i);
++        bridge.writeSignal(head, i);
+       });
+-      console.assert(last.read() === i + 50);
++      console.assert(bridge.readComputed(last) === i + 50);
+     }
+     console.assert(callCounter.count === atleast, callCounter.count);
+   };
+diff --git a/packages/core/src/benches/kairo/deep.ts b/packages/core/src/benches/kairo/deep.ts
+index 7c47670..296f4c2 100644
+--- a/packages/core/src/benches/kairo/deep.ts
++++ b/packages/core/src/benches/kairo/deep.ts
+@@ -1,21 +1,21 @@
+ import { Counter } from "../../util/counter";
+-import { Computed, ReactiveFramework } from "../../util/reactiveFramework";
++import { ReactiveFramework } from "../../util/reactiveFramework";
+ let len = 50;
+ 
+ /** deep propagation */
+-export function deepPropagation(bridge: ReactiveFramework) {
+-  let head = bridge.signal(0);
+-  let current = head as Computed<number>;
++export function deepPropagation<S>(bridge: ReactiveFramework<S>) {
++  let head = bridge.createSignal(0);
++  let current = head;
+   for (let i = 0; i < len; i++) {
+     let c = current;
+-    current = bridge.computed(() => {
+-      return c.read() + 1;
++    current = bridge.createComputed(() => {
++      return (bridge.readComputed(c) as number) + 1;
+     });
+   }
+   let callCounter = new Counter();
+ 
+   bridge.effect(() => {
+-    current.read();
++    bridge.readComputed(current);
+     callCounter.count++;
+   });
+ 
+@@ -23,15 +23,15 @@ export function deepPropagation(bridge: ReactiveFramework) {
+ 
+   return () => {
+     bridge.withBatch(() => {
+-      head.write(1);
++      bridge.writeSignal(head, 1);
+     });
+     const atleast = iter;
+     callCounter.count = 0;
+     for (let i = 0; i < iter; i++) {
+       bridge.withBatch(() => {
+-        head.write(i);
++        bridge.writeSignal(head, i);
+       });
+-      console.assert(current.read() === len + i);
++      console.assert(bridge.readComputed(current) === len + i);
+     }
+ 
+     console.assert(callCounter.count === atleast);
+diff --git a/packages/core/src/benches/kairo/diamond.ts b/packages/core/src/benches/kairo/diamond.ts
+index c846cab..a9cc8e5 100644
+--- a/packages/core/src/benches/kairo/diamond.ts
++++ b/packages/core/src/benches/kairo/diamond.ts
+@@ -1,39 +1,41 @@
+ import { Counter } from "../../util/counter";
+-import { Computed, ReactiveFramework } from "../../util/reactiveFramework";
++import { ReactiveFramework } from "../../util/reactiveFramework";
+ 
+ let width = 5;
+ 
+-export function diamond(bridge: ReactiveFramework) {
+-  let head = bridge.signal(0);
+-  let current: Computed<number>[] = [];
++export function diamond<S>(bridge: ReactiveFramework<S>) {
++  let head = bridge.createSignal(0);
++  let current: S[] = [];
+   for (let i = 0; i < width; i++) {
+     current.push(
+-      bridge.computed(() => {
+-        return head.read() + 1;
++      bridge.createComputed(() => {
++        return (bridge.readSignal(head) as number) + 1;
+       }),
+     );
+   }
+-  let sum = bridge.computed(() => {
+-    return current.map((x) => x.read()).reduce((a, b) => a + b, 0);
++  let sum = bridge.createComputed(() => {
++    return current
++      .map((x) => bridge.readComputed(x) as number)
++      .reduce((a, b) => a + b, 0);
+   });
+   let callCounter = new Counter();
+   bridge.effect(() => {
+-    sum.read();
++    bridge.readComputed(sum);
+     callCounter.count++;
+   });
+ 
+   return () => {
+     bridge.withBatch(() => {
+-      head.write(1);
++      bridge.writeSignal(head, 1);
+     });
+-    console.assert(sum.read() === 2 * width);
++    console.assert(bridge.readComputed(sum) === 2 * width);
+     const atleast = 500;
+     callCounter.count = 0;
+     for (let i = 0; i < 500; i++) {
+       bridge.withBatch(() => {
+-        head.write(i);
++        bridge.writeSignal(head, i);
+       });
+-      console.assert(sum.read() === (i + 1) * width);
++      console.assert(bridge.readComputed(sum) === (i + 1) * width);
+     }
+     console.assert(callCounter.count === atleast);
+   };
+diff --git a/packages/core/src/benches/kairo/molBench.ts b/packages/core/src/benches/kairo/molBench.ts
+index 0c12a03..815c574 100644
+--- a/packages/core/src/benches/kairo/molBench.ts
++++ b/packages/core/src/benches/kairo/molBench.ts
+@@ -11,39 +11,73 @@ function hard(n: number, _log: string) {
+ 
+ const numbers = Array.from({ length: 5 }, (_, i) => i);
+ 
+-export function mol(framework: ReactiveFramework) {
+-  let res = [];
+-  const A = framework.signal(0);
+-  const B = framework.signal(0);
+-  const C = framework.computed(() => (A.read() % 2) + (B.read() % 2));
+-  const D = framework.computed(() =>
+-    numbers.map((i) => ({ x: i + (A.read() % 2) - (B.read() % 2) })),
++/** the value type of computed D below */
++type Points = { x: number }[];
++
++export function mol<S>(framework: ReactiveFramework<S>) {
++  let res: number[] = [];
++  const A = framework.createSignal(0);
++  const B = framework.createSignal(0);
++  const C = framework.createComputed(
++    () =>
++      ((framework.readSignal(A) as number) % 2) +
++      ((framework.readSignal(B) as number) % 2),
++  );
++  const D = framework.createComputed(() =>
++    numbers.map((i) => ({
++      x:
++        i +
++        ((framework.readSignal(A) as number) % 2) -
++        ((framework.readSignal(B) as number) % 2),
++    })),
++  );
++  const E = framework.createComputed(() =>
++    hard(
++      (framework.readComputed(C) as number) +
++        (framework.readSignal(A) as number) +
++        (framework.readComputed(D) as Points)[0].x,
++      "E",
++    ),
+   );
+-  const E = framework.computed(() =>
+-    hard(C.read() + A.read() + D.read()[0].x, "E"),
++  const F = framework.createComputed(() =>
++    hard(
++      (framework.readComputed(D) as Points)[2].x ||
++        (framework.readSignal(B) as number),
++      "F",
++    ),
+   );
+-  const F = framework.computed(() => hard(D.read()[2].x || B.read(), "F"));
+-  const G = framework.computed(
+-    () => C.read() + (C.read() || E.read() % 2) + D.read()[4].x + F.read(),
++  const G = framework.createComputed(
++    () =>
++      (framework.readComputed(C) as number) +
++      ((framework.readComputed(C) as number) ||
++        (framework.readComputed(E) as number) % 2) +
++      (framework.readComputed(D) as Points)[4].x +
++      (framework.readComputed(F) as number),
+   );
+   // H:
+-  framework.effect(() => res.push(hard(G.read(), "H")));
++  framework.effect(() => {
++    res.push(hard(framework.readComputed(G) as number, "H"));
++  });
+   // I:
+-  framework.effect(() => res.push(G.read()));
++  framework.effect(() => {
++    res.push(framework.readComputed(G) as number);
++  });
+   // J:
+-  framework.effect(() => res.push(hard(F.read(), "J")));
++  framework.effect(() => {
++    res.push(hard(framework.readComputed(F) as number, "J"));
++  });
+ 
+   let i = 0;
+   return () => {
+     i++;
+     res.length = 0;
+     framework.withBatch(() => {
+-      B.write(1);
+-      A.write(1 + i * 2);
++      framework.writeSignal(B, 1);
++      framework.writeSignal(A, 1 + i * 2);
+     });
+     framework.withBatch(() => {
+-      A.write(2 + i * 2);
+-      B.write(2);
++      framework.writeSignal(A, 2 + i * 2);
++      framework.writeSignal(B, 2);
+     });
+   };
+ }
+diff --git a/packages/core/src/benches/kairo/mux.ts b/packages/core/src/benches/kairo/mux.ts
+index 97e4e8f..f00331f 100644
+--- a/packages/core/src/benches/kairo/mux.ts
++++ b/packages/core/src/benches/kairo/mux.ts
+@@ -1,29 +1,37 @@
+ import { ReactiveFramework } from "../../util/reactiveFramework";
+ 
+-export function mux(bridge: ReactiveFramework) {
+-  let heads = new Array(100).fill(null).map((_) => bridge.signal(0));
+-  const mux = bridge.computed(() => {
+-    return Object.fromEntries(heads.map((h) => h.read()).entries());
++export function mux<S>(bridge: ReactiveFramework<S>) {
++  let heads = new Array(100).fill(null).map((_) => bridge.createSignal(0));
++  const mux = bridge.createComputed(() => {
++    return Object.fromEntries(heads.map((h) => bridge.readSignal(h)).entries());
+   });
+   const splited = heads
+-    .map((_, index) => bridge.computed(() => mux.read()[index]))
+-    .map((x) => bridge.computed(() => x.read() + 1));
++    .map((_, index) =>
++      bridge.createComputed(
++        () => (bridge.readComputed(mux) as Record<number, number>)[index],
++      ),
++    )
++    .map((x) =>
++      bridge.createComputed(() => (bridge.readComputed(x) as number) + 1),
++    );
+ 
+   splited.forEach((x) => {
+-    bridge.effect(() => x.read());
++    bridge.effect(() => {
++      bridge.readComputed(x);
++    });
+   });
+   return () => {
+     for (let i = 0; i < 10; i++) {
+       bridge.withBatch(() => {
+-        heads[i].write(i);
++        bridge.writeSignal(heads[i], i);
+       });
+-      console.assert(splited[i].read() === i + 1);
++      console.assert(bridge.readComputed(splited[i]) === i + 1);
+     }
+     for (let i = 0; i < 10; i++) {
+       bridge.withBatch(() => {
+-        heads[i].write(i * 2);
++        bridge.writeSignal(heads[i], i * 2);
+       });
+-      console.assert(splited[i].read() === i * 2 + 1);
++      console.assert(bridge.readComputed(splited[i]) === i * 2 + 1);
+     }
+   };
+ }
+diff --git a/packages/core/src/benches/kairo/repeated.ts b/packages/core/src/benches/kairo/repeated.ts
+index 00a9a31..8aa2985 100644
+--- a/packages/core/src/benches/kairo/repeated.ts
++++ b/packages/core/src/benches/kairo/repeated.ts
+@@ -4,35 +4,35 @@ import { ReactiveFramework } from "../../util/reactiveFramework";
+ let size = 30;
+ 
+ /** repeated observers */
+-export function repeatedObservers(bridge: ReactiveFramework) {
+-  let head = bridge.signal(0);
+-  let current = bridge.computed(() => {
++export function repeatedObservers<S>(bridge: ReactiveFramework<S>) {
++  let head = bridge.createSignal(0);
++  let current = bridge.createComputed(() => {
+     let result = 0;
+     for (let i = 0; i < size; i++) {
+       // tbh I think it's meanigless to be this big...
+-      result += head.read();
++      result += bridge.readSignal(head) as number;
+     }
+     return result;
+   });
+ 
+   let callCounter = new Counter();
+   bridge.effect(() => {
+-    current.read();
++    bridge.readComputed(current);
+     callCounter.count++;
+   });
+ 
+   return () => {
+     bridge.withBatch(() => {
+-      head.write(1);
++      bridge.writeSignal(head, 1);
+     });
+-    console.assert(current.read() === size);
++    console.assert(bridge.readComputed(current) === size);
+     const atleast = 100;
+     callCounter.count = 0;
+     for (let i = 0; i < 100; i++) {
+       bridge.withBatch(() => {
+-        head.write(i);
++        bridge.writeSignal(head, i);
+       });
+-      console.assert(current.read() === i * size);
++      console.assert(bridge.readComputed(current) === i * size);
+     }
+     console.assert(callCounter.count === atleast);
+   };
+diff --git a/packages/core/src/benches/kairo/triangle.ts b/packages/core/src/benches/kairo/triangle.ts
+index 82ed1ca..17038e6 100644
+--- a/packages/core/src/benches/kairo/triangle.ts
++++ b/packages/core/src/benches/kairo/triangle.ts
+@@ -1,42 +1,44 @@
+ import { Counter } from "../../util/counter";
+-import { Computed, ReactiveFramework } from "../../util/reactiveFramework";
++import { ReactiveFramework } from "../../util/reactiveFramework";
+ 
+ let width = 10;
+ 
+-export function triangle(bridge: ReactiveFramework) {
+-  let head = bridge.signal(0);
+-  let current = head as Computed<number>;
+-  let list: Computed<number>[] = [];
++export function triangle<S>(bridge: ReactiveFramework<S>) {
++  let head = bridge.createSignal(0);
++  let current = head;
++  let list: S[] = [];
+   for (let i = 0; i < width; i++) {
+     let c = current;
+     list.push(current);
+-    current = bridge.computed(() => {
+-      return c.read() + 1;
++    current = bridge.createComputed(() => {
++      return (bridge.readComputed(c) as number) + 1;
+     });
+   }
+-  let sum = bridge.computed(() => {
+-    return list.map((x) => x.read()).reduce((a, b) => a + b, 0);
++  let sum = bridge.createComputed(() => {
++    return list
++      .map((x) => bridge.readComputed(x) as number)
++      .reduce((a, b) => a + b, 0);
+   });
+ 
+   let callCounter = new Counter();
+   bridge.effect(() => {
+-    sum.read();
++    bridge.readComputed(sum);
+     callCounter.count++;
+   });
+ 
+   return () => {
+     const constant = count(width);
+     bridge.withBatch(() => {
+-      head.write(1);
++      bridge.writeSignal(head, 1);
+     });
+-    console.assert(sum.read() === constant);
++    console.assert(bridge.readComputed(sum) === constant);
+     const atleast = 100;
+     callCounter.count = 0;
+     for (let i = 0; i < 100; i++) {
+       bridge.withBatch(() => {
+-        head.write(i);
++        bridge.writeSignal(head, i);
+       });
+-      console.assert(sum.read() === constant - width + i * width);
++      console.assert(bridge.readComputed(sum) === constant - width + i * width);
+     }
+     console.assert(callCounter.count === atleast);
+   };
+diff --git a/packages/core/src/benches/kairo/unstable.ts b/packages/core/src/benches/kairo/unstable.ts
+index 766cbc6..57ecb09 100644
+--- a/packages/core/src/benches/kairo/unstable.ts
++++ b/packages/core/src/benches/kairo/unstable.ts
+@@ -2,35 +2,43 @@ import { Counter } from "../../util/counter";
+ import { ReactiveFramework } from "../../util/reactiveFramework";
+ 
+ /** worst case. */
+-export function unstable(bridge: ReactiveFramework) {
+-  let head = bridge.signal(0);
+-  const double = bridge.computed(() => head.read() * 2);
+-  const inverse = bridge.computed(() => -head.read());
+-  let current = bridge.computed(() => {
++export function unstable<S>(bridge: ReactiveFramework<S>) {
++  let head = bridge.createSignal(0);
++  const double = bridge.createComputed(
++    () => (bridge.readSignal(head) as number) * 2,
++  );
++  const inverse = bridge.createComputed(
++    () => -(bridge.readSignal(head) as number),
++  );
++  let current = bridge.createComputed(() => {
+     let result = 0;
+     for (let i = 0; i < 20; i++) {
+-      result += head.read() % 2 ? double.read() : inverse.read();
++      result += (
++        (bridge.readSignal(head) as number) % 2
++          ? bridge.readComputed(double)
++          : bridge.readComputed(inverse)
++      ) as number;
+     }
+     return result;
+   });
+ 
+   let callCounter = new Counter();
+   bridge.effect(() => {
+-    current.read();
++    bridge.readComputed(current);
+     callCounter.count++;
+   });
+   return () => {
+     bridge.withBatch(() => {
+-      head.write(1);
++      bridge.writeSignal(head, 1);
+     });
+-    console.assert(current.read() === 40);
++    console.assert(bridge.readComputed(current) === 40);
+     const atleast = 100;
+     callCounter.count = 0;
+     for (let i = 0; i < 100; i++) {
+       bridge.withBatch(() => {
+-        head.write(i);
++        bridge.writeSignal(head, i);
+       });
+-      // console.assert(current.read() === i % 2 ? i * 2 * 10 : i * -10);
++      // console.assert(bridge.readComputed(current) === i % 2 ? i * 2 * 10 : i * -10);
+     }
+     console.assert(callCounter.count === atleast);
+   };
 diff --git a/packages/core/src/benches/kairoBench.ts b/packages/core/src/benches/kairoBench.ts
 index 313b370..8458a10 100644
 --- a/packages/core/src/benches/kairoBench.ts
@@ -43,6 +694,180 @@ index 313b370..8458a10 100644
          for (let i = 0; i < 500; i++) {
            iter();
          }
+diff --git a/packages/core/src/benches/reactively/dependencyGraph.ts b/packages/core/src/benches/reactively/dependencyGraph.ts
+index 2c363a7..7dc3a80 100644
+--- a/packages/core/src/benches/reactively/dependencyGraph.ts
++++ b/packages/core/src/benches/reactively/dependencyGraph.ts
+@@ -1,20 +1,16 @@
+ import { Counter } from "../../util/counter";
+ import { TestConfig } from "../../util/frameworkTypes";
+ import { pseudoRandom } from "../../util/pseudoRandom";
+-import {
+-  Computed,
+-  ReactiveFramework,
+-  Signal,
+-} from "../../util/reactiveFramework";
+-
+-export interface Graph {
+-  sources: Signal<number>[];
+-  layers: Computed<number>[][];
+-  readLeaves: Computed<number>[];
++import { ReactiveFramework } from "../../util/reactiveFramework";
++
++export interface Graph<S> {
++  sources: S[];
++  layers: S[][];
++  readLeaves: S[];
+ }
+ 
+-export interface GraphAndCounter {
+-  graph: Graph;
++export interface GraphAndCounter<S> {
++  graph: Graph<S>;
+   counter: Counter;
+ }
+ 
+@@ -27,15 +23,17 @@ export interface GraphAndCounter {
+  * @param staticFraction every nth computed node is static (1 = all static, 3 = 2/3rd are dynamic)
+  * @returns the graph
+  */
+-export function makeGraph(
+-  framework: ReactiveFramework,
++export function makeGraph<S>(
++  framework: ReactiveFramework<S>,
+   readFraction: number,
+   config: TestConfig,
+-): GraphAndCounter {
++): GraphAndCounter<S> {
+   const { width, totalLayers, staticFraction, nSources } = config;
+ 
+   return framework.withBuild(() => {
+-    const sources = new Array(width).fill(0).map((_, i) => framework.signal(i));
++    const sources = new Array(width)
++      .fill(0)
++      .map((_, i) => framework.createSignal(i));
+     const counter = new Counter();
+     const rows = makeDependentRows(
+       sources,
+@@ -52,7 +50,7 @@ export function makeGraph(
+     const readLeaves = removeElems(leaves, skipCount, rand);
+     framework.effect(() => {
+       for (const leaf of readLeaves) {
+-        leaf.read();
++        framework.readComputed(leaf);
+       }
+     });
+ 
+@@ -66,24 +64,27 @@ export function makeGraph(
+  *
+  * @return the sum of all leaf values
+  */
+-export function runGraph(
+-  graph: Graph,
++export function runGraph<S>(
++  graph: Graph<S>,
+   iterations: number,
+-  framework: ReactiveFramework,
++  framework: ReactiveFramework<S>,
+ ): number {
+   const { sources, readLeaves } = graph;
+ 
+   for (let i = 0; i < iterations; i++) {
+     framework.withBatch(() => {
+       const sourceDex = i % sources.length;
+-      sources[sourceDex].write(i + sourceDex);
++      framework.writeSignal(sources[sourceDex], i + sourceDex);
+     });
+     for (const leaf of readLeaves) {
+-      leaf.read();
++      framework.readComputed(leaf);
+     }
+   }
+ 
+-  const sum = readLeaves.reduce((total, leaf) => leaf.read() + total, 0);
++  const sum = readLeaves.reduce(
++    (total, leaf) => (framework.readComputed(leaf) as number) + total,
++    0,
++  );
+   return sum;
+ }
+ 
+@@ -96,14 +97,14 @@ function removeElems<T>(src: T[], rmCount: number, rand: () => number): T[] {
+   return copy;
+ }
+ 
+-function makeDependentRows(
+-  sources: Computed<number>[],
++function makeDependentRows<S>(
++  sources: S[],
+   numRows: number,
+   counter: Counter,
+   staticFraction: number,
+   nSources: number,
+-  framework: ReactiveFramework,
+-): Computed<number>[][] {
++  framework: ReactiveFramework<S>,
++): S[][] {
+   let prevRow = sources;
+   const random = pseudoRandom();
+   const rows = [];
+@@ -123,17 +124,17 @@ function makeDependentRows(
+   return rows;
+ }
+ 
+-function makeRow(
+-  sources: Computed<number>[],
++function makeRow<S>(
++  sources: S[],
+   counter: Counter,
+   staticFraction: number,
+   nSources: number,
+-  framework: ReactiveFramework,
++  framework: ReactiveFramework<S>,
+   _layer: number,
+   random: () => number,
+-): Computed<number>[] {
++): S[] {
+   return sources.map((_, myDex) => {
+-    const mySources: Computed<number>[] = [];
++    const mySources: S[] = [];
+     for (let sourceDex = 0; sourceDex < nSources; sourceDex++) {
+       mySources.push(sources[(myDex + sourceDex) % sources.length]);
+     }
+@@ -141,12 +142,12 @@ function makeRow(
+     const staticNode = random() < staticFraction;
+     if (staticNode) {
+       // static node, always reference sources
+-      return framework.computed(() => {
++      return framework.createComputed(() => {
+         counter.count++;
+ 
+         let sum = 0;
+         for (const src of mySources) {
+-          sum += src.read();
++          sum += framework.readComputed(src) as number;
+         }
+         return sum;
+       });
+@@ -154,15 +155,15 @@ function makeRow(
+       // dynamic node, drops one of the sources depending on the value of the first element
+       const first = mySources[0];
+       const tail = mySources.slice(1);
+-      const node = framework.computed(() => {
++      const node = framework.createComputed(() => {
+         counter.count++;
+-        let sum = first.read();
++        let sum = framework.readComputed(first) as number;
+         const shouldDrop = sum & 0x1;
+         const dropDex = sum % tail.length;
+ 
+         for (let i = 0; i < tail.length; i++) {
+           if (shouldDrop && i === dropDex) continue;
+-          sum += tail[i].read();
++          sum += framework.readComputed(tail[i]) as number;
+         }
+ 
+         return sum;
 diff --git a/packages/core/src/benches/reactively/dynamicBench.ts b/packages/core/src/benches/reactively/dynamicBench.ts
 index 12220a3..cc72299 100644
 --- a/packages/core/src/benches/reactively/dynamicBench.ts
@@ -75,19 +900,46 @@ index 12220a3..cc72299 100644
          const sum = runOnce();
          return { sum, count: counter.count };
 diff --git a/packages/core/src/benches/sBench.ts b/packages/core/src/benches/sBench.ts
-index dd2b039..35c9a19 100644
+index dd2b039..f018fa8 100644
 --- a/packages/core/src/benches/sBench.ts
 +++ b/packages/core/src/benches/sBench.ts
-@@ -1,7 +1,7 @@
+@@ -1,17 +1,16 @@
  // Inspired by https://github.com/solidjs/solid/blob/main/packages/solid/bench/bench.cjs
  
  import { nextTick } from "../util/asyncUtil";
 -import { fastestTest } from "../util/benchRepeat";
 +import { medianOf } from "../util/medianOf";
  import { PerfResultCallback } from "../util/perfLogging";
- import { Computed, ReactiveFramework, Signal } from "../util/reactiveFramework";
+-import { Computed, ReactiveFramework, Signal } from "../util/reactiveFramework";
++import { ReactiveFramework } from "../util/reactiveFramework";
  
-@@ -74,7 +74,7 @@ export async function sbench(
+ const COUNT = 1e5;
+ 
+ function empty() {}
+ 
+-type Reader = () => number;
+-export async function sbench(
+-  framework: ReactiveFramework,
++export async function sbench<S>(
++  framework: ReactiveFramework<S>,
+   logPerfResult: PerfResultCallback,
+ ) {
+   const createSignalsTime = await run(createSignals, COUNT, COUNT);
+@@ -52,11 +51,11 @@ export async function sbench(
+   });
+ 
+   async function run(
+-    fn: (n: number, sources: Signal<number>[]) => () => void,
++    fn: (n: number, sources: S[]) => () => void,
+     n: number,
+     scount: number,
+   ) {
+-    let sources: Signal<number>[] | null;
++    let sources: S[] | null;
+     if (globalThis.gc) (gc!(), gc!());
+     for (let i = 0; i < 3; i++) {
+       let warmupUpdate = framework.withBuild(() => {
+@@ -74,7 +73,7 @@ export async function sbench(
      if (globalThis.gc) (gc!(), gc!());
      await nextTick();
  
@@ -96,7 +948,20 @@ index dd2b039..35c9a19 100644
      for (let i = 0; i < 10; i++) {
        let start = 0;
        let end = 0;
-@@ -100,12 +100,9 @@ export async function sbench(
+@@ -82,9 +81,9 @@ export async function sbench(
+         sources = [];
+         createSignals(scount, sources);
+         for (let i = 0; i < scount; i++) {
+-          sources[i].read();
+-          sources[i].read();
+-          sources[i].read();
++          framework.readSignal(sources[i]);
++          framework.readSignal(sources[i]);
++          framework.readSignal(sources[i]);
+         }
+ 
+         start = performance.now();
+@@ -100,102 +99,98 @@ export async function sbench(
        // end GC clean
        if (globalThis.gc) (gc!(), gc!());
  
@@ -110,32 +975,465 @@ index dd2b039..35c9a19 100644
 +    return medianOf(runTimes);
    }
  
-   function createSignals(n: number, sources: Computed<number>[]) {
+-  function createSignals(n: number, sources: Computed<number>[]) {
++  function createSignals(n: number, sources: S[]) {
+     for (let i = 0; i < n; i++) {
+-      sources[i] = framework.signal(i);
++      sources[i] = framework.createSignal(i);
+     }
+     return empty;
+   }
+ 
+-  function create0to1(n: number, _sources: Computed<number>[]) {
++  function create0to1(n: number, _sources: S[]) {
+     for (let i = 0; i < n; i++) {
+       createComputation0(i);
+     }
+     return empty;
+   }
+ 
+-  function create1to1000(n: number, sources: Computed<number>[]) {
++  function create1to1000(n: number, sources: S[]) {
+     for (let i = 0; i < n / 1000; i++) {
+-      const { read: get } = sources[i];
++      const source = sources[i];
+       for (let j = 0; j < 1000; j++) {
+-        createComputation1(get);
++        createComputation1(source);
+       }
+     }
+     return empty;
+   }
+ 
+-  function create1to8(n: number, sources: Computed<number>[]) {
++  function create1to8(n: number, sources: S[]) {
+     for (let i = 0; i < n / 8; i++) {
+-      const { read: get } = sources[i];
+-      createComputation1(get);
+-      createComputation1(get);
+-      createComputation1(get);
+-      createComputation1(get);
+-      createComputation1(get);
+-      createComputation1(get);
+-      createComputation1(get);
+-      createComputation1(get);
++      const source = sources[i];
++      createComputation1(source);
++      createComputation1(source);
++      createComputation1(source);
++      createComputation1(source);
++      createComputation1(source);
++      createComputation1(source);
++      createComputation1(source);
++      createComputation1(source);
+     }
+     return empty;
+   }
+ 
+-  function create1to4(n: number, sources: Computed<number>[]) {
++  function create1to4(n: number, sources: S[]) {
+     for (let i = 0; i < n / 4; i++) {
+-      const { read: get } = sources[i];
+-      createComputation1(get);
+-      createComputation1(get);
+-      createComputation1(get);
+-      createComputation1(get);
++      const source = sources[i];
++      createComputation1(source);
++      createComputation1(source);
++      createComputation1(source);
++      createComputation1(source);
+     }
+     return empty;
+   }
+ 
+-  function create1to2(n: number, sources: Computed<number>[]) {
++  function create1to2(n: number, sources: S[]) {
+     for (let i = 0; i < n / 2; i++) {
+-      const { read: get } = sources[i];
+-      createComputation1(get);
+-      createComputation1(get);
++      const source = sources[i];
++      createComputation1(source);
++      createComputation1(source);
+     }
+     return empty;
+   }
+ 
+-  function create1to1(n: number, sources: Computed<number>[]) {
++  function create1to1(n: number, sources: S[]) {
+     for (let i = 0; i < n; i++) {
+-      const { read: get } = sources[i];
+-      createComputation1(get);
++      createComputation1(sources[i]);
+     }
+     return empty;
+   }
+ 
+-  function create2to1(n: number, sources: Computed<number>[]) {
++  function create2to1(n: number, sources: S[]) {
+     for (let i = 0; i < n; i++) {
+-      createComputation2(sources[i * 2].read, sources[i * 2 + 1].read);
++      createComputation2(sources[i * 2], sources[i * 2 + 1]);
+     }
+     return empty;
+   }
+ 
+-  function create4to1(n: number, sources: Computed<number>[]) {
++  function create4to1(n: number, sources: S[]) {
+     for (let i = 0; i < n; i++) {
+       createComputation4(
+-        sources[i * 4].read,
+-        sources[i * 4 + 1].read,
+-        sources[i * 4 + 2].read,
+-        sources[i * 4 + 3].read,
++        sources[i * 4],
++        sources[i * 4 + 1],
++        sources[i * 4 + 2],
++        sources[i * 4 + 3],
+       );
+     }
+     return empty;
+   }
+ 
+   // only create n / 100 computations, as otherwise takes too long
+-  function create1000to1(n: number, sources: Computed<number>[]) {
++  function create1000to1(n: number, sources: S[]) {
+     for (let i = 0; i < n; i++) {
+       createComputation1000(sources, i * 1000);
+     }
+@@ -203,130 +198,165 @@ export async function sbench(
+   }
+ 
+   function createComputation0(i: number) {
+-    framework.effect(() => i);
++    framework.effect(() => {
++      // 0-source effect; capture i so each effect gets a distinct closure
++      void i;
++    });
+     return empty;
+   }
+ 
+-  function createComputation1(s1: Reader) {
+-    framework.effect(() => s1());
++  function createComputation1(s1: S) {
++    framework.effect(() => {
++      framework.readSignal(s1);
++    });
+     return empty;
+   }
+-  function createComputation2(s1: Reader, s2: Reader) {
+-    framework.effect(() => s1() + s2());
++  function createComputation2(s1: S, s2: S) {
++    framework.effect(() => {
++      (framework.readSignal(s1) as number) +
++        (framework.readSignal(s2) as number);
++    });
+     return empty;
+   }
+ 
+-  function createComputation4(s1: Reader, s2: Reader, s3: Reader, s4: Reader) {
+-    framework.effect(() => s1() + s2() + s3() + s4());
++  function createComputation4(s1: S, s2: S, s3: S, s4: S) {
++    framework.effect(() => {
++      (framework.readSignal(s1) as number) +
++        (framework.readSignal(s2) as number) +
++        (framework.readSignal(s3) as number) +
++        (framework.readSignal(s4) as number);
++    });
+     return empty;
+   }
+ 
+-  function createComputation1000(ss: Computed<number>[], offset: number) {
++  function createComputation1000(ss: S[], offset: number) {
+     framework.effect(() => {
+       let sum = 0;
+       for (let i = 0; i < 1000; i++) {
+-        sum += ss[offset + i].read();
++        sum += framework.readSignal(ss[offset + i]) as number;
+       }
+-      return sum;
+     });
+     return empty;
+   }
+ 
+-  function update1to1(n: number, sources: Signal<number>[]) {
+-    let { read: get1, write: set1 } = sources[0];
+-    framework.effect(() => get1());
++  function update1to1(n: number, sources: S[]) {
++    const s0 = sources[0];
++    framework.effect(() => {
++      framework.readSignal(s0);
++    });
+     return () => {
+       for (let i = 0; i < n; i++) {
+         framework.withBatch(() => {
+-          set1(i);
++          framework.writeSignal(s0, i);
+         });
+       }
+     };
+   }
+ 
+-  function update2to1(n: number, sources: Signal<number>[]) {
+-    let { read: get1, write: set1 } = sources[0],
+-      { read: get2 } = sources[1];
+-    framework.effect(() => get1() + get2());
++  function update2to1(n: number, sources: S[]) {
++    const s0 = sources[0];
++    const s1 = sources[1];
++    framework.effect(() => {
++      (framework.readSignal(s0) as number) +
++        (framework.readSignal(s1) as number);
++    });
+     return () => {
+       for (let i = 0; i < n; i++) {
+         framework.withBatch(() => {
+-          set1(i);
++          framework.writeSignal(s0, i);
+         });
+       }
+     };
+   }
+ 
+-  function update4to1(n: number, sources: Signal<number>[]) {
+-    let { read: get1, write: set1 } = sources[0],
+-      { read: get2 } = sources[1],
+-      { read: get3 } = sources[2],
+-      { read: get4 } = sources[3];
+-    framework.effect(() => get1() + get2() + get3() + get4());
++  function update4to1(n: number, sources: S[]) {
++    const s0 = sources[0];
++    const s1 = sources[1];
++    const s2 = sources[2];
++    const s3 = sources[3];
++    framework.effect(() => {
++      (framework.readSignal(s0) as number) +
++        (framework.readSignal(s1) as number) +
++        (framework.readSignal(s2) as number) +
++        (framework.readSignal(s3) as number);
++    });
+     return () => {
+       for (let i = 0; i < n; i++) {
+         framework.withBatch(() => {
+-          set1(i);
++          framework.writeSignal(s0, i);
+         });
+       }
+     };
+   }
+ 
+-  function update1000to1(n: number, sources: Signal<number>[]) {
+-    let { write: set1 } = sources[0];
++  function update1000to1(n: number, sources: S[]) {
++    const s0 = sources[0];
+     framework.effect(() => {
+       let sum = 0;
+       for (let i = 0; i < 1000; i++) {
+-        sum += sources[i].read();
++        sum += framework.readSignal(sources[i]) as number;
+       }
+-      return sum;
+     });
+     return () => {
+       for (let i = 0; i < n; i++) {
+         framework.withBatch(() => {
+-          set1(i);
++          framework.writeSignal(s0, i);
+         });
+       }
+     };
+   }
+ 
+-  function update1to2(n: number, sources: Signal<number>[]) {
+-    let { read: get1, write: set1 } = sources[0];
+-    framework.effect(() => get1());
+-    framework.effect(() => get1());
++  function update1to2(n: number, sources: S[]) {
++    const s0 = sources[0];
++    framework.effect(() => {
++      framework.readSignal(s0);
++    });
++    framework.effect(() => {
++      framework.readSignal(s0);
++    });
+     return () => {
+       for (let i = 0; i < n; i++) {
+         framework.withBatch(() => {
+-          set1(i);
++          framework.writeSignal(s0, i);
+         });
+       }
+     };
+   }
+ 
+-  function update1to4(n: number, sources: Signal<number>[]) {
+-    let { read: get1, write: set1 } = sources[0];
+-    framework.effect(() => get1());
+-    framework.effect(() => get1());
+-    framework.effect(() => get1());
+-    framework.effect(() => get1());
++  function update1to4(n: number, sources: S[]) {
++    const s0 = sources[0];
++    framework.effect(() => {
++      framework.readSignal(s0);
++    });
++    framework.effect(() => {
++      framework.readSignal(s0);
++    });
++    framework.effect(() => {
++      framework.readSignal(s0);
++    });
++    framework.effect(() => {
++      framework.readSignal(s0);
++    });
+     return () => {
+       for (let i = 0; i < n; i++) {
+         framework.withBatch(() => {
+-          set1(i);
++          framework.writeSignal(s0, i);
+         });
+       }
+     };
+   }
+ 
+-  function update1to1000(n: number, sources: Signal<number>[]) {
+-    const { read: get1, write: set1 } = sources[0];
++  function update1to1000(n: number, sources: S[]) {
++    const s0 = sources[0];
+     for (let i = 0; i < 1000; i++) {
+-      framework.effect(() => get1());
++      framework.effect(() => {
++        framework.readSignal(s0);
++      });
+     }
+     return () => {
+       for (let i = 0; i < n / 10; i++) {
+         framework.withBatch(() => {
+-          set1(i);
++          framework.writeSignal(s0, i);
+         });
+       }
+     };
+diff --git a/packages/core/src/frameworks.test.ts b/packages/core/src/frameworks.test.ts
+index c0cca4e..6ac94cc 100644
+--- a/packages/core/src/frameworks.test.ts
++++ b/packages/core/src/frameworks.test.ts
+@@ -23,10 +23,12 @@ function makeConfig(): TestConfig {
+ function frameworkTests({ framework, testPullCounts }: FrameworkInfo) {
+   const name = framework.name;
+   test(`${name} | simple dependency executes`, () => {
+-    const s = framework.signal(2);
+-    const c = framework.computed(() => s.read() * 2);
++    const s = framework.createSignal(2);
++    const c = framework.createComputed(
++      () => (framework.readSignal(s) as number) * 2,
++    );
+ 
+-    expect(c.read()).toEqual(4);
++    expect(framework.readComputed(c)).toEqual(4);
+   });
+ 
+   test(`${name} | static graph`, () => {
 diff --git a/packages/core/src/frameworks/alienSignals.ts b/packages/core/src/frameworks/alienSignals.ts
-index 8d250bf..6872fbf 100644
+index 8d250bf..2f56bd9 100644
 --- a/packages/core/src/frameworks/alienSignals.ts
 +++ b/packages/core/src/frameworks/alienSignals.ts
-@@ -25,7 +25,13 @@ export const alienFramework: ReactiveFramework = {
-       read: () => c(),
-     };
+@@ -8,24 +8,30 @@ import {
+ } from "alien-signals/esm";
+ import { ReactiveFramework } from "../util/reactiveFramework";
+ 
++// A cell is alien-signals' own callable: signals read via s() and write via
++// s(v); computeds read via c(). No per-cell wrapper is needed.
++type AlienCell = {
++  (): unknown;
++  (value: unknown): void;
++};
++
+ let scope: (() => void) | null = null;
+ 
+-export const alienFramework: ReactiveFramework = {
++export const alienFramework: ReactiveFramework<AlienCell> = {
+   name: "Alien Signals",
+-  signal: (initial) => {
+-    const data = signal(initial);
+-    return {
+-      read: () => data(),
+-      write: (v) => data(v),
+-    };
++  createSignal: (initialValue) => signal(initialValue) as AlienCell,
++  readSignal: (s) => s(),
++  writeSignal: (s, value) => {
++    s(value);
+   },
+-  computed: (fn) => {
+-    const c = computed(fn);
+-    return {
+-      read: () => c(),
+-    };
++  createComputed: (fn) => computed(fn) as AlienCell,
++  readComputed: (c) => c(),
++  // alien-signals >= 3.2 treats a non-undefined return value from the effect
++  // callback as a cleanup function; the bench contract guarantees fn returns
++  // undefined, so fn passes through without a protective wrapper.
++  effect: (fn) => {
++    effect(fn);
    },
 -  effect: (fn) => effect(fn),
-+  // alien-signals >= 3.2 treats a non-undefined return value from the effect
-+  // callback as a cleanup function; the bench contract ignores returns.
-+  effect: (fn) => {
-+    effect(() => {
-+      fn();
-+    });
-+  },
    withBatch: (fn) => {
      startBatch();
      fn();
+diff --git a/packages/core/src/frameworks/angularSignals2.ts b/packages/core/src/frameworks/angularSignals2.ts
+index 96e1e53..921a45f 100644
+--- a/packages/core/src/frameworks/angularSignals2.ts
++++ b/packages/core/src/frameworks/angularSignals2.ts
+@@ -7,6 +7,8 @@ import {
+   ɵChangeDetectionScheduler,
+   ɵEffectScheduler,
+   untracked,
++  type Signal,
++  type WritableSignal,
+ } from "@angular/core";
+ 
+ interface SchedulableEffect {
+@@ -52,21 +54,18 @@ const createInjector = () => ({
+ 
+ let injectorObj = createInjector();
+ 
+-export const angularFramework: ReactiveFramework = {
++// A cell is Angular's own signal getter; writable signals carry .set.
++type AngularCell = Signal<unknown>;
++
++export const angularFramework: ReactiveFramework<AngularCell> = {
+   name: "Angular Signals",
+-  signal: (initialValue) => {
+-    const s = signal(initialValue);
+-    return {
+-      write: (v) => s.set(v),
+-      read: () => s(),
+-    };
+-  },
+-  computed: (fn) => {
+-    const c = computed(fn);
+-    return {
+-      read: () => c(),
+-    };
++  createSignal: (initialValue) => signal(initialValue),
++  readSignal: (s) => s(),
++  writeSignal: (s, value) => {
++    (s as WritableSignal<unknown>).set(value);
+   },
++  createComputed: (fn) => computed(fn),
++  readComputed: (c) => c(),
+   effect: (fn) => {
+     effect(fn, injectorObj);
+   },
 diff --git a/packages/core/src/frameworks/anod.ts b/packages/core/src/frameworks/anod.ts
 new file mode 100644
-index 0000000..827de8e
+index 0000000..fa4614c
 --- /dev/null
 +++ b/packages/core/src/frameworks/anod.ts
-@@ -0,0 +1,66 @@
+@@ -0,0 +1,68 @@
 +import { ReactiveFramework } from "../util/reactiveFramework";
 +import {
 +  c,
@@ -150,10 +1448,17 @@ index 0000000..827de8e
 +
 +// anod has no automatic dependency tracking: reads subscribe by calling
 +// c.val() on the context passed to each compute/effect callback. Track the
-+// innermost context here so wrapped signals can read through it.
++// innermost context here so cells can read through it.
 +let currentReader: Reader | null = null;
 +let currentRoot: RootContext | null = null;
 +let rootHandle: Root | null = null;
++
++// A cell is anod's own signal or compute node; both read via .get() outside
++// a tracking context and via reader.val() inside one. Signals carry .set().
++type AnodCell = {
++  get(): unknown;
++  set?: (v: unknown) => void;
++};
 +
 +function tracked<T>(fn: () => T): (c: Reader) => T {
 +  return (c) => {
@@ -167,25 +1472,20 @@ index 0000000..827de8e
 +  };
 +}
 +
-+export const anodFramework: ReactiveFramework = {
++function readCell(cell: AnodCell): unknown {
++  return currentReader ? currentReader.val(cell) : cell.get();
++}
++
++export const anodFramework: ReactiveFramework<AnodCell> = {
 +  name: "anod",
-+  signal: (initialValue) => {
-+    const s = signal(initialValue);
-+    return {
-+      write: (v) => s.set(v),
-+      read: () => (currentReader ? currentReader.val(s) : s.get()),
-+    };
++  createSignal: (initialValue) => signal(initialValue),
++  readSignal: readCell,
++  writeSignal: (s, value) => {
++    s.set!(value);
 +  },
-+  computed: <T>(fn: () => T) => {
-+    const node = (currentRoot ?? c).compute(
-+      tracked(fn),
-+      undefined as unknown as T,
-+      OPT_DEFER,
-+    );
-+    return {
-+      read: () => (currentReader ? currentReader.val(node) : node.get()),
-+    };
-+  },
++  createComputed: (fn) =>
++    (currentRoot ?? c).compute(tracked(fn), undefined, OPT_DEFER),
++  readComputed: readCell,
 +  effect: (fn) => (currentRoot ?? c).effect(tracked(fn)),
 +  withBatch: (fn) => batch(fn),
 +  withBuild: <T>(fn: () => T) => {
@@ -204,10 +1504,10 @@ index 0000000..827de8e
 +};
 diff --git a/packages/core/src/frameworks/cosignal.ts b/packages/core/src/frameworks/cosignal.ts
 new file mode 100644
-index 0000000..dcd011c
+index 0000000..1d576b9
 --- /dev/null
 +++ b/packages/core/src/frameworks/cosignal.ts
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,45 @@
 +import * as lib from "cosignal";
 +import { ReactiveFramework } from "../util/reactiveFramework";
 +
@@ -215,29 +1515,24 @@ index 0000000..dcd011c
 +// Computed `.state` and `.set`) so the benchmark measures the surface
 +// applications use, policy wrapper included. Graphs are built inside an
 +// effectScope and disposed in cleanup(), like the other adapters.
++// A cell is the Atom or Computed instance itself; both expose .state.
++type CosignalCell = lib.Atom<unknown> | lib.Computed<unknown>;
++
 +let scope: (() => void) | null = null;
 +
-+export const cosignalFramework: ReactiveFramework = {
++export const cosignalFramework: ReactiveFramework<CosignalCell> = {
 +  name: "Cosignal",
-+  signal: <T>(initial: T) => {
-+    const a = new lib.Atom(initial);
-+    return {
-+      read: () => a.state,
-+      write: (v: T) => a.set(v),
-+    };
++  createSignal: (initialValue) => new lib.Atom(initialValue),
++  readSignal: (cell) => cell.state,
++  writeSignal: (cell, value) => {
++    (cell as lib.Atom<unknown>).set(value);
 +  },
-+  computed: <T>(fn: () => T) => {
-+    const c = new lib.Computed(fn);
-+    return {
-+      read: () => c.state,
-+    };
-+  },
-+  // Wrapped so bench callbacks' return values are never treated as cleanup
-+  // functions (same shape as the alien-signals adapters).
++  createComputed: (fn) => new lib.Computed(fn),
++  readComputed: (cell) => cell.state,
++  // The bench contract guarantees fn returns undefined, so returns are never
++  // treated as cleanup functions and fn passes through unwrapped.
 +  effect: (fn) => {
-+    lib.effect(() => {
-+      fn();
-+    });
++    lib.effect(fn);
 +  },
 +  withBatch: (fn) => {
 +    lib.startBatch();
@@ -260,10 +1555,10 @@ index 0000000..dcd011c
 +};
 diff --git a/packages/core/src/frameworks/dalienMallocFree.ts b/packages/core/src/frameworks/dalienMallocFree.ts
 new file mode 100644
-index 0000000..655bc73
+index 0000000..86399de
 --- /dev/null
 +++ b/packages/core/src/frameworks/dalienMallocFree.ts
-@@ -0,0 +1,66 @@
+@@ -0,0 +1,58 @@
 +import {
 +  flushEffects,
 +  setEffectMode,
@@ -284,39 +1579,31 @@ index 0000000..655bc73
 +// 100% explicit: every id created here lives until the enclosing effect
 +// scope is disposed (creations inside a scope region are freed with it).
 +// This is the malloc/free counterpart to the "Dalien Signals" adapter,
-+// isolating what the leak-free-by-default interface costs. Default
-+// capacity (2^20 records); the suite never grows the arena.
++// isolating what the leak-free-by-default interface costs. With S = the
++// numeric id itself, this adapter allocates nothing per cell. Library
++// default capacity; the suite never grows the arena.
 +setEffectMode("manual");
 +
 +let scope: SignalId | null = null;
 +
-+export const dalienMallocFreeFramework: ReactiveFramework = {
++export const dalienMallocFreeFramework: ReactiveFramework<SignalId> = {
 +  name: "Dalien Malloc Free",
-+  signal: <T,>(initial: T) => {
-+    const id = signalId(initial);
-+    return {
-+      read: () => get(id),
-+      write: (v: T) => set(id, v),
-+    };
-+  },
-+  computed: <T,>(fn: () => T) => {
-+    const id = computedId(fn);
-+    return {
-+      read: () => get(id) as T,
-+    };
-+  },
++  createSignal: (initialValue) => signalId(initialValue),
++  readSignal: (id) => get(id),
++  writeSignal: (id, value) => set(id, value),
++  createComputed: (fn) => computedId(fn),
++  readComputed: (id) => get(id),
 +  // alien-signals >= 3.2 treats a non-undefined return value from the effect
-+  // callback as a cleanup function; the bench contract ignores returns.
++  // callback as a cleanup function; the bench contract guarantees fn returns
++  // undefined, so fn passes through without a protective wrapper.
 +  effect: (fn) => {
-+    effectId(() => {
-+      fn();
-+    });
++    effectId(fn);
 +  },
 +  withBatch: (fn) => {
 +    fn();
 +    flushEffects();
 +  },
-+  withBuild: <T,>(fn: () => T) => {
++  withBuild: <T>(fn: () => T) => {
 +    let out!: T;
 +    scope = effectScopeId(() => {
 +      out = fn();
@@ -332,10 +1619,10 @@ index 0000000..655bc73
 +};
 diff --git a/packages/core/src/frameworks/dalienSignals.ts b/packages/core/src/frameworks/dalienSignals.ts
 new file mode 100644
-index 0000000..9c7d6a8
+index 0000000..4654bfb
 --- /dev/null
 +++ b/packages/core/src/frameworks/dalienSignals.ts
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,59 @@
 +import {
 +  flushEffects,
 +  setEffectMode,
@@ -350,41 +1637,38 @@ index 0000000..9c7d6a8
 +// dalien-signals through its DEFAULT API: upstream-shaped
 +// callables (sig() reads, sig(next) writes) that are their own GC owners —
 +// drop the callable, the record reclaims — the leak-free basic interface,
-+// measured as-is, at the library's default capacity (2^20 records; the
-+// suite never grows the arena).
++// measured as-is, at the library's default capacity (the suite never grows
++// the arena).
 +setEffectMode("manual");
++
++// A cell is the library's own callable; no per-cell wrapper is needed.
++type DalienCell = {
++  (): unknown;
++  (value: unknown): void;
++};
 +
 +let scope: EffectStop | null = null;
 +
-+export const dalienFramework: ReactiveFramework = {
++export const dalienFramework: ReactiveFramework<DalienCell> = {
 +  name: "Dalien Signals",
-+  // The read/write closures retain the callable (its lifetime is the
-+  // node's lifetime) by capturing it.
-+  signal: <T,>(initial: T) => {
-+    const s = signal(initial);
-+    return {
-+      read: () => s(),
-+      write: (v: T) => s(v),
-+    };
++  createSignal: (initialValue) => signal(initialValue) as DalienCell,
++  readSignal: (s) => s(),
++  writeSignal: (s, value) => {
++    s(value);
 +  },
-+  computed: <T,>(fn: () => T) => {
-+    const c = computed(fn);
-+    return {
-+      read: () => c(),
-+    };
-+  },
++  createComputed: (fn) => computed(fn) as DalienCell,
++  readComputed: (c) => c(),
 +  // alien-signals >= 3.2 treats a non-undefined return value from the effect
-+  // callback as a cleanup function; the bench contract ignores returns.
++  // callback as a cleanup function; the bench contract guarantees fn returns
++  // undefined, so fn passes through without a protective wrapper.
 +  effect: (fn) => {
-+    effect(() => {
-+      fn();
-+    });
++    effect(fn);
 +  },
 +  withBatch: (fn) => {
 +    fn();
 +    flushEffects();
 +  },
-+  withBuild: <T,>(fn: () => T) => {
++  withBuild: <T>(fn: () => T) => {
 +    let out!: T;
 +    scope = effectScope(() => {
 +      out = fn();
@@ -398,12 +1682,509 @@ index 0000000..9c7d6a8
 +    }
 +  },
 +};
+diff --git a/packages/core/src/frameworks/inactive/compostate.ts b/packages/core/src/frameworks/inactive/compostate.ts
+index f5a3a4b..caae68a 100644
+--- a/packages/core/src/frameworks/inactive/compostate.ts
++++ b/packages/core/src/frameworks/inactive/compostate.ts
+@@ -1,22 +1,29 @@
+ import { signal, computed, syncEffect, batch, createRoot } from "compostate";
+ import { ReactiveFramework } from "../../util/reactiveFramework";
+ 
++// A cell is compostate's own getter function. signal() returns a [get, set]
++// pair; the setter rides along as a property on the getter so the pair is
++// not retained and every read stays a bare call.
++type CompostateCell = {
++  (): unknown;
++  set?: (v: unknown) => void;
++};
++
+ let toCleanup: (() => void)[] = [];
+-export const compostateFramework: ReactiveFramework = {
++export const compostateFramework: ReactiveFramework<CompostateCell> = {
+   name: "Compostate",
+-  signal: (initialValue) => {
++  createSignal: (initialValue) => {
+     const [get, set] = signal(initialValue);
+-    return {
+-      write: (v) => set(v),
+-      read: () => get(),
+-    };
++    const cell = get as CompostateCell;
++    cell.set = set as (v: unknown) => void;
++    return cell;
+   },
+-  computed: (fn) => {
+-    const get = computed(fn);
+-    return {
+-      read: () => get(),
+-    };
++  readSignal: (s) => s(),
++  writeSignal: (s, value) => {
++    s.set!(value);
+   },
++  createComputed: (fn) => computed(fn),
++  readComputed: (c) => c(),
+   effect: (fn) => toCleanup.push(syncEffect(fn)),
+   withBatch: (fn) => batch(fn),
+   withBuild: (fn) => createRoot(fn),
+diff --git a/packages/core/src/frameworks/inactive/mobx.ts b/packages/core/src/frameworks/inactive/mobx.ts
+index da7ab41..7a9b6c9 100644
+--- a/packages/core/src/frameworks/inactive/mobx.ts
++++ b/packages/core/src/frameworks/inactive/mobx.ts
+@@ -1,22 +1,23 @@
+ import { computed, observable, autorun, runInAction } from "mobx";
+ import { ReactiveFramework } from "../../util/reactiveFramework";
+ 
++// A cell is mobx's own box or computed value; both read via .get() and
++// boxes carry .set(). No per-cell wrapper is needed.
++type MobxCell = {
++  get(): unknown;
++  set?: (v: unknown) => void;
++};
++
+ let toCleanup: (() => void)[] = [];
+-export const mobxFramework: ReactiveFramework = {
++export const mobxFramework: ReactiveFramework<MobxCell> = {
+   name: "MobX",
+-  signal(initial) {
+-    const s = observable.box(initial, { deep: false });
+-    return {
+-      read: () => s.get(),
+-      write: (x) => s.set(x),
+-    };
+-  },
+-  computed: (fn) => {
+-    const read = computed(fn);
+-    return {
+-      read: () => read.get(),
+-    };
++  createSignal: (initialValue) => observable.box(initialValue, { deep: false }),
++  readSignal: (s) => s.get(),
++  writeSignal: (s, value) => {
++    s.set!(value);
+   },
++  createComputed: (fn) => computed(fn),
++  readComputed: (c) => c.get(),
+   effect: (fn) => toCleanup.push(autorun(fn)),
+   withBatch: (fn) => runInAction(fn),
+   withBuild: (fn) => fn(),
+diff --git a/packages/core/src/frameworks/inactive/oby.ts b/packages/core/src/frameworks/inactive/oby.ts
+index bcdce67..937d2db 100644
+--- a/packages/core/src/frameworks/inactive/oby.ts
++++ b/packages/core/src/frameworks/inactive/oby.ts
+@@ -1,21 +1,22 @@
+ import { ReactiveFramework } from "../../util/reactiveFramework";
+ import $ from "oby";
+ 
+-export const obyFramework: ReactiveFramework = {
++// A cell is oby's own observable callable: read via cell(), write via
++// cell(v). No per-cell wrapper is needed.
++type ObyCell = {
++  (): unknown;
++  (value: unknown): unknown;
++};
++
++export const obyFramework: ReactiveFramework<ObyCell> = {
+   name: "Oby",
+-  signal: (initialValue) => {
+-    const observable = $(initialValue);
+-    return {
+-      write: (v) => observable(v),
+-      read: () => observable(),
+-    };
+-  },
+-  computed: (fn) => {
+-    const memo = $.memo(fn);
+-    return {
+-      read: () => memo(),
+-    };
++  createSignal: (initialValue) => $(initialValue) as ObyCell,
++  readSignal: (s) => s(),
++  writeSignal: (s, value) => {
++    s(value);
+   },
++  createComputed: (fn) => $.memo(fn) as ObyCell,
++  readComputed: (c) => c(),
+   effect: (fn) => $.effect(fn),
+   withBatch: (fn) => {
+     fn();
+diff --git a/packages/core/src/frameworks/inactive/s.ts b/packages/core/src/frameworks/inactive/s.ts
+index c44978f..46eb596 100644
+--- a/packages/core/src/frameworks/inactive/s.ts
++++ b/packages/core/src/frameworks/inactive/s.ts
+@@ -1,21 +1,22 @@
+ import { ReactiveFramework } from "../../util/reactiveFramework";
+ import S from "s-js";
+ 
+-export const sFramework: ReactiveFramework = {
++// A cell is s-js's own data/computation callable: read via cell(), write
++// via cell(v). No per-cell wrapper is needed.
++type SCell = {
++  (): unknown;
++  (value: unknown): unknown;
++};
++
++export const sFramework: ReactiveFramework<SCell> = {
+   name: "s-js",
+-  signal: (initial) => {
+-    const data = S.value(initial);
+-    return {
+-      read: () => data(),
+-      write: (v) => data(v),
+-    };
+-  },
+-  computed: (fn) => {
+-    const computed = S(fn);
+-    return {
+-      read: () => computed(),
+-    };
++  createSignal: (initialValue) => S.value(initialValue) as SCell,
++  readSignal: (s) => s(),
++  writeSignal: (s, value) => {
++    s(value);
+   },
++  createComputed: (fn) => S(fn) as SCell,
++  readComputed: (c) => c(),
+   effect: (fn) => S(fn),
+   withBatch: (fn) => S.freeze(fn),
+   withBuild: (fn) =>
+diff --git a/packages/core/src/frameworks/inactive/uSignal.ts b/packages/core/src/frameworks/inactive/uSignal.ts
+index cc43998..e101353 100644
+--- a/packages/core/src/frameworks/inactive/uSignal.ts
++++ b/packages/core/src/frameworks/inactive/uSignal.ts
+@@ -1,22 +1,22 @@
+ import { ReactiveFramework } from "../../util/reactiveFramework";
+ import { batch, computed, effect, signal } from "usignal";
+ 
++// A cell is usignal's own Signal instance; both signals and computeds read
++// through .value. No per-cell wrapper is needed.
++type USignalCell = {
++  value: unknown;
++};
++
+ let toCleanup: (() => void)[] = [];
+-export const usignalFramework: ReactiveFramework = {
++export const usignalFramework: ReactiveFramework<USignalCell> = {
+   name: "uSignal",
+-  signal: (initialValue) => {
+-    const s = signal(initialValue);
+-    return {
+-      write: (v) => (s.value = v),
+-      read: () => s.value,
+-    };
+-  },
+-  computed: (fn) => {
+-    const c = computed(fn);
+-    return {
+-      read: () => c.value,
+-    };
++  createSignal: (initialValue) => signal(initialValue),
++  readSignal: (s) => s.value,
++  writeSignal: (s, value) => {
++    s.value = value;
+   },
++  createComputed: (fn) => computed(fn),
++  readComputed: (c) => c.value,
+   effect: (fn) => toCleanup.push(effect(fn)),
+   withBatch: (fn) => batch(fn),
+   withBuild: (fn) => fn(),
+diff --git a/packages/core/src/frameworks/inactive/vueReactivity.ts b/packages/core/src/frameworks/inactive/vueReactivity.ts
+index d1399d2..1fcffef 100644
+--- a/packages/core/src/frameworks/inactive/vueReactivity.ts
++++ b/packages/core/src/frameworks/inactive/vueReactivity.ts
+@@ -8,23 +8,23 @@ import {
+ } from "@vue/reactivity";
+ import { ReactiveFramework } from "../../util/reactiveFramework";
+ 
++// A cell is vue's own ref or computed ref; both read through .value.
++// No per-cell wrapper is needed.
++type VueCell = {
++  value: unknown;
++};
++
+ let scheduled = [] as ReactiveEffect[];
+ let scope: EffectScope | null = null;
+-export const vueReactivityFramework: ReactiveFramework = {
++export const vueReactivityFramework: ReactiveFramework<VueCell> = {
+   name: "Vue",
+-  signal: (initial) => {
+-    const data = shallowRef(initial);
+-    return {
+-      read: () => data.value as any,
+-      write: (v) => (data.value = v as any),
+-    };
+-  },
+-  computed: (fn) => {
+-    const c = computed(fn);
+-    return {
+-      read: () => c.value,
+-    };
++  createSignal: (initialValue) => shallowRef(initialValue),
++  readSignal: (s) => s.value,
++  writeSignal: (s, value) => {
++    s.value = value;
+   },
++  createComputed: (fn) => computed(fn),
++  readComputed: (c) => c.value,
+   effect: (fn) => {
+     let t = effect(fn, {
+       scheduler: () => {
+diff --git a/packages/core/src/frameworks/molWire.ts b/packages/core/src/frameworks/molWire.ts
+index 29e4461..175d061 100644
+--- a/packages/core/src/frameworks/molWire.ts
++++ b/packages/core/src/frameworks/molWire.ts
+@@ -1,24 +1,26 @@
+-import { ReactiveFramework, Signal } from "../util/reactiveFramework";
++import { ReactiveFramework } from "../util/reactiveFramework";
+ import $ from "mol_wire_lib";
+ 
+ const Atom = $.$mol_wire_atom; // fix a bug in mol exports
+ 
++// A cell is a $mol_wire_atom instance; both signals and computeds read via
++// .sync() and atoms accept writes via .put(). No per-cell wrapper is needed.
++type MolWireCell = {
++  put(v: unknown): unknown;
++  sync(): unknown;
++};
++
+ let toCleanup: $.$mol_wire_atom<unknown, [], unknown>[] = [];
+-export const molWireFramework: ReactiveFramework = {
++export const molWireFramework: ReactiveFramework<MolWireCell> = {
+   name: "$mol_wire_atom",
+-  signal: <T>(initialValue: T): Signal<T> => {
+-    const atom = new Atom("", (next: T = initialValue) => next);
+-    return {
+-      write: (v: T) => atom.put(v),
+-      read: () => atom.sync(),
+-    };
+-  },
+-  computed: (fn) => {
+-    const atom = new Atom("", fn);
+-    return {
+-      read: () => atom.sync(),
+-    };
++  createSignal: (initialValue) =>
++    new Atom("", (next: unknown = initialValue) => next),
++  readSignal: (s) => s.sync(),
++  writeSignal: (s, value) => {
++    s.put(value);
+   },
++  createComputed: (fn) => new Atom("", fn),
++  readComputed: (c) => c.sync(),
+   effect: (fn) => toCleanup.push(new Atom("", fn)),
+   withBatch: (fn) => {
+     fn();
+diff --git a/packages/core/src/frameworks/pota.ts b/packages/core/src/frameworks/pota.ts
+index 465e74b..1c4af0b 100644
+--- a/packages/core/src/frameworks/pota.ts
++++ b/packages/core/src/frameworks/pota.ts
+@@ -7,21 +7,28 @@ import {
+   signal as createSignal,
+ } from "pota";
+ 
+-export const potaFramework: ReactiveFramework = {
++// A cell is pota's own accessor function. signal() returns a [get, set]
++// pair; the setter rides along as a property on the getter so the pair is
++// not retained and every read stays a bare call.
++type PotaCell = {
++  (): unknown;
++  set?: (v: unknown) => void;
++};
++
++export const potaFramework: ReactiveFramework<PotaCell> = {
+   name: "Pota",
+-  signal: (initialValue) => {
++  createSignal: (initialValue) => {
+     const [getter, setter] = createSignal(initialValue);
+-    return {
+-      write: (v) => setter(v as any),
+-      read: () => getter(),
+-    };
++    const cell = getter as PotaCell;
++    cell.set = setter as (v: unknown) => void;
++    return cell;
+   },
+-  computed: (fn) => {
+-    const memo = createMemo(fn);
+-    return {
+-      read: () => memo(),
+-    };
++  readSignal: (s) => s(),
++  writeSignal: (s, value) => {
++    s.set!(value);
+   },
++  createComputed: (fn) => createMemo(fn),
++  readComputed: (c) => c(),
+   effect: (fn) => createEffect(fn),
+   withBatch: (fn) => batch(fn),
+   withBuild: (fn) =>
+diff --git a/packages/core/src/frameworks/preactSignals.ts b/packages/core/src/frameworks/preactSignals.ts
+index d506160..9fdb85e 100644
+--- a/packages/core/src/frameworks/preactSignals.ts
++++ b/packages/core/src/frameworks/preactSignals.ts
+@@ -1,22 +1,27 @@
+ import { ReactiveFramework } from "../util/reactiveFramework";
+-import { batch, computed, effect, signal } from "@preact/signals";
++import {
++  batch,
++  computed,
++  effect,
++  signal,
++  type ReadonlySignal,
++  type Signal,
++} from "@preact/signals";
++
++// A cell is preact's own Signal instance; both signals and computeds read
++// through .value. No per-cell wrapper is needed.
++type PreactCell = ReadonlySignal<unknown>;
+ 
+ let toCleanup: (() => void)[] = [];
+-export const preactSignalFramework: ReactiveFramework = {
++export const preactSignalFramework: ReactiveFramework<PreactCell> = {
+   name: "Preact Signals",
+-  signal: (initialValue) => {
+-    const s = signal(initialValue);
+-    return {
+-      write: (v) => (s.value = v),
+-      read: () => s.value,
+-    };
+-  },
+-  computed: (fn) => {
+-    const c = computed(fn);
+-    return {
+-      read: () => c.value,
+-    };
++  createSignal: (initialValue) => signal(initialValue),
++  readSignal: (s) => s.value,
++  writeSignal: (s, value) => {
++    (s as Signal<unknown>).value = value;
+   },
++  createComputed: (fn) => computed(fn),
++  readComputed: (c) => c.value,
+   effect: (fn) => toCleanup.push(effect(fn)),
+   withBatch: (fn) => batch(fn),
+   withBuild: (fn) => fn(),
+diff --git a/packages/core/src/frameworks/reactively.ts b/packages/core/src/frameworks/reactively.ts
+index b88ea78..f5cdb06 100644
+--- a/packages/core/src/frameworks/reactively.ts
++++ b/packages/core/src/frameworks/reactively.ts
+@@ -1,28 +1,51 @@
+ import { Reactive, stabilize } from "@reactively/core";
+ import { ReactiveFramework } from "../util/reactiveFramework";
+ 
+-export const reactivelyFramework: ReactiveFramework = {
++// A cell is a Reactive node itself; signals and computeds both read via
++// .get(). No per-cell wrapper is needed.
++type ReactivelyCell = Reactive<unknown>;
++
++// @reactively/core has no public disposal API, and its effects re-run on
++// every stabilize() for as long as their sources still list them as
++// observers — without teardown, each benchmark round's effects keep firing
++// against dead graphs. Detach an effect by hand; this relies on
++// runtime-accessible TS-private fields of Reactive.
++function disposeEffect(effectNode: ReactivelyCell): void {
++  // Reactive's fields are TS-private but plain at runtime; cast once.
++  const node = effectNode as any;
++  // run pending user cleanups exactly as update() would
++  if (node.cleanups.length) {
++    for (const c of node.cleanups) c(node._value);
++    node.cleanups = [];
++  }
++  node.removeParentObservers(0); // detach from every source's observer list
++  node.sources = null;
++  node.effect = false; // never re-enters the effect queue
++  node.state = 0; // CacheClean: a stale effect-queue entry no-ops on get()
++}
++
++let effects: ReactivelyCell[] = [];
++
++export const reactivelyFramework: ReactiveFramework<ReactivelyCell> = {
+   name: "Reactively",
+-  signal: (initialValue) => {
+-    const r = new Reactive(initialValue);
+-    return {
+-      write: (v) => r.set(v),
+-      read: () => r.get(),
+-    };
+-  },
+-  computed: (fn) => {
+-    const r = new Reactive(fn);
+-    return {
+-      read: () => r.get(),
+-    };
++  createSignal: (initialValue) => new Reactive(initialValue),
++  readSignal: (s) => s.get(),
++  writeSignal: (s, value) => s.set(value),
++  createComputed: (fn) => new Reactive(fn),
++  readComputed: (c) => c.get(),
++  effect: (fn) => {
++    effects.push(new Reactive<unknown>(fn, true));
+   },
+-  effect: (fn) => new Reactive(fn, true),
+   withBatch: (fn) => {
+     fn();
+     stabilize();
+   },
+   withBuild: (fn) => fn(),
+   cleanup: () => {
+-    // TODO: reactively doesn't support cleaning up effects yet
++    const disposing = effects;
++    effects = [];
++    for (const node of disposing) {
++      disposeEffect(node);
++    }
+   },
+ };
+diff --git a/packages/core/src/frameworks/solid.ts b/packages/core/src/frameworks/solid.ts
+index 4614d0b..d86e39d 100644
+--- a/packages/core/src/frameworks/solid.ts
++++ b/packages/core/src/frameworks/solid.ts
+@@ -7,21 +7,28 @@ import {
+   createSignal,
+ } from "solid-js/dist/solid.cjs";
+ 
+-export const solidFramework: ReactiveFramework = {
++// A cell is solid's own accessor function. createSignal returns a
++// [get, set] pair; the setter rides along as a property on the getter so
++// the pair is not retained and every read stays a bare call.
++type SolidCell = {
++  (): unknown;
++  set?: (v: unknown) => void;
++};
++
++export const solidFramework: ReactiveFramework<SolidCell> = {
+   name: "SolidJS",
+-  signal: (initialValue) => {
++  createSignal: (initialValue) => {
+     const [getter, setter] = createSignal(initialValue);
+-    return {
+-      write: (v) => setter(v as any),
+-      read: () => getter(),
+-    };
++    const cell = getter as SolidCell;
++    cell.set = setter as (v: unknown) => void;
++    return cell;
+   },
+-  computed: (fn) => {
+-    const memo = createMemo(fn);
+-    return {
+-      read: () => memo(),
+-    };
++  readSignal: (s) => s(),
++  writeSignal: (s, value) => {
++    s.set!(value);
+   },
++  createComputed: (fn) => createMemo(fn),
++  readComputed: (c) => c(),
+   effect: (fn) => createEffect(fn),
+   withBatch: (fn) => batch(fn),
+   withBuild: (fn) =>
 diff --git a/packages/core/src/frameworks/solid2.ts b/packages/core/src/frameworks/solid2.ts
 new file mode 100644
-index 0000000..c3b89bc
+index 0000000..ceb044e
 --- /dev/null
 +++ b/packages/core/src/frameworks/solid2.ts
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,45 @@
 +import { ReactiveFramework } from "../util/reactiveFramework";
 +// The package's `node` export condition resolves to a server build with
 +// inert reactivity, so load the browser build directly.
@@ -415,58 +2196,183 @@ index 0000000..c3b89bc
 +  createSignal,
 +} from "../../node_modules/solid-js-2/dist/solid.js";
 +
-+export const solid2Framework: ReactiveFramework = {
++// A cell is solid's own accessor function. createSignal returns a
++// [get, set] pair; the setter rides along as a property on the getter so
++// the pair is not retained and every read stays a bare call.
++type Solid2Cell = {
++  (): unknown;
++  set?: (v: unknown) => void;
++};
++
++export const solid2Framework: ReactiveFramework<Solid2Cell> = {
 +  name: "SolidJS 2.0",
-+  signal: (initialValue) => {
++  createSignal: (initialValue) => {
 +    const [getter, setter] = createSignal(initialValue as any);
-+    return {
-+      write: (v) => setter(v as any),
-+      read: () => getter(),
-+    };
++    const cell = getter as Solid2Cell;
++    cell.set = setter as (v: unknown) => void;
++    return cell;
 +  },
-+  computed: (fn) => {
-+    const memo = createMemo(fn);
-+    return {
-+      read: () => memo(),
-+    };
++  readSignal: (s) => s(),
++  writeSignal: (s, value) => {
++    s.set!(value);
 +  },
++  createComputed: (fn) => createMemo(fn),
++  readComputed: (c) => c(),
 +  effect: (fn) => createEffect(fn, () => {}),
 +  withBatch: (fn) => {
 +    fn();
 +    flush();
 +  },
-+  withBuild: (fn) =>
-+    createRoot((dispose) => {
++  withBuild: (fn: () => any) =>
++    createRoot((dispose: () => void) => {
 +      solid2Framework.cleanup = dispose;
 +      return fn();
 +    }),
 +  cleanup: () => {},
 +};
+diff --git a/packages/core/src/frameworks/svelte.ts b/packages/core/src/frameworks/svelte.ts
+index 24e6640..dcfc754 100644
+--- a/packages/core/src/frameworks/svelte.ts
++++ b/packages/core/src/frameworks/svelte.ts
+@@ -10,21 +10,19 @@ import * as $ from "svelte/internal/client";
+ // efficient TS implementations available, I wanted to include it in the
+ // benchmark suite regardless.
+ 
+-export const svelteFramework: ReactiveFramework = {
++// A cell is svelte's own internal source/derived object, read through $.get
++// and written through $.set. The object is opaque to the benchmarks.
++type SvelteCell = unknown;
++
++export const svelteFramework: ReactiveFramework<SvelteCell> = {
+   name: "Svelte v5",
+-  signal: (initialValue) => {
+-    const s = $.state(initialValue);
+-    return {
+-      write: (v) => $.set(s, v),
+-      read: () => $.get(s),
+-    };
+-  },
+-  computed: (fn) => {
+-    const c = $.derived(fn);
+-    return {
+-      read: () => $.get(c),
+-    };
++  createSignal: (initialValue) => $.state(initialValue),
++  readSignal: (s) => $.get(s),
++  writeSignal: (s, value) => {
++    $.set(s, value);
+   },
++  createComputed: (fn) => $.derived(fn),
++  readComputed: (c) => $.get(c),
+   effect: (fn) => {
+     $.render_effect(fn);
+   },
+diff --git a/packages/core/src/frameworks/tansu.ts b/packages/core/src/frameworks/tansu.ts
+index 4c0c1b0..2dd883e 100644
+--- a/packages/core/src/frameworks/tansu.ts
++++ b/packages/core/src/frameworks/tansu.ts
+@@ -1,22 +1,22 @@
+ import { ReactiveFramework } from "../util/reactiveFramework";
+ import { writable, computed, batch } from "@amadeus-it-group/tansu";
+ 
++// A cell is tansu's own store callable; writable stores carry .set.
++type TansuCell = {
++  (): unknown;
++  set?: (v: unknown) => void;
++};
++
+ let toCleanup: (() => void)[] = [];
+-export const tansuFramework: ReactiveFramework = {
++export const tansuFramework: ReactiveFramework<TansuCell> = {
+   name: "amadeus-it-group/tansu",
+-  signal: (initialValue) => {
+-    const w = writable(initialValue);
+-    return {
+-      write: (v) => w.set(v),
+-      read: () => w(),
+-    };
+-  },
+-  computed: (fn) => {
+-    const c = computed(fn);
+-    return {
+-      read: () => c(),
+-    };
++  createSignal: (initialValue) => writable(initialValue) as TansuCell,
++  readSignal: (s) => s(),
++  writeSignal: (s, value) => {
++    s.set!(value);
+   },
++  createComputed: (fn) => computed(fn) as TansuCell,
++  readComputed: (c) => c(),
+   effect: (fn) => toCleanup.push(computed(fn).subscribe(() => {})),
+   withBatch: (fn) => batch(fn),
+   withBuild: (fn) => fn(),
+diff --git a/packages/core/src/frameworks/tc39signals.ts b/packages/core/src/frameworks/tc39signals.ts
+index 099c639..a8e3293 100644
+--- a/packages/core/src/frameworks/tc39signals.ts
++++ b/packages/core/src/frameworks/tc39signals.ts
+@@ -1,23 +1,21 @@
+ import { ReactiveFramework } from "../util/reactiveFramework";
+ import { Signal } from "signal-polyfill";
+ 
++// A cell is the polyfill's own State or Computed instance; both read via
++// .get(). No per-cell wrapper is needed.
++type Tc39Cell = Signal.State<unknown> | Signal.Computed<unknown>;
++
+ let toCleanup: (() => void)[] = [];
+-export const tc39SignalsFramework: ReactiveFramework = {
++export const tc39SignalsFramework: ReactiveFramework<Tc39Cell> = {
+   name: "TC39 Signals",
+-  signal: (initialValue) => {
+-    const s = new Signal.State(initialValue);
+-    return {
+-      write: (v) => s.set(v),
+-      read: () => s.get(),
+-    };
+-  },
+-  computed: (fn) => {
+-    const c = new Signal.Computed(fn);
+-    return {
+-      read: () => c.get(),
+-    };
++  createSignal: (initialValue) => new Signal.State(initialValue),
++  readSignal: (s) => s.get(),
++  writeSignal: (s, value) => {
++    (s as Signal.State<unknown>).set(value);
+   },
+-  effect: (callback: any) => {
++  createComputed: (fn) => new Signal.Computed(fn),
++  readComputed: (c) => c.get(),
++  effect: (callback) => {
+     const computed = new Signal.Computed(() => callback());
+ 
+     w.watch(computed);
 diff --git a/packages/core/src/frameworks/tldrawState.ts b/packages/core/src/frameworks/tldrawState.ts
 new file mode 100644
-index 0000000..8633d72
+index 0000000..008f1d7
 --- /dev/null
 +++ b/packages/core/src/frameworks/tldrawState.ts
-@@ -0,0 +1,29 @@
+@@ -0,0 +1,30 @@
 +import { ReactiveFramework } from "../util/reactiveFramework";
 +import { atom, computed, react, transact } from "@tldraw/state";
 +
++// A cell is tldraw's own atom or computed instance; both read via .get()
++// and atoms carry .set(). No per-cell wrapper is needed.
++type TldrawCell = {
++  get(): unknown;
++  set?: (v: unknown) => void;
++};
++
 +let toCleanup: (() => void)[] = [];
-+export const tldrawStateFramework: ReactiveFramework = {
++export const tldrawStateFramework: ReactiveFramework<TldrawCell> = {
 +  name: "@tldraw/state",
-+  signal: (initialValue) => {
-+    const a = atom("s", initialValue);
-+    return {
-+      write: (v) => a.set(v),
-+      read: () => a.get(),
-+    };
++  createSignal: (initialValue) => atom("s", initialValue),
++  readSignal: (s) => s.get(),
++  writeSignal: (s, value) => {
++    s.set!(value);
 +  },
-+  computed: (fn) => {
-+    const c = computed("c", fn);
-+    return {
-+      read: () => c.get(),
-+    };
-+  },
++  createComputed: (fn) => computed("c", fn),
++  readComputed: (c) => c.get(),
 +  effect: (fn) => toCleanup.push(react("e", fn)),
 +  withBatch: (fn) => transact(fn),
 +  withBuild: (fn) => fn(),
@@ -477,6 +2383,50 @@ index 0000000..8633d72
 +    toCleanup = [];
 +  },
 +};
+diff --git a/packages/core/src/frameworks/xReactivity.ts b/packages/core/src/frameworks/xReactivity.ts
+index 26c574c..7a79d79 100644
+--- a/packages/core/src/frameworks/xReactivity.ts
++++ b/packages/core/src/frameworks/xReactivity.ts
+@@ -7,21 +7,28 @@ import {
+   createSignal,
+ } from "@solidjs/signals";
+ 
+-export const xReactivityFramework: ReactiveFramework = {
++// A cell is the framework's own accessor function. createSignal returns a
++// [get, set] pair; the setter rides along as a property on the getter so
++// the pair is not retained and every read stays a bare call.
++type XReactivityCell = {
++  (): unknown;
++  set?: (v: unknown) => void;
++};
++
++export const xReactivityFramework: ReactiveFramework<XReactivityCell> = {
+   name: "x-reactivity",
+-  signal: (initialValue) => {
++  createSignal: (initialValue) => {
+     const [getter, setter] = createSignal(initialValue as any);
+-    return {
+-      write: (v) => setter(v as any),
+-      read: () => getter(),
+-    };
++    const cell = getter as XReactivityCell;
++    cell.set = setter as (v: unknown) => void;
++    return cell;
+   },
+-  computed: (fn) => {
+-    const memo = createMemo(fn);
+-    return {
+-      read: () => memo(),
+-    };
++  readSignal: (s) => s(),
++  writeSignal: (s, value) => {
++    s.set!(value);
+   },
++  createComputed: (fn) => createMemo(fn),
++  readComputed: (c) => c(),
+   effect: (fn) => createEffect(fn, () => {}),
+   withBatch: (fn) => {
+     fn();
 diff --git a/packages/core/src/frameworksList.ts b/packages/core/src/frameworksList.ts
 index 30d3c8b..06f85eb 100644
 --- a/packages/core/src/frameworksList.ts
@@ -597,6 +2547,25 @@ index fc7b78a..85661f2 100644
  /** benchmark a function n times, returning the fastest result and associated timing */
  export async function fastestTest<T>(
    times: number,
+diff --git a/packages/core/src/util/frameworkTypes.ts b/packages/core/src/util/frameworkTypes.ts
+index edbb641..1493854 100644
+--- a/packages/core/src/util/frameworkTypes.ts
++++ b/packages/core/src/util/frameworkTypes.ts
+@@ -44,9 +44,11 @@ export interface TestConfig {
+   expected: Partial<TestResult>;
+ }
+ 
+-export interface FrameworkInfo {
+-  /** wrapper/adapter for a benchmarking a reactive framework */
+-  framework: ReactiveFramework;
++/** S defaults to any because framework rosters mix adapters with different
++ * cell representations. */
++export interface FrameworkInfo<S = any> {
++  /** adapter for benchmarking a reactive framework */
++  framework: ReactiveFramework<S>;
+ 
+   /** verify the number of nodes executed matches the expected number */
+   testPullCounts?: boolean;
 diff --git a/packages/core/src/util/medianOf.ts b/packages/core/src/util/medianOf.ts
 new file mode 100644
 index 0000000..8e51663
@@ -615,6 +2584,80 @@ index 0000000..8e51663
 +    ? sorted[mid]
 +    : (sorted[mid - 1] + sorted[mid]) / 2;
 +}
+diff --git a/packages/core/src/util/reactiveFramework.ts b/packages/core/src/util/reactiveFramework.ts
+index 7965832..0e180e0 100644
+--- a/packages/core/src/util/reactiveFramework.ts
++++ b/packages/core/src/util/reactiveFramework.ts
+@@ -1,22 +1,42 @@
+-/** interface for a reactive framework.
++/** Adapter interface for benchmarking a reactive framework.
+  *
+- * Implement this interface to add a new reactive framework to the test and performance test suite.
++ * The adapter is generic over S, the framework's own representation of a
++ * reactive cell: a signal object, a callable, or a plain numeric id. Cells
++ * flow through the benchmarks as opaque S values and every operation is a
++ * static method on the adapter, so an adapter never allocates a wrapper
++ * object or a read/write closure pair per cell. Cell values are `unknown` at
++ * this boundary; each benchmark knows the concrete types of the cells it
++ * creates and casts at the point of use.
+  */
+-export interface ReactiveFramework {
++export interface ReactiveFramework<S = unknown> {
+   name: string;
+-  signal<T>(initialValue: T): Signal<T>;
+-  computed<T>(fn: () => T): Computed<T>;
++
++  /** Create a writable signal cell holding initialValue. */
++  createSignal(initialValue: unknown): S;
++
++  /** Read a cell statically known to be a signal. */
++  readSignal(signal: S): unknown;
++
++  /** Write a new value into a signal cell. */
++  writeSignal(signal: S, value: unknown): void;
++
++  /** Create a computed cell recomputed from the cells fn reads. */
++  createComputed(fn: () => unknown): S;
++
++  /** Read a computed cell. Benchmarks mix signals and computeds in the same
++   * dependency rows, so readComputed must also accept signal cells;
++   * readSignal exists separately for frameworks with a cheaper signal-only
++   * read path. */
++  readComputed(cell: S): unknown;
++
++  /** Create an effect that re-runs when the cells fn reads change.
++   *
++   * fn must return undefined: several frameworks treat a returned value as a
++   * cleanup handle, so benchmarks pass block-bodied callbacks and adapters
++   * may hand fn to the framework without a protective wrapper closure. */
+   effect(fn: () => void): void;
+-  withBatch<T>(fn: () => T): void;
++
++  withBatch(fn: () => void): void;
+   withBuild<T>(fn: () => T): T;
+   cleanup(): void;
+ }
+-
+-export interface Signal<T> {
+-  read(): T;
+-  write(v: T): void;
+-}
+-
+-export interface Computed<T> {
+-  read(): T;
+-}
+diff --git a/packages/core/vitest.config.ts b/packages/core/vitest.config.ts
+new file mode 100644
+index 0000000..3d462c6
+--- /dev/null
++++ b/packages/core/vitest.config.ts
+@@ -0,0 +1,6 @@
++import { defineConfig } from "vitest/config";
++
++// The enclosing monorepo's root vite.config.ts declares vitest "projects"
++// that do not exist relative to this package, which aborts startup. A local
++// config stops vitest's upward config search at this package.
++export default defineConfig({});
 diff --git a/packages/node/src/index.ts b/packages/node/src/index.ts
 index a0a2c47..8ddb4d0 100644
 --- a/packages/node/src/index.ts
