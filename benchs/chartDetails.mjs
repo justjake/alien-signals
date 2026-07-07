@@ -8,7 +8,7 @@
 //
 // Usage: node benchs/chartDetails.mjs <results.txt> <out.svg> [TITLE] [SUBTITLE]
 import { readFileSync, writeFileSync } from 'node:fs';
-import { COLOR, GRID, INK, INK2, INK3, SURFACE, SUITES, escXml, parseResults, suiteOf } from './lib.mjs';
+import { COLOR, GRID, INK, INK2, INK3, SURFACE, SUITES, escXml, parseResults, suiteOf, displayName, isOurs } from './lib.mjs';
 
 const SRC = process.argv[2] ?? 'benchs/results/2026-07-05-isolated-node.txt';
 const OUT = process.argv[3] ?? '/tmp/benchmark-details.svg';
@@ -79,9 +79,7 @@ panels.forEach((test, pi) => {
 	svg.push(`<line x1="${px + LABEL_W}" y1="${py + PANEL_HEAD - 2}" x2="${px + LABEL_W}" y2="${py + PANEL_HEAD + frameworks.length * ROW_H - 2}" stroke="${GRID}" stroke-width="1"/>`);
 	frameworks.forEach((fw, i) => {
 		const y = py + PANEL_HEAD + i * ROW_H;
-		const isOurs = fw === 'Dalien Signals' || fw === 'dalien-signals';
-		const isUpstream = fw.startsWith('Alien Signals') || fw.startsWith('alien-signals');
-		svg.push(`<text x="${px + LABEL_W - 6}" y="${y + BAR_H - 2}" font-size="10" text-anchor="end" fill="${isOurs || isUpstream ? INK : INK2}"${isOurs ? ' font-weight="700"' : isUpstream ? ' font-weight="600"' : ''}>${esc(shorten(fw))}</text>`);
+		svg.push(`<text x="${px + LABEL_W - 6}" y="${y + BAR_H - 2}" font-size="10" text-anchor="end" fill="${isOurs(fw) ? INK : INK2}"${isOurs(fw) ? ' font-weight="700"' : ''}>${esc(shorten(displayName(fw)))}</text>`);
 		const v = data.get(fw);
 		if (v === undefined) {
 			// crashed/skipped test for this framework — keep the row, mark it

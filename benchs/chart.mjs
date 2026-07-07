@@ -4,7 +4,7 @@
 // 4px rounded data-end (square baseline), 2px surface gaps between segments,
 // hairline solid gridlines, values at bar tips in text ink, legend on top.
 import { readFileSync, writeFileSync } from 'node:fs';
-import { COLOR, GRID, INK, INK2, SURFACE, SUITES, escXml, parseResults, summarize } from './lib.mjs';
+import { COLOR, GRID, INK, INK2, SURFACE, SUITES, escXml, parseResults, summarize, displayName, isOurs } from './lib.mjs';
 
 // Pipeline: run `node dist/isolated.js` in milomg-reactivity-benchmark/packages/node
 // (one process per framework), save its stdout under benchs/results/, then
@@ -67,9 +67,7 @@ svg.push(`<text x="${x(axisMax / 2)}" y="${H - 10}" font-size="11" fill="${INK2}
 // bars
 frameworks.forEach((f, i) => {
 	const y = TOP + i * ROW + (ROW - BAR) / 2;
-	const isOurs = f.fw === 'Dalien Signals' || f.fw === 'dalien-signals';
-	const isUpstream = f.fw.startsWith('Alien Signals') || f.fw.startsWith('alien-signals');
-	svg.push(`<text x="${LABEL_W - 8}" y="${y + BAR / 2 + 4}" font-size="12" text-anchor="end" fill="${INK}"${isOurs ? ' font-weight="700"' : isUpstream ? ' font-weight="600"' : ''}>${esc(f.fw)}</text>`);
+	svg.push(`<text x="${LABEL_W - 8}" y="${y + BAR / 2 + 4}" font-size="12" text-anchor="end" fill="${INK}"${isOurs(f.fw) ? ' font-weight="700"' : ''}>${esc(displayName(f.fw))}</text>`);
 	let cx = LABEL_W;
 	SUITES.forEach((s, si) => {
 		const w = (f[s] / axisMax) * plotW;

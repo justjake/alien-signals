@@ -17,7 +17,7 @@ import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdir
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { SUITES, parseResults, summarize } from '../lib.mjs';
+import { SUITES, parseResults, summarize, displayName } from '../lib.mjs';
 
 const args = process.argv.slice(2);
 const flag = (name) => {
@@ -110,11 +110,11 @@ for (const rt of runtimes) {
 	const { frameworks, partial } = summarize(parseResults(readFileSync(csvSrc, 'utf8')));
 	if (partial.length) console.error(`note: excluded from ${rt} charts (crashed mid-suite): ${partial.join('; ')}`);
 
-	const alt = frameworks.map((f) => `${f.fw} ${fmtMs(f.total)} ms`).join('; ');
+	const alt = frameworks.map((f) => `${displayName(f.fw)} ${fmtMs(f.total)} ms`).join('; ');
 	const table = [
 		'| framework | sbench | kairo | cellx | dynamic | total |',
 		'| --- | ---: | ---: | ---: | ---: | ---: |',
-		...frameworks.map((f) => `| ${f.fw} | ${SUITES.map((s) => Math.round(f[s])).join(' | ')} | ${Math.round(f.total)} |`),
+		...frameworks.map((f) => `| ${displayName(f.fw)} | ${SUITES.map((s) => Math.round(f[s])).join(' | ')} | ${Math.round(f.total)} |`),
 	].join('\n');
 	const block = [
 		`<img width="1080" alt="Total benchmark time by framework, ${label}: ${alt}" src="assets/benchmark${suffix}.png" />`,

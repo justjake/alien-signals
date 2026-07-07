@@ -55,3 +55,9 @@ export function summarize(rows) {
 }
 
 export const escXml = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+
+// Chart presentation policy, one place: this repo's frameworks are the
+// bold rows, and the raw-id-tier framework renders under its public name.
+const DISPLAY_NAMES = new Map([['Dalien Malloc Free', 'Dalien Id Alloc/Free']]);
+export const displayName = (fw) => DISPLAY_NAMES.get(fw) ?? fw;
+export const isOurs = (fw) => fw === 'Dalien Signals' || fw === 'dalien-signals' || fw === 'Dalien Malloc Free' || fw === 'Dalien Id Alloc/Free';
