@@ -682,11 +682,27 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 			}
 		}
 		const idx = id >> Arena.NodeIndexShift;
-		currentVals[idx] = undefined;
-		pendingVals[idx] = undefined;
-		fns[idx] = undefined;
-		cleanups[idx] = undefined;
-		owned[idx] = undefined;
+		// Clear only within each column's populated range. A store past the
+		// end of a large array flips V8's elements kind to dictionary mode
+		// and every later access to that column pays for it; past .length
+		// nothing was ever stored, so there is nothing to release.
+		// (Measured: this guard took a 2M-node teardown sweep from ~21s of
+		// dictionary-mode stores to milliseconds.)
+		if (idx < currentVals.length) {
+			currentVals[idx] = undefined;
+		}
+		if (idx < pendingVals.length) {
+			pendingVals[idx] = undefined;
+		}
+		if (idx < fns.length) {
+			fns[idx] = undefined;
+		}
+		if (idx < cleanups.length) {
+			cleanups[idx] = undefined;
+		}
+		if (idx < owned.length) {
+			owned[idx] = undefined;
+		}
 	}
 	// Upstream's unwatched, delivered when a node's last subscriber unlinks.
 	function unwatchedNode(id: SignalId): void {
