@@ -1,5 +1,41 @@
 # milomg benchmark campaign — findings
 
+## Campaign vs fused main (goal: parity or better, everywhere)
+
+The reference is this repo's fused dalien-signals engine (milomg
+0.99–1.07 vs alien; crossover matrix 0.90). Landed levers, each measured
+in isolation:
+
+1. **Kind-specialized callable reads** (the big one): the signal oper
+   calls readSignal — flags check, link, value load; NO version gate, NO
+   memo — and the computed oper calls readComputed (gate as its
+   verification fast path), mirroring fused main's read()/computedRead().
+   The gate+memo body belongs to the kind-dispatching raw get() only;
+   carrying it on every callable read was most of the wrapper tax.
+   Suite user/main went ~1.15 → ~1.01 geomean; 8 cells now beat main
+   (createComputations 0.71–0.75, cellx 0.72–0.88, diamond 0.90).
+2. **No .id on callables**: one property store on a fresh closure is a
+   map transition — ~30ns of a ~50ns mint. Dropping it took the mint
+   burst from 3× main to parity. Id workflows use the raw tier.
+3. **Getter threading** (readComputed carries the oper-captured getter to
+   read-driven recomputes; walk-driven updates still load fns[]) —
+   neutral in measurement, kept for main-parity structure.
+
+Measured and rejected:
+
+- **EnterDepth as a host let** with 0/1 transition mirroring: the branch
+  pair costs more than the two typed-array RMWs it replaced (~+3%).
+- **Immediate registration in adoptNode**: decided by 3 interleaved suite
+  rounds — deferred wins the geomean 1.038 vs 1.057 AND the createSignals
+  cell itself (2.02 vs 2.52 of main); single rounds that favored immediate
+  were the cell's own ±30% noise. Same verdict as the v16 handle-era
+  experiment: per-mint weak cells in bursts cost more than the deferred
+  queue, in every era.
+
+Remaining gaps (single-round; multi-round scoreboard pending):
+createSignals ~1.6 vs main, repeatedObservers/unstable ~1.2, dynamic
+band ~1.1–1.3, crossover microkernels ~1.15/main uniformly.
+
 Goal under test: be 20% faster than upstream alien-signals v3 on the milomg
 reactivity benchmark (geomean of per-test medians ≤ 0.80), with a basic
 public API that cannot leak and needs no ceremony.
