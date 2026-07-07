@@ -114,7 +114,6 @@ let globalVersion = 1;
 // flush time means the record was freed (and possibly reused) after being
 // queued, so the entry is skipped instead of running a stranger.
 const queued: SignalId[] = [];
-const queuedGens: SignalGen[] = [];
 let manualEffects = false;
 
 // ---- the shared arena and the five graph ops --------------------------------
@@ -172,14 +171,12 @@ const system = createReactiveSystem({
 	// it (clearing Watching as the dedup) and reverse the run so outer
 	// effects flush before the children they own. The core already cleared
 	// the entry node's Watching bit before calling here.
-	notify: function enqueueEffect(id, gen): void {
+	notify: function enqueueEffect(id): void {
 		let insertIndex = queuedLength;
 		let firstInsertedIndex = insertIndex;
 		let e = id;
-		let eGen = gen;
 		while (true) {
-			queued[insertIndex] = e;
-			queuedGens[insertIndex++] = eGen;
+			queued[insertIndex++] = e;
 			const subsLink: LinkId = M[e + NodeSlot.Subs];
 			if (!subsLink) {
 				break;
@@ -190,16 +187,12 @@ const system = createReactiveSystem({
 				break;
 			}
 			M[e + NodeSlot.Flags] = flags & ~Flag.Watching;
-			eGen = M[e + NodeSlot.Gen];
 		}
 		queuedLength = insertIndex;
 		while (firstInsertedIndex < --insertIndex) {
 			const leftId = queued[firstInsertedIndex];
-			const leftGen = queuedGens[firstInsertedIndex];
-			queued[firstInsertedIndex] = queued[insertIndex];
-			queuedGens[firstInsertedIndex++] = queuedGens[insertIndex];
+			queued[firstInsertedIndex++] = queued[insertIndex];
 			queued[insertIndex] = leftId;
-			queuedGens[insertIndex] = leftGen;
 		}
 	},
 	// A record went to the free list (explicit free, owner collection, or
@@ -207,6 +200,18 @@ const system = createReactiveSystem({
 	// values and closures stay pinned — and traced by every major GC —
 	// until the record is reused.
 	freed: function freedNode(id): void {
+		// A freed record can be recycled after the next sweep. In manual
+		// effect mode the queue outlives writes, so a queued id could
+		// otherwise be reused by an unrelated node before its flush; scrub
+		// it here — the queue is empty outside flush in sync workloads, so
+		// this loop runs only for frees during a manual-mode pending window.
+		if (notifyIndex !== queuedLength) {
+			for (let i = notifyIndex; i < queuedLength; i++) {
+				if (queued[i] === id) {
+					queued[i] = 0;
+				}
+			}
+		}
 		const idx = id >> Arena.NodeIndexShift;
 		currentVals[idx] = undefined;
 		pendingVals[idx] = undefined;
@@ -327,9 +332,10 @@ function flush(): void {
 	try {
 		while (notifyIndex < queuedLength) {
 			const id = queued[notifyIndex];
-			const gen = queuedGens[notifyIndex];
 			queued[notifyIndex++] = 0;
-			if (M[id + NodeSlot.Gen] === gen) {
+			// A zeroed entry was scrubbed (freed while queued); a live id
+			// with no callback was disposed while queued.
+			if (id !== 0) {
 				const fn = fns[id >> Arena.NodeIndexShift];
 				if (fn !== undefined) {
 					run(id, fn);
@@ -342,9 +348,8 @@ function flush(): void {
 		// not resume on unrelated writes (upstream parity).
 		while (notifyIndex < queuedLength) {
 			const id = queued[notifyIndex];
-			const gen = queuedGens[notifyIndex];
 			queued[notifyIndex++] = 0;
-			if (M[id + NodeSlot.Gen] === gen && fns[id >> Arena.NodeIndexShift] !== undefined) {
+			if (id !== 0 && fns[id >> Arena.NodeIndexShift] !== undefined) {
 				M[id + NodeSlot.Flags] |= Flag.Watching | Flag.Recursed;
 			}
 		}
@@ -548,7 +553,6 @@ export function reset(): void {
 	owned.length = 0;
 	pendingRegions.length = 0;
 	queued.length = 0;
-	queuedGens.length = 0;
 	notifyIndex = 0;
 	queuedLength = 0;
 	activeSub = 0;
