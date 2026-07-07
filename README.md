@@ -76,19 +76,55 @@ sequenceDiagram
 
 ## API
 
-````ts
-import type { ReactiveNode } from "dalien-signals/system";
+The library has two interfaces over the same graph, distinguished by what
+a "reactive value" is in your hands:
 
-/** Return the node currently recording signal reads, if there is one. */
-export declare function getActiveSub(): ReactiveNode | undefined;
+- **The function tier** — `signal`, `computed`, `effect`, `effectScope` —
+  returns callables: `count()` reads, `count(1)` writes, and calling an
+  effect's returned function stops it. Each callable **owns its record**:
+  the engine registers it with a `FinalizationRegistry`, so dropping the
+  last reference reclaims the node's memory automatically. This is the
+  default, the leak-free choice, and the interface all published
+  benchmarks measure.
+- **The id tier** — `signalId`, `computedId`, `effectId`, `effectScopeId`
+  with `get`, `set`, and `dispose` — returns the record's integer id
+  itself. Nothing is allocated per node beyond the 32-byte record, and
+  nothing is garbage-collected for you: an id lives until you `dispose`
+  it, its creating effect scope is disposed, or an `owner` object you
+  passed at creation is collected. Ids are what the arena actually
+  stores; the function tier is a thin ownership layer over them.
+
+Choose by lifetime discipline, not by speed: reads and writes go through
+the same engine paths, and creation differs by one closure per node.
+Frameworks embedding the graph — storing ids in their own structures,
+managing lifetimes with their own model — use the id tier; application
+code uses functions. The tiers interoperate in one graph: an id-tier
+computed can read function-tier signals and vice versa.
+
+```ts
+import { signal, get, set, signalId, dispose } from "dalien-signals";
+
+const count = signal(0);      // function tier: GC-owned callable
+count(1);
+
+const id = signalId(0);       // id tier: a plain integer
+set(id, get(id) + 1);
+dispose(id);                  // explicit end of life
+```
+
+The function tier in full:
+
+````ts
+import type { SignalId } from "dalien-signals/system";
+
+/** Return the id of the node currently recording signal reads (0 = none). */
+export declare function getActiveSub(): SignalId;
 
 /**
  * Set the node that records subsequent reads.
- * Returns the previous node so it can be restored.
+ * Returns the previous id so it can be restored.
  */
-export declare function setActiveSub(
-  sub?: ReactiveNode,
-): ReactiveNode | undefined;
+export declare function setActiveSub(sub?: SignalId): SignalId;
 
 /**
  * Raise the arena's capacity to at least `records` 32-byte records (no-op
@@ -222,7 +258,17 @@ export declare function effectScope(fn: () => void): () => void;
 export declare function trigger(fn: () => void): void;
 ````
 
-The `dalien-signals/system` entry point exposes isolated engines, numeric record IDs, debugging, and bulk reset.
+The id tier mirrors the functions above: `signalId(initialValue?, owner?)`,
+`computedId(getter, owner?)`, `effectId(fn)`, and `effectScopeId(fn)`
+return `SignalId`s; `get(id)` / `set(id, value)` read and write;
+`dispose(id)` frees effects, scopes, or records explicitly; `getFlags` /
+`setFlags` expose the node's engine state bits. Ids created inside an
+`effectScopeId` belong to that scope's region and are freed with it; ids
+created with an `owner` object are freed when the owner is collected;
+bare ids are the caller's responsibility.
+
+The `dalien-signals/system` entry point exposes isolated engines, the raw
+graph operations, debugging, and bulk reset.
 
 ## Storage
 
