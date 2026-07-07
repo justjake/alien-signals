@@ -88,33 +88,28 @@ const owned: (number[] | undefined)[] = [];
 
 // ---- host-owned tracking state (upstream's module lets) ---------------------
 
-let runDepth = 0;
-let batchDepth = 0;
 /**
  * The innermost live effectScope: signals and computeds minted inside it
  * belong to it and are freed when it disposes (region ownership — the
  * leak-free default for structured code). An explicit `owner` argument
  * takes precedence; outside any scope, handles are caller-managed.
  */
-let currentScope: SignalId = 0;
-let notifyIndex = 0;
-let queuedLength = 0;
-let activeSub: SignalId = 0;
-/** The tracking-pass counter (upstream's `cycle`): link versions. */
-let cycle = 0;
-/**
- * The global version (Preact/Vue naming): bumped by every committed write
- * and trigger. A node whose version snapshot (in the arena's `versions`
- * view) equals it is provably current — nothing observed has been written
- * since its last verification.
- */
-let globalVersion = 1;
 
 // The effect queue holds (id, generation) pairs: a generation mismatch at
 // flush time means the record was freed (and possibly reused) after being
 // queued, so the entry is skipped instead of running a stranger.
 const queued: SignalId[] = [];
-let manualEffects = false;
+const pendingRegions: number[][] = [];
+const hostDeps: HostDeps = {
+	currentVals,
+	pendingVals,
+	fns,
+	cleanups,
+	owned,
+	queued,
+	pendingRegions,
+	sys: undefined as unknown as HostDeps['sys'], // bound right after creation
+};
 
 // ---- the shared arena and the five graph ops --------------------------------
 // Bound by the `allocated` callback below — once at creation, again after
@@ -124,11 +119,6 @@ let manualEffects = false;
 
 let M: Int32Array = new Int32Array(0);
 let D: Float64Array = new Float64Array(0);
-let link!: (dep: SignalId, sub: SignalId, version: number) => LinkId;
-let unlink!: (linkId: LinkId, sub?: SignalId) => LinkId;
-let propagate!: (subsLink: LinkId, innerWrite: boolean) => void;
-let shallowPropagate!: (subsLink: LinkId) => void;
-let freeNode!: (id: SignalId, gen: SignalGen) => void;
 
 // ---- the hot host tier, compiled per arena generation ------------------------
 // createHost() defines the recompute/flush/read machinery in ONE closure
@@ -139,16 +129,51 @@ let freeNode!: (id: SignalId, gen: SignalGen) => void;
 // the current generation through these lets — the exact indirection the
 // module already paid — so growth just re-points them at a boundary.
 let host!: ReturnType<typeof createHost>;
+
+/** Whether this host permits runtime code generation (CSP etc.). */
+const codegenAvailable = (() => {
+	try {
+		return (new Function('return 1') as () => number)() === 1;
+	} catch {
+		return false;
+	}
+})();
+let hostInstantiations = 0; // feedback slots are per-literal, process-wide
+let hostSourceText: string | undefined;
+
+// Arena growth replaces the host generation. A second closure from the
+// same function literals permanently disables V8's context specialization
+// for all of them, so later generations compile from fresh source text
+// (the trailing generation comment defeats the eval compilation cache),
+// exactly like the engine's own grow-by-migration codegen.
+function instantiateHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot): ReturnType<typeof createHost> {
+	if (++hostInstantiations > 1 && codegenAvailable) {
+		if (hostSourceText === undefined) {
+			const text = String(createHost);
+			// Cloning requires the factory's source to be CLOSED. The BUILT
+			// artifact is (tests/hostCodegen.spec.ts pins it: const enums are
+			// inlined by tsc), but dev-time module transforms (vitest/vite
+			// SSR, webpack) rewrite imports into module-scope helpers that a
+			// clone cannot see; detect those and keep the plain call — which
+			// is always correct, merely despecialized.
+			hostSourceText = /__vite_ssr|__webpack|require\(/.test(text)
+				? ''
+				: 'return (' + text + ');//host-gen';
+		}
+		if (hostSourceText !== '') {
+			const compile = new Function(hostSourceText + hostInstantiations) as () => typeof createHost;
+			return compile()(arena, deps, boot);
+		}
+	}
+	return createHost(arena, deps, boot);
+}
 let hostUpdateNode!: (id: SignalId, flags: number) => boolean;
 let hostEnqueueEffect!: (id: SignalId) => void;
 let hostFreedNode!: (id: SignalId) => void;
 let hostUnwatchedNode!: (id: SignalId) => void;
 let hostReadSignal!: (id: SignalId) => unknown;
 let hostReadComputed!: (id: SignalId, getter?: NodeFn) => unknown;
-let hostGetSlow!: (id: SignalId, getter?: NodeFn) => unknown;
 let hostSet!: (id: SignalId, value: unknown) => void;
-let hostFlush!: () => void;
-let hostRunCleanup!: (idx: number) => void;
 
 // TODO(seeding): port main's adaptive seeding at library level — synthetic
 // graph warm-up keyed on callback-shape diversity (String(fn) sampled on a
@@ -168,22 +193,17 @@ const system = createReactiveSystem({
 	allocated(arena: ReactiveArena): void {
 		M = arena.memory;
 		D = arena.versions;
-		link = arena.link;
-		unlink = arena.unlink;
-		propagate = arena.propagate;
-		shallowPropagate = arena.shallowPropagate;
-		freeNode = arena.freeNode;
-		host = createHost(arena);
+		host = instantiateHost(arena, hostDeps, host !== undefined ? host.state() : {
+			activeSub: 0, cycle: 0, globalVersion: 1, batchDepth: 0, runDepth: 0,
+			manualEffects: false, notifyIndex: 0, queuedLength: 0, currentScope: 0, triggerScratch: 0,
+		});
 		hostUpdateNode = host.updateNode;
 		hostEnqueueEffect = host.enqueueEffect;
 		hostFreedNode = host.freedNode;
 		hostUnwatchedNode = host.unwatchedNode;
 		hostReadSignal = host.readSignal;
 		hostReadComputed = host.readComputed;
-		hostGetSlow = host.getSlow;
 		hostSet = host.set;
-		hostFlush = host.flush;
-		hostRunCleanup = host.runCleanup;
 		// The side columns are NOT presized to capacity: pointer arrays are
 		// traversed by major GC marking, and capacity-sized columns (2M
 		// slots x 5 arrays) put a ~10 ms Mark-Compact tax on every major
@@ -195,10 +215,43 @@ const system = createReactiveSystem({
 	freed: (id) => hostFreedNode(id),
 	unwatched: (id) => hostUnwatchedNode(id),
 });
+hostDeps.sys = system;
 
 
 // ---- the hot host tier factory (see the entry lets above) --------------------
-function createHost(arena: ReactiveArena) {
+interface HostBoot {
+	activeSub: SignalId;
+	cycle: number;
+	globalVersion: number;
+	batchDepth: number;
+	runDepth: number;
+	manualEffects: boolean;
+	notifyIndex: number;
+	queuedLength: number;
+	currentScope: SignalId;
+	triggerScratch: SignalId;
+}
+
+interface HostDeps {
+	currentVals: unknown[];
+	pendingVals: unknown[];
+	fns: (NodeFn | undefined)[];
+	cleanups: ((() => void) | void)[];
+	owned: (number[] | undefined)[];
+	queued: SignalId[];
+	pendingRegions: number[][];
+	/** Late-bound: assigned right after createReactiveSystem returns. */
+	sys: { createNode(owner: WeakKey, bits?: number): SignalId; allocNode(bits?: number): SignalId; adoptNode(owner: WeakKey, id: SignalId): void };
+}
+
+// CLOSED FUNCTION (tests/hostCodegen.spec.ts pins this): its only free
+// names are its parameters and globals, so generations after the first can
+// be compiled from String(createHost) via new Function — fresh function
+// identities per generation keep V8's function-context specialization
+// (const M folded into machine code) that a second closure from the same
+// literals would permanently disable. Where codegen is unavailable (CSP)
+// the plain call is correct and merely despecializes.
+function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 	const M = arena.memory;
 	const D = arena.versions;
 	const link = arena.link;
@@ -206,6 +259,372 @@ function createHost(arena: ReactiveArena) {
 	const propagate = arena.propagate;
 	const checkDirty = arena.checkDirty;
 	const shallowPropagate = arena.shallowPropagate;
+	const freeNode = arena.freeNode;
+	const { currentVals, pendingVals, fns, cleanups, owned, queued, pendingRegions } = deps;
+
+	let activeSub = boot.activeSub;
+	let cycle = boot.cycle;
+	let globalVersion = boot.globalVersion;
+	let batchDepth = boot.batchDepth;
+	let runDepth = boot.runDepth;
+	let manualEffects = boot.manualEffects;
+	let notifyIndex = boot.notifyIndex;
+	let queuedLength = boot.queuedLength;
+	let currentScope: SignalId = boot.currentScope;
+	// One persistent scratch subscriber for trigger(), minted on first use
+	// and reused ever after (released by reset, which clears this cache).
+	let triggerScratch: SignalId = boot.triggerScratch;
+	let triggerScratchBusy = false;
+
+	function state(): HostBoot {
+		return { activeSub, cycle, globalVersion, batchDepth, runDepth, manualEffects, notifyIndex, queuedLength, currentScope, triggerScratch };
+	}
+
+	function resetState(): void {
+		activeSub = 0;
+		batchDepth = 0;
+		runDepth = 0;
+		notifyIndex = 0;
+		queuedLength = 0;
+		currentScope = 0;
+		triggerScratch = 0;
+		triggerScratchBusy = false;
+		queued.length = 0;
+		pendingRegions.length = 0;
+	}
+
+	/**
+	 * Return the id of the node currently recording signal reads, or 0 outside a
+	 * computed getter, effect callback, effect scope, or other
+	 * dependency-tracking operation.
+	 */
+	function getActiveSub(): SignalId {
+		return activeSub;
+	}
+	/**
+	 * Set the node that records subsequent signal reads.
+	 *
+	 * Pass an id previously returned by {@link getActiveSub}, or `undefined` (or
+	 * 0) to disable tracking. Returns the previous id so callers can restore it.
+	 */
+	function setActiveSub(sub?: SignalId): SignalId {
+		const prev = activeSub;
+		activeSub = sub !== undefined ? sub : 0;
+		return prev;
+	}
+	/** Return the number of currently open batches. */
+	function getBatchDepth(): number {
+		return batchDepth;
+	}
+	/**
+	 * Open a batch. Signal writes still take effect, but queued effects wait for
+	 * the matching {@link endBatch} call.
+	 *
+	 * @example
+	 * ```ts
+	 * const count = signal(0);
+	 * effect(() => console.log(get(count))); // 0
+	 * startBatch();
+	 * try {
+	 *   set(count, 1);
+	 *   set(count, 2);
+	 * } finally {
+	 *   endBatch(); // 2; the effect runs once.
+	 * }
+	 * ```
+	 */
+	function startBatch(): void {
+		++batchDepth;
+	}
+	/** Close a batch, flushing effects when the outermost batch closes. */
+	function endBatch(): void {
+		if (!--batchDepth && !manualEffects) {
+			flush();
+		}
+	}
+	/** Immediately run every queued effect. Throws inside an open batch. */
+	function flushEffects(): void {
+		if (batchDepth !== 0) {
+			throw new Error('dalien-signals: cannot flush effects inside an open batch');
+		}
+		if (!notifyIndex) {
+			flush();
+		}
+	}
+	/**
+	 * Choose whether writes run queued effects synchronously or leave them for
+	 * flushEffects(). Switching back to sync drains pending effects immediately
+	 * unless a batch or effect drain is already active.
+	 */
+	function setEffectMode(mode: 'sync' | 'manual'): 'sync' | 'manual' {
+		const previous = manualEffects ? 'manual' : 'sync';
+		manualEffects = mode === 'manual';
+		if (!manualEffects && !batchDepth && !notifyIndex) {
+			flush();
+		}
+		return previous;
+	}
+	/**
+	 * Create a reactive value and return its handle (a number). Read it with
+	 * {@link get}, write it with {@link set}.
+	 *
+	 * @example
+	 * ```ts
+	 * const count = signal(0);
+	 * get(count);     // 0
+	 * set(count, 1);
+	 * get(count);     // 1
+	 * ```
+	 */
+	function signalId<T>(): SignalIdOf<T | undefined>;
+	function signalId<T>(initialValue: T, owner?: WeakKey): SignalIdOf<T>;
+	function signalId<T>(initialValue?: T, owner?: WeakKey): SignalIdOf<T | undefined> {
+		// With an owner, the record frees itself when the owner is collected —
+		// the GC-managed lifetime for hosts that wrap handles in objects.
+		// Without one, the handle lives until dispose()/reset().
+		const id = owner !== undefined
+			? deps.sys.createNode(owner, Host.Signal | Flag.Mutable)
+			: deps.sys.allocNode(Host.Signal | Flag.Mutable);
+		const idx = id >> Arena.NodeIndexShift;
+		currentVals[idx] = initialValue;
+		pendingVals[idx] = initialValue;
+		if (owner === undefined && currentScope !== 0) {
+			owned[currentScope >> Arena.NodeIndexShift]!.push(id, M[id + NodeSlot.Gen]);
+		}
+		return id;
+	}
+	function get<T>(id: SignalIdOf<T>): T {
+		// The version gate: a snapshot equal to the current globalVersion proves
+		// nothing observed has been written since this node was last verified.
+		// (The one-entry read memo that used to sit in front of this gate was
+		// deleted when the callable tier stopped using it: the kind-specialized
+		// opers never consult it, the suite holds alien-parity on repeated-read
+		// cells without it, and its invalidation stores taxed every write and
+		// every recompute bracket.)
+		if (D[(id >> Arena.VersionShift) + Arena.VersionOffset] === globalVersion) {
+			if (activeSub !== 0) {
+				link(id, activeSub, cycle);
+			}
+			return currentVals[id >> Arena.NodeIndexShift] as T;
+		}
+		return getSlow(id) as T;
+	}
+	/**
+	 * Create a cached value derived from the signals and computeds read by
+	 * `getter`, and return its handle. Its argument is the previous value, or
+	 * `undefined` initially.
+	 *
+	 * @example
+	 * ```ts
+	 * const count = signal(2);
+	 * const doubled = computed(() => get(count) * 2);
+	 * get(doubled); // 4
+	 * ```
+	 */
+	function computedId<T>(getter: (previousValue?: T) => T, owner?: WeakKey): SignalIdOf<T> {
+		// Minted DIRTY: the first read takes the update path (upstream's cold
+		// first evaluation), against an empty subscriber list. `owner` as in
+		// signal(): its collection frees the record.
+		const id = owner !== undefined
+			? deps.sys.createNode(owner, Host.Computed | Flag.Mutable | Flag.Dirty)
+			: deps.sys.allocNode(Host.Computed | Flag.Mutable | Flag.Dirty);
+		fns[id >> Arena.NodeIndexShift] = getter as NodeFn;
+		if (owner === undefined && currentScope !== 0) {
+			owned[currentScope >> Arena.NodeIndexShift]!.push(id, M[id + NodeSlot.Gen]);
+		}
+		return id;
+	}
+	/**
+	 * Run `fn` immediately, then rerun it when a value it read changes.
+	 * `fn` may return cleanup work. Stop the effect with {@link dispose}.
+	 *
+	 * @example
+	 * ```ts
+	 * const count = signal(0);
+	 * const e = effect(() => console.log(get(count))); // 0
+	 * set(count, 1); // 1
+	 * dispose(e);
+	 * ```
+	 */
+	function effectId(fn: () => void | (() => void)): SignalId {
+		const id = deps.sys.allocNode(Host.Effect | Flag.Watching | Flag.RecursedCheck);
+		const idx = id >> Arena.NodeIndexShift;
+		fns[idx] = fn as NodeFn;
+		const prevSub = activeSub;
+		activeSub = id;
+		if (prevSub !== 0) {
+			// A child effect is a dependency of its parent: the parent's next
+			// re-run (or disposal) unlinks it, which disposes it.
+			link(id, prevSub, 0);
+			M[prevSub + NodeSlot.Flags] |= Host.HasChildEffect;
+		}
+		++M[SysSlot.EnterDepth];
+		++runDepth;
+		try {
+			cleanups[idx] = fn() as (() => void) | void;
+		} finally {
+			--runDepth;
+			--M[SysSlot.EnterDepth];
+			activeSub = prevSub;
+			M[id + NodeSlot.Flags] &= ~Flag.RecursedCheck;
+		}
+		return id;
+	}
+	/**
+	 * Run `fn` and group every nested effect it creates; dispose() of the scope
+	 * stops the group and runs its cleanup work.
+	 *
+	 * @example
+	 * ```ts
+	 * const count = signal(0);
+	 * const scope = effectScope(() => {
+	 *   effect(() => console.log(get(count)));
+	 * });
+	 * dispose(scope);
+	 * set(count, 1); // No log; the scope is stopped.
+	 * ```
+	 */
+	function effectScopeId(fn: () => void): SignalId {
+		const id = deps.sys.allocNode(Host.Scope | Flag.Mutable);
+		fns[id >> Arena.NodeIndexShift] = fn as NodeFn;
+		owned[id >> Arena.NodeIndexShift] = [];
+		const prevSub = activeSub;
+		const prevScope = currentScope;
+		activeSub = id;
+		currentScope = id;
+		if (prevSub !== 0) {
+			link(id, prevSub, 0);
+			M[prevSub + NodeSlot.Flags] |= Host.HasChildEffect;
+		}
+		++M[SysSlot.EnterDepth];
+		try {
+			fn();
+		} finally {
+			--M[SysSlot.EnterDepth];
+			activeSub = prevSub;
+			currentScope = prevScope;
+		}
+		return id;
+	}
+	/**
+	 * Free a node by handle. Effects and scopes tear down (cleanups run, child
+	 * effects cascade); signals and computeds release their record. Repeat
+	 * disposals are harmless no-ops.
+	 */
+	function dispose(id: SignalId): void {
+		const flags = M[id + NodeSlot.Flags];
+		if (!(flags & Flag.Live)) {
+			return; // already freed
+		}
+		if ((flags & Host.KindMask) >= Host.Effect) {
+			disposeEffect(id);
+		} else {
+			fns[id >> Arena.NodeIndexShift] = undefined;
+			freeNode(id, M[id + NodeSlot.Gen]);
+		}
+	}
+	// The effect/scope teardown (upstream's effectOper + effectScopeOper), shared
+	// by dispose() and unwatched() delivery. The graph teardown itself — deps
+	// unlinked in reverse, subscribers unlinked, child stops delivered — is
+	// freeNode's job, and ONLY freeNode's: doing any of it here too would unlink
+	// the same edges twice (a self-dispose mid-run leaves DepsTail mid-chain, so
+	// a second reverse walk re-frees links and corrupts the free list). Clearing
+	// the fns slot FIRST makes the reentrant unwatched() that freeNode delivers
+	// for this very node a no-op.
+	function disposeEffect(id: SignalId): void {
+		const idx = id >> Arena.NodeIndexShift;
+		if (fns[idx] === undefined) {
+			return; // already disposed
+		}
+		fns[idx] = undefined;
+		freeNode(id, M[id + NodeSlot.Gen]);
+		if (cleanups[idx]) {
+			runCleanup(idx);
+		}
+		const region = owned[idx];
+		if (region !== undefined) {
+			// A scope frees the signals/computeds minted inside it — DEFERRED to
+			// a microtask, so disposal costs land off the disposing caller's
+			// clock (where garbage-collected graphs pay theirs). Gen-guarded:
+			// members freed early, or whose records were reused, no-op.
+			owned[idx] = undefined;
+			pendingRegions.push(region);
+			if (!regionFlushScheduled) {
+				regionFlushScheduled = true;
+				queueMicrotask(freePendingRegions);
+			}
+		}
+	}
+	function freePendingRegions(): void {
+		regionFlushScheduled = false;
+		for (let r = 0; r < pendingRegions.length; r++) {
+			const region = pendingRegions[r];
+			for (let i = 0; i < region.length; i += 2) {
+				const member: SignalId = region[i];
+				fns[member >> Arena.NodeIndexShift] = undefined;
+				freeNode(member, region[i + 1]);
+			}
+		}
+		pendingRegions.length = 0;
+	}
+	function noopEffectBody(): void {}
+	/**
+	 * Notify dependents after mutating values stored inside signals in place.
+	 * Read each changed signal inside `fn`.
+	 */
+	function trigger(fn: () => void): void {
+		// A scratch subscriber records the reads; unlinking it afterwards turns
+		// each recorded dependency into an out-of-band invalidation wave.
+		let id: SignalId;
+		let persistent = false;
+		if (!triggerScratchBusy && triggerScratch !== 0) {
+			id = triggerScratch;
+			persistent = true;
+			M[id + NodeSlot.Flags] = (M[id + NodeSlot.Flags] & Host.Hidden) | Flag.Watching | Flag.RecursedCheck;
+		} else {
+			id = deps.sys.allocNode(Flag.Watching | Flag.RecursedCheck);
+			fns[id >> Arena.NodeIndexShift] = noopEffectBody as NodeFn;
+			if (triggerScratch === 0 && !triggerScratchBusy) {
+				triggerScratch = id;
+				persistent = true;
+			}
+		}
+		if (persistent) {
+			triggerScratchBusy = true;
+		}
+		const prevSub = activeSub;
+		activeSub = id;
+		++batchDepth;
+		++M[SysSlot.EnterDepth];
+		try {
+			fn();
+		} finally {
+			activeSub = prevSub;
+			M[id + NodeSlot.Flags] &= Host.Hidden;
+			++globalVersion;
+			let l: LinkId = M[id + NodeSlot.Deps];
+			while (l !== 0) {
+				const dep: SignalId = M[l + LinkSlot.Dep];
+				l = unlink(l, id);
+				const subs: LinkId = M[dep + NodeSlot.Subs];
+				if (subs !== 0) {
+					propagate(subs, runDepth !== 0);
+					shallowPropagate(subs);
+				}
+			}
+			--M[SysSlot.EnterDepth];
+			if (persistent) {
+				triggerScratchBusy = false;
+			} else {
+				fns[id >> Arena.NodeIndexShift] = undefined;
+				freeNode(id, M[id + NodeSlot.Gen]);
+			}
+			if (!--batchDepth && !manualEffects) {
+				flush();
+			}
+		}
+	}
+
 
 	function updateNode(id: SignalId, flags: number): boolean {
 		if ((flags & Host.KindMask) === Host.Signal) {
@@ -542,6 +961,22 @@ function createHost(arena: ReactiveArena) {
 		set: setHot,
 		flush,
 		runCleanup,
+		state,
+		resetState,
+		getActiveSub,
+		setActiveSub,
+		getBatchDepth,
+		startBatch,
+		endBatch,
+		flushEffects,
+		setEffectMode,
+		signalId,
+		get,
+		computedId,
+		effectId,
+		effectScopeId,
+		dispose,
+		trigger,
 	};
 }
 
@@ -551,29 +986,7 @@ function createHost(arena: ReactiveArena) {
 
 
 
-/** Immediately run every queued effect. Throws inside an open batch. */
-export function flushEffects(): void {
-	if (batchDepth !== 0) {
-		throw new Error('dalien-signals: cannot flush effects inside an open batch');
-	}
-	if (!notifyIndex) {
-		hostFlush();
-	}
-}
 
-/**
- * Choose whether writes run queued effects synchronously or leave them for
- * flushEffects(). Switching back to sync drains pending effects immediately
- * unless a batch or effect drain is already active.
- */
-export function setEffectMode(mode: 'sync' | 'manual'): 'sync' | 'manual' {
-	const previous = manualEffects ? 'manual' : 'sync';
-	manualEffects = mode === 'manual';
-	if (!manualEffects && !batchDepth && !notifyIndex) {
-		hostFlush();
-	}
-	return previous;
-}
 
 // ---- teardown helpers --------------------------------------------------------
 
@@ -581,77 +994,13 @@ export function setEffectMode(mode: 'sync' | 'manual'): 'sync' | 'manual' {
 
 
 
-// The effect/scope teardown (upstream's effectOper + effectScopeOper), shared
-// by dispose() and unwatched() delivery. The graph teardown itself — deps
-// unlinked in reverse, subscribers unlinked, child stops delivered — is
-// freeNode's job, and ONLY freeNode's: doing any of it here too would unlink
-// the same edges twice (a self-dispose mid-run leaves DepsTail mid-chain, so
-// a second reverse walk re-frees links and corrupts the free list). Clearing
-// the fns slot FIRST makes the reentrant unwatched() that freeNode delivers
-// for this very node a no-op.
-function disposeEffect(id: SignalId): void {
-	const idx = id >> Arena.NodeIndexShift;
-	if (fns[idx] === undefined) {
-		return; // already disposed
-	}
-	fns[idx] = undefined;
-	freeNode(id, M[id + NodeSlot.Gen]);
-	if (cleanups[idx]) {
-		hostRunCleanup(idx);
-	}
-	const region = owned[idx];
-	if (region !== undefined) {
-		// A scope frees the signals/computeds minted inside it — DEFERRED to
-		// a microtask, so disposal costs land off the disposing caller's
-		// clock (where garbage-collected graphs pay theirs). Gen-guarded:
-		// members freed early, or whose records were reused, no-op.
-		owned[idx] = undefined;
-		pendingRegions.push(region);
-		if (!regionFlushScheduled) {
-			regionFlushScheduled = true;
-			queueMicrotask(freePendingRegions);
-		}
-	}
-}
 
-const pendingRegions: number[][] = [];
 let regionFlushScheduled = false;
 
-function freePendingRegions(): void {
-	regionFlushScheduled = false;
-	for (let r = 0; r < pendingRegions.length; r++) {
-		const region = pendingRegions[r];
-		for (let i = 0; i < region.length; i += 2) {
-			const member: SignalId = region[i];
-			fns[member >> Arena.NodeIndexShift] = undefined;
-			freeNode(member, region[i + 1]);
-		}
-	}
-	pendingRegions.length = 0;
-}
 
 // ---- public API ---------------------------------------------------------------
 
-/**
- * Return the id of the node currently recording signal reads, or 0 outside a
- * computed getter, effect callback, effect scope, or other
- * dependency-tracking operation.
- */
-export function getActiveSub(): SignalId {
-	return activeSub;
-}
 
-/**
- * Set the node that records subsequent signal reads.
- *
- * Pass an id previously returned by {@link getActiveSub}, or `undefined` (or
- * 0) to disable tracking. Returns the previous id so callers can restore it.
- */
-export function setActiveSub(sub?: SignalId): SignalId {
-	const prev = activeSub;
-	activeSub = sub !== undefined ? sub : 0;
-	return prev;
-}
 
 /**
  * Read a node's public update-state flags (see ReactiveFlags).
@@ -699,51 +1048,14 @@ export function reset(): void {
 	cleanups.length = 0;
 	owned.length = 0;
 	pendingRegions.length = 0;
-	queued.length = 0;
-	notifyIndex = 0;
-	queuedLength = 0;
-	activeSub = 0;
-	currentScope = 0;
-	batchDepth = 0;
-	runDepth = 0;
-	triggerScratch = 0;
-	triggerScratchBusy = false;
-	// globalVersion and cycle keep counting: fresh records hold zeroed
-	// snapshots/versions, which can never equal them.
+	// Scalars, queue, and pending regions reset inside the current host
+	// generation. globalVersion and cycle keep counting: fresh records hold
+	// zeroed snapshots/versions, which can never equal them.
+	host.resetState();
 }
 
-/** Return the number of currently open batches. */
-export function getBatchDepth(): number {
-	return batchDepth;
-}
 
-/**
- * Open a batch. Signal writes still take effect, but queued effects wait for
- * the matching {@link endBatch} call.
- *
- * @example
- * ```ts
- * const count = signal(0);
- * effect(() => console.log(get(count))); // 0
- * startBatch();
- * try {
- *   set(count, 1);
- *   set(count, 2);
- * } finally {
- *   endBatch(); // 2; the effect runs once.
- * }
- * ```
- */
-export function startBatch(): void {
-	++batchDepth;
-}
 
-/** Close a batch, flushing effects when the outermost batch closes. */
-export function endBatch(): void {
-	if (!--batchDepth && !manualEffects) {
-		hostFlush();
-	}
-}
 
 /** Return whether `id` is a live signal. */
 export function isSignal(id: SignalId): boolean {
@@ -765,57 +1077,12 @@ export function isEffectScope(id: SignalId): boolean {
 	return (M[id + NodeSlot.Flags] & (Host.KindMask | Flag.Live)) === (Host.Scope | Flag.Live);
 }
 
-/**
- * Create a reactive value and return its handle (a number). Read it with
- * {@link get}, write it with {@link set}.
- *
- * @example
- * ```ts
- * const count = signal(0);
- * get(count);     // 0
- * set(count, 1);
- * get(count);     // 1
- * ```
- */
-export function signalId<T>(): SignalIdOf<T | undefined>;
-export function signalId<T>(initialValue: T, owner?: WeakKey): SignalIdOf<T>;
-export function signalId<T>(initialValue?: T, owner?: WeakKey): SignalIdOf<T | undefined> {
-	// With an owner, the record frees itself when the owner is collected —
-	// the GC-managed lifetime for hosts that wrap handles in objects.
-	// Without one, the handle lives until dispose()/reset().
-	const id = owner !== undefined
-		? system.createNode(owner, Host.Signal | Flag.Mutable)
-		: system.allocNode(Host.Signal | Flag.Mutable);
-	const idx = id >> Arena.NodeIndexShift;
-	currentVals[idx] = initialValue;
-	pendingVals[idx] = initialValue;
-	if (owner === undefined && currentScope !== 0) {
-		owned[currentScope >> Arena.NodeIndexShift]!.push(id, M[id + NodeSlot.Gen]);
-	}
-	return id;
-}
 
 /**
  * Read a signal or computed by handle, tracking it as a dependency of the
  * active subscriber.
  */
 
-export function get<T>(id: SignalIdOf<T>): T {
-	// The version gate: a snapshot equal to the current globalVersion proves
-	// nothing observed has been written since this node was last verified.
-	// (The one-entry read memo that used to sit in front of this gate was
-	// deleted when the callable tier stopped using it: the kind-specialized
-	// opers never consult it, the suite holds alien-parity on repeated-read
-	// cells without it, and its invalidation stores taxed every write and
-	// every recompute bracket.)
-	if (D[(id >> Arena.VersionShift) + Arena.VersionOffset] === globalVersion) {
-		if (activeSub !== 0) {
-			link(id, activeSub, cycle);
-		}
-		return currentVals[id >> Arena.NodeIndexShift] as T;
-	}
-	return hostGetSlow(id) as T;
-}
 
 
 /** Write a signal by handle. Equal values (Object.is-style ===) are ignored. */
@@ -823,123 +1090,72 @@ export function set<T>(id: SignalIdOf<T>, value: T): void {
 	hostSet(id, value);
 }
 
-/**
- * Create a cached value derived from the signals and computeds read by
- * `getter`, and return its handle. Its argument is the previous value, or
- * `undefined` initially.
- *
- * @example
- * ```ts
- * const count = signal(2);
- * const doubled = computed(() => get(count) * 2);
- * get(doubled); // 4
- * ```
- */
+// ---- warm-tier exports: thin trampolines into the current host generation ----
+// (Bodies live in createHost so they compile in the factory's closed scope;
+// the lets re-point at growth boundaries, exactly like the five core ops.)
+
+export function signalId<T>(): SignalIdOf<T | undefined>;
+export function signalId<T>(initialValue: T, owner?: WeakKey): SignalIdOf<T>;
+export function signalId<T>(initialValue?: T, owner?: WeakKey): SignalIdOf<T | undefined> {
+	return host.signalId(initialValue, owner) as SignalIdOf<T | undefined>;
+}
+
+export function get<T>(id: SignalIdOf<T>): T {
+	return host.get(id) as T;
+}
+
 export function computedId<T>(getter: (previousValue?: T) => T, owner?: WeakKey): SignalIdOf<T> {
-	// Minted DIRTY: the first read takes the update path (upstream's cold
-	// first evaluation), against an empty subscriber list. `owner` as in
-	// signal(): its collection frees the record.
-	const id = owner !== undefined
-		? system.createNode(owner, Host.Computed | Flag.Mutable | Flag.Dirty)
-		: system.allocNode(Host.Computed | Flag.Mutable | Flag.Dirty);
-	fns[id >> Arena.NodeIndexShift] = getter as NodeFn;
-	if (owner === undefined && currentScope !== 0) {
-		owned[currentScope >> Arena.NodeIndexShift]!.push(id, M[id + NodeSlot.Gen]);
-	}
-	return id;
+	return host.computedId(getter as NodeFn, owner) as SignalIdOf<T>;
 }
 
-/**
- * Run `fn` immediately, then rerun it when a value it read changes.
- * `fn` may return cleanup work. Stop the effect with {@link dispose}.
- *
- * @example
- * ```ts
- * const count = signal(0);
- * const e = effect(() => console.log(get(count))); // 0
- * set(count, 1); // 1
- * dispose(e);
- * ```
- */
 export function effectId(fn: () => void | (() => void)): SignalId {
-	const id = system.allocNode(Host.Effect | Flag.Watching | Flag.RecursedCheck);
-	const idx = id >> Arena.NodeIndexShift;
-	fns[idx] = fn as NodeFn;
-	const prevSub = activeSub;
-	activeSub = id;
-	if (prevSub !== 0) {
-		// A child effect is a dependency of its parent: the parent's next
-		// re-run (or disposal) unlinks it, which disposes it.
-		link(id, prevSub, 0);
-		M[prevSub + NodeSlot.Flags] |= Host.HasChildEffect;
-	}
-	++M[SysSlot.EnterDepth];
-	++runDepth;
-	try {
-		cleanups[idx] = fn() as (() => void) | void;
-	} finally {
-		--runDepth;
-		--M[SysSlot.EnterDepth];
-		activeSub = prevSub;
-		M[id + NodeSlot.Flags] &= ~Flag.RecursedCheck;
-	}
-	return id;
+	return host.effectId(fn);
 }
 
-/**
- * Run `fn` and group every nested effect it creates; dispose() of the scope
- * stops the group and runs its cleanup work.
- *
- * @example
- * ```ts
- * const count = signal(0);
- * const scope = effectScope(() => {
- *   effect(() => console.log(get(count)));
- * });
- * dispose(scope);
- * set(count, 1); // No log; the scope is stopped.
- * ```
- */
 export function effectScopeId(fn: () => void): SignalId {
-	const id = system.allocNode(Host.Scope | Flag.Mutable);
-	fns[id >> Arena.NodeIndexShift] = fn as NodeFn;
-	owned[id >> Arena.NodeIndexShift] = [];
-	const prevSub = activeSub;
-	const prevScope = currentScope;
-	activeSub = id;
-	currentScope = id;
-	if (prevSub !== 0) {
-		link(id, prevSub, 0);
-		M[prevSub + NodeSlot.Flags] |= Host.HasChildEffect;
-	}
-	++M[SysSlot.EnterDepth];
-	try {
-		fn();
-	} finally {
-		--M[SysSlot.EnterDepth];
-		activeSub = prevSub;
-		currentScope = prevScope;
-	}
-	return id;
+	return host.effectScopeId(fn);
 }
 
-/**
- * Free a node by handle. Effects and scopes tear down (cleanups run, child
- * effects cascade); signals and computeds release their record. Repeat
- * disposals are harmless no-ops.
- */
 export function dispose(id: SignalId): void {
-	const flags = M[id + NodeSlot.Flags];
-	if (!(flags & Flag.Live)) {
-		return; // already freed
-	}
-	if ((flags & Host.KindMask) >= Host.Effect) {
-		disposeEffect(id);
-	} else {
-		fns[id >> Arena.NodeIndexShift] = undefined;
-		freeNode(id, M[id + NodeSlot.Gen]);
-	}
+	host.dispose(id);
 }
+
+export function trigger(fn: () => void): void {
+	host.trigger(fn);
+}
+
+export function getActiveSub(): SignalId {
+	return host.getActiveSub();
+}
+
+export function setActiveSub(sub?: SignalId): SignalId {
+	return host.setActiveSub(sub);
+}
+
+export function getBatchDepth(): number {
+	return host.getBatchDepth();
+}
+
+export function startBatch(): void {
+	host.startBatch();
+}
+
+export function endBatch(): void {
+	host.endBatch();
+}
+
+/** Immediately run every queued effect. Throws inside an open batch. */
+export function flushEffects(): void {
+	host.flushEffects();
+}
+
+export function setEffectMode(mode: 'sync' | 'manual'): 'sync' | 'manual' {
+	return host.setEffectMode(mode);
+}
+
+
+
+
 
 /**
  * AUTOMATIC memory management with a handle object: mint a signal whose
@@ -1073,71 +1289,7 @@ export function effectScope(fn: () => void): EffectStop {
 	};
 }
 
-function noopEffectBody(): void {}
 
-// One persistent scratch subscriber for trigger(), minted on first use and
-// reused ever after (its record is only released by reset(), which also
-// clears this cache). Watching|RecursedCheck together keep the propagation
-// ladder from ever notifying it. A reentrant trigger — rare — falls back to
-// a throwaway node.
-let triggerScratch: SignalId = 0;
-let triggerScratchBusy = false;
 
-/**
- * Notify dependents after mutating values stored inside signals in place.
- * Read each changed signal inside `fn`.
- */
-export function trigger(fn: () => void): void {
-	// A scratch subscriber records the reads; unlinking it afterwards turns
-	// each recorded dependency into an out-of-band invalidation wave.
-	let id: SignalId;
-	let persistent = false;
-	if (!triggerScratchBusy && triggerScratch !== 0) {
-		id = triggerScratch;
-		persistent = true;
-		M[id + NodeSlot.Flags] = (M[id + NodeSlot.Flags] & Host.Hidden) | Flag.Watching | Flag.RecursedCheck;
-	} else {
-		id = system.allocNode(Flag.Watching | Flag.RecursedCheck);
-		fns[id >> Arena.NodeIndexShift] = noopEffectBody as NodeFn;
-		if (triggerScratch === 0 && !triggerScratchBusy) {
-			triggerScratch = id;
-			persistent = true;
-		}
-	}
-	if (persistent) {
-		triggerScratchBusy = true;
-	}
-	const prevSub = activeSub;
-	activeSub = id;
-	++batchDepth;
-	++M[SysSlot.EnterDepth];
-	try {
-		fn();
-	} finally {
-		activeSub = prevSub;
-		M[id + NodeSlot.Flags] &= Host.Hidden;
-		++globalVersion;
-		let l: LinkId = M[id + NodeSlot.Deps];
-		while (l !== 0) {
-			const dep: SignalId = M[l + LinkSlot.Dep];
-			l = unlink(l, id);
-			const subs: LinkId = M[dep + NodeSlot.Subs];
-			if (subs !== 0) {
-				propagate(subs, runDepth !== 0);
-				shallowPropagate(subs);
-			}
-		}
-		--M[SysSlot.EnterDepth];
-		if (persistent) {
-			triggerScratchBusy = false;
-		} else {
-			fns[id >> Arena.NodeIndexShift] = undefined;
-			freeNode(id, M[id + NodeSlot.Gen]);
-		}
-		if (!--batchDepth && !manualEffects) {
-			hostFlush();
-		}
-	}
-}
 
 export { ReactiveFlags, type SignalId } from './system.js';
