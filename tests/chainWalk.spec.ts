@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { computedFn as computed, effectFn as effect, signalFn as signal } from './helpers/closures';
+import { computed, effect, signal } from '../src';
 
 // The stackless chain walk (chainCheck in system.ts) resolves runs of
 // single-dep single-subscriber pending nodes without the traversal stack.

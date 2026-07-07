@@ -6,20 +6,19 @@ const framework: ReactiveFramework = {
 	signal(initialValue) {
 		const s = signal(initialValue);
 		return {
-			read: () => s.get(),
-			write: (v) => s.set(v),
+			read: () => s(),
+			write: (v) => s(v),
 		};
 	},
 	computed(fn) {
 		const c = computed(fn);
-		return { read: () => c.get() };
+		return { read: () => c() };
 	},
 	effect(fn) {
-		const e = effect(fn);
-		return () => e.dispose();
+		return effect(fn);
 	},
 	run(fn) {
-		effectScope(fn).dispose();
+		effectScope(fn)();
 	},
 	batch(fn) {
 		startBatch();

@@ -1,6 +1,6 @@
 import { expect, test } from 'vitest';
 import { trigger } from '../src';
-import { computedFn as computed, effectFn as effect, signalFn as signal } from './helpers/closures';
+import { computed, effect, signal } from '../src';
 
 test('should not throw when triggering with no dependencies', () => {
 	trigger(() => { });

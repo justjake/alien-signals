@@ -406,6 +406,12 @@ export interface ReactiveSystem {
 	 */
 	createNode(owner: WeakKey, hostBits?: number): SignalId;
 	/**
+	 * Tie an ALREADY-MINTED node's lifetime to `owner`, as createNode does
+	 * at mint. For hosts whose owner object needs the id to exist first
+	 * (e.g. a callable bound to the id): allocNode, build the owner, adopt.
+	 */
+	adoptNode(owner: WeakKey, id: SignalId): void;
+	/**
 	 * MANUAL memory management with the growth boundary check: like
 	 * arena.allocNode, but grows the arena first when it is running out of
 	 * space (the safe default for mint paths). No owner, no watch — pair
@@ -916,6 +922,10 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 			const engine = shared.inner!;
 			engine.maybeBoundary();
 			return engine.allocNode(hostBits ?? 0);
+		},
+		adoptNode(owner: WeakKey, id: SignalId): void {
+			pendingRegister.push(owner, id);
+			scheduleMaintenance();
 		},
 		disposeNode(id: SignalId, gen?: SignalGen): void {
 			const engine = shared.inner!;

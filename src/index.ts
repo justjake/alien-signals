@@ -115,6 +115,7 @@ let globalVersion = 1;
 // queued, so the entry is skipped instead of running a stranger.
 const queued: SignalId[] = [];
 const queuedGens: SignalGen[] = [];
+let manualEffects = false;
 
 // ---- the shared arena and the five graph ops --------------------------------
 // Bound by the `allocated` callback below — once at creation, again after
@@ -130,6 +131,13 @@ let propagate!: (subsLink: LinkId, innerWrite: boolean) => void;
 let checkDirty!: (depsLink: LinkId, sub: SignalId) => boolean;
 let shallowPropagate!: (subsLink: LinkId) => void;
 let freeNode!: (id: SignalId, gen: SignalGen) => void;
+
+// TODO(seeding): port main's adaptive seeding at library level — synthetic
+// graph warm-up keyed on callback-shape diversity (String(fn) sampled on a
+// geometric cadence), as in the fused engine. Not for milomg (its harness
+// pre-warms every cell) but for the write-size crossover bench, where cold
+// first-shape compilation decides the result. See dalien-signals main:
+// adaptive seeding notes (one-shot specialization, seed tax ~0 when idle).
 
 // ---- the system, driven by this library's update/notify/unwatched seams -----
 
@@ -250,6 +258,7 @@ function updateComputed(id: SignalId, flags: number): boolean {
 	const prevSub = activeSub;
 	activeSub = id;
 	++cycle;
+	memoId = -1; // a new tracking pass must re-link: no reads may memo across it
 	++M[SysSlot.EnterDepth];
 	const entryVersion = globalVersion;
 	try {
@@ -294,6 +303,7 @@ function run(id: SignalId, fn: NodeFn): void {
 		const prevSub = activeSub;
 		activeSub = id;
 		++cycle;
+		memoId = -1;
 		++M[SysSlot.EnterDepth];
 		++runDepth;
 		try {
@@ -339,6 +349,30 @@ function flush(): void {
 		notifyIndex = 0;
 		queuedLength = 0;
 	}
+}
+
+/** Immediately run every queued effect. Throws inside an open batch. */
+export function flushEffects(): void {
+	if (batchDepth !== 0) {
+		throw new Error('dalien-signals: cannot flush effects inside an open batch');
+	}
+	if (!notifyIndex) {
+		flush();
+	}
+}
+
+/**
+ * Choose whether writes run queued effects synchronously or leave them for
+ * flushEffects(). Switching back to sync drains pending effects immediately
+ * unless a batch or effect drain is already active.
+ */
+export function setEffectMode(mode: 'sync' | 'manual'): 'sync' | 'manual' {
+	const previous = manualEffects ? 'manual' : 'sync';
+	manualEffects = mode === 'manual';
+	if (!manualEffects && !batchDepth && !notifyIndex) {
+		flush();
+	}
+	return previous;
 }
 
 // ---- teardown helpers --------------------------------------------------------
@@ -554,7 +588,7 @@ export function startBatch(): void {
 
 /** Close a batch, flushing effects when the outermost batch closes. */
 export function endBatch(): void {
-	if (!--batchDepth) {
+	if (!--batchDepth && !manualEffects) {
 		flush();
 	}
 }
@@ -615,14 +649,24 @@ export function signalId<T>(initialValue?: T, owner?: WeakKey): SignalIdOf<T | u
  */
 let memoId = -1;
 let memoSub: SignalId = -1 as SignalId;
-let memoVersion = -1;
-let memoCycle = -1;
 let memoVal: unknown;
 
 export function get<T>(id: SignalIdOf<T>): T {
-	if (id === memoId && activeSub === memoSub && globalVersion === memoVersion && cycle === memoCycle) {
+	// This head must stay TINY: it is the entire cost of a repeated read,
+	// and it has to inline through the callable opers into user getters —
+	// V8 rejects candidates once a hot compile's cumulative inlined size
+	// is spent, and the read path loses exactly those races when it is one
+	// big function (measured: the callable API carried a 10-25% wrapper
+	// tax purely from get() at 184 bytecodes failing to inline). The memo
+	// key is (id, sub) only; every ++globalVersion / ++cycle site clears
+	// memoId instead of the read comparing them.
+	if (id === memoId && activeSub === memoSub) {
 		return memoVal as T;
 	}
+	return getFresh(id) as T;
+}
+
+function getFresh(id: SignalId): unknown {
 	// The version gate: a snapshot equal to the current globalVersion proves
 	// nothing observed has been written since this node was last verified.
 	if (D[(id >> Arena.VersionShift) + Arena.VersionOffset] === globalVersion) {
@@ -632,12 +676,10 @@ export function get<T>(id: SignalIdOf<T>): T {
 		const value = currentVals[id >> Arena.NodeIndexShift];
 		memoId = id;
 		memoSub = activeSub;
-		memoVersion = globalVersion;
-		memoCycle = cycle;
 		memoVal = value;
-		return value as T;
+		return value;
 	}
-	return getSlow(id) as T;
+	return getSlow(id);
 }
 
 function getSlow(id: SignalId): unknown {
@@ -692,10 +734,11 @@ export function set<T>(id: SignalIdOf<T>, value: T): void {
 		M[id + NodeSlot.Flags] = (M[id + NodeSlot.Flags] & Host.Hidden) | Flag.Mutable | Flag.Dirty;
 		// Every committed write invalidates the version snapshots.
 		++globalVersion;
+		memoId = -1;
 		const subs: LinkId = M[id + NodeSlot.Subs];
 		if (subs !== 0) {
 			propagate(subs, runDepth !== 0);
-			if (!batchDepth) {
+			if (!manualEffects && !batchDepth) {
 				flush();
 			}
 		}
@@ -854,99 +897,116 @@ export function computedOwner<T, R extends WeakKey>(getter: (previousValue?: T) 
 	return stamped;
 }
 
-// ---- default handles ----------------------------------------------------------
-// The DEFAULT creators return small handle objects that are their own
-// garbage-collection owners: drop the handle and the node reclaims — the
-// basic API cannot leak. Each handle is one object; reads and writes go
-// through the same module fast paths as the raw id tier (one property load
-// more). Hosts that want zero allocations per node use the raw tier
-// (signalId/computedId + get/set) and manage lifetime explicitly.
+// ---- default callables --------------------------------------------------------
+// The DEFAULT creators return callables in the upstream alien-signals
+// shape — `sig()` reads, `sig(next)` writes, `stop()` disposes — and each
+// callable is its own garbage-collection owner: drop it and the node
+// reclaims, so the basic API cannot leak. A call goes straight to the
+// module fast paths with the id in the closure context (no property load,
+// no method dispatch). Hosts that want zero allocations per node use the
+// raw tier (signalId/computedId + get/set) and manage lifetime explicitly.
 
-/** A reactive value handle. Created by {@link signal}; GC-owned. */
-export class Signal<T> {
-	id: SignalIdOf<T>;
-	constructor(initialValue: T) {
-		this.id = signalId(initialValue, this);
-	}
-	get(): T {
-		return get(this.id);
-	}
-	set(value: T): void {
-		set(this.id, value);
-	}
+/** A reactive value: call with no arguments to read, one argument to write. */
+export interface WriteableSignal<T> {
+	(): T;
+	(value: T): void;
+	/** The underlying record id, for mixing with the raw tier. */
+	readonly id: SignalIdOf<T>;
 }
 
-/** A cached derived-value handle. Created by {@link computed}; GC-owned. */
-export class Computed<T> {
-	id: SignalIdOf<T>;
-	constructor(getter: (previousValue?: T) => T) {
-		this.id = computedId(getter, this);
-	}
-	get(): T {
-		return get(this.id);
-	}
+/** A cached derived value: call to read. */
+export interface ReadableSignal<T> {
+	(): T;
+	/** The underlying record id, for mixing with the raw tier. */
+	readonly id: SignalIdOf<T>;
 }
 
-/** An effect (or effect scope) handle. Dispose to stop it. */
-export class Effect {
-	id: SignalId;
-	constructor(id: SignalId) {
-		this.id = id;
-	}
-	dispose(): void {
-		dispose(this.id);
-	}
+/** Stops its effect (or effect scope) when called. */
+export interface EffectStop {
+	(): void;
+	/** The underlying record id, for mixing with the raw tier. */
+	readonly id: SignalId;
 }
 
 /**
- * Create a reactive value (leak-free default: the returned handle owns the
- * node; dropping it reclaims the record).
+ * Create a reactive value (leak-free default: the returned callable owns
+ * the node; dropping it reclaims the record).
  *
  * @example
  * ```ts
  * const count = signal(0);
- * count.get();  // 0
- * count.set(1);
- * count.get();  // 1
+ * count();   // 0
+ * count(1);
+ * count();   // 1
  * ```
  */
-export function signal<T>(): Signal<T | undefined>;
-export function signal<T>(initialValue: T): Signal<T>;
-export function signal<T>(initialValue?: T): Signal<T | undefined> {
-	return new Signal(initialValue);
+export function signal<T>(): WriteableSignal<T | undefined>;
+export function signal<T>(initialValue: T): WriteableSignal<T>;
+export function signal<T>(initialValue?: T): WriteableSignal<T | undefined> {
+	// A plain per-node arrow calling the module fast paths. Three
+	// mechanisms were measured on the crossover matrix — this, both arms
+	// manually inlined, and upstream's shared-oper-bound-to-the-node — and
+	// all carry the same wrapper tax over the raw tier (registry adoption
+	// measured exactly zero), so keep the simplest one. Evidence and the
+	// remaining hypothesis (the read path is too big to inline through any
+	// wrapper) are in BENCHMARKS.md.
+	const oper = (...value: [T?]) => {
+		if (value.length) {
+			set(id, value[0] as T);
+		} else {
+			return get(id);
+		}
+	};
+	const id = signalId(initialValue, oper);
+	(oper as { id?: SignalIdOf<T | undefined> }).id = id;
+	return oper as WriteableSignal<T | undefined>;
 }
 
 /**
  * Create a cached value derived from the signals and computeds read by
- * `getter` (leak-free default: the handle owns the node).
+ * `getter` (leak-free default: the callable owns the node).
  *
  * @example
  * ```ts
  * const count = signal(2);
- * const doubled = computed(() => count.get() * 2);
- * doubled.get(); // 4
+ * const doubled = computed(() => count() * 2);
+ * doubled(); // 4
  * ```
  */
-export function computed<T>(getter: (previousValue?: T) => T): Computed<T> {
-	return new Computed(getter);
+export function computed<T>(getter: (previousValue?: T) => T): ReadableSignal<T> {
+	const oper = () => get(id);
+	const id = computedId(getter, oper);
+	(oper as { id?: SignalIdOf<T> }).id = id;
+	return oper as ReadableSignal<T>;
 }
 
 /**
  * Run `fn` immediately, then rerun it when a value it read changes; returns
- * a disposable handle. Effects live until disposed (or until their owning
- * scope disposes) — they are kept alive by the graph, not by the handle.
+ * a function that stops it. Effects live until stopped (or until their
+ * owning scope disposes) — they are kept alive by the graph, not by the
+ * returned callable.
  */
-export function effect(fn: () => void | (() => void)): Effect {
-	return new Effect(effectId(fn));
+export function effect(fn: () => void | (() => void)): EffectStop {
+	const id = effectId(fn);
+	const stop = () => {
+		dispose(id);
+	};
+	(stop as { id?: SignalId }).id = id;
+	return stop as EffectStop;
 }
 
 /**
- * Run `fn` and group every nested effect it creates; disposing the returned
- * handle stops the group, its effects, and the signals/computeds created
+ * Run `fn` and group every nested effect it creates; calling the returned
+ * function stops the group, its effects, and the signals/computeds created
  * inside it (region ownership).
  */
-export function effectScope(fn: () => void): Effect {
-	return new Effect(effectScopeId(fn));
+export function effectScope(fn: () => void): EffectStop {
+	const id = effectScopeId(fn);
+	const stop = () => {
+		dispose(id);
+	};
+	(stop as { id?: SignalId }).id = id;
+	return stop as EffectStop;
 }
 
 function noopEffectBody(): void {}
@@ -993,6 +1053,7 @@ export function trigger(fn: () => void): void {
 		activeSub = prevSub;
 		M[id + NodeSlot.Flags] &= Host.Hidden;
 		++globalVersion;
+		memoId = -1;
 		let l: LinkId = M[id + NodeSlot.Deps];
 		while (l !== 0) {
 			const dep: SignalId = M[l + LinkSlot.Dep];
@@ -1010,7 +1071,7 @@ export function trigger(fn: () => void): void {
 			fns[id >> Arena.NodeIndexShift] = undefined;
 			freeNode(id, M[id + NodeSlot.Gen]);
 		}
-		if (!--batchDepth) {
+		if (!--batchDepth && !manualEffects) {
 			flush();
 		}
 	}

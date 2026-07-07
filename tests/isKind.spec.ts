@@ -18,6 +18,6 @@ test('each kind identifies as itself and nothing else', () => {
 test('a disposed id is no kind', () => {
 	const e = effect(() => {});
 	expect(isEffect(e.id)).toBe(true);
-	e.dispose();
+	e();
 	expect(isEffect(e.id)).toBe(false);
 });

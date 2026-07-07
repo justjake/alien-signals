@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { computedFn as computed, effectFn as effect, signalFn as signal } from './helpers/closures';
+import { computed, effect, signal } from '../src';
 
 // Regression: a computed evaluated by an UNTRACKED read is stamped by the
 // quiet-epoch fast path; if the first subscription then arrives through

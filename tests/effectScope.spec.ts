@@ -1,6 +1,6 @@
 import { expect, test } from 'vitest';
 import { computedId as computed, dispose, effectScopeId as effectScopeRaw, get, isComputed, isSignal, signalId as signalRaw } from '../src';
-import { effectFn as effect, effectScopeFn as effectScope, signalFn as signal } from './helpers/closures';
+import { effect, effectScope, signal } from '../src';
 
 test('scope dispose runs child effect cleanup', () => {
 	const log: string[] = [];

@@ -68,6 +68,109 @@ a propagation band at 1.05–1.15.
 - Run one framework per process; pass framework names as argv, and
   `--test <substring>` filters output.
 
+## Write-size crossover matrix (benchs/crossover.mjs, 5 families × 10 sizes)
+
+Sustained ns/write across recompute-cone sizes vs upstream alien, 2
+interleaved rounds, per-cell medians (2026-07-06, after the switch to the
+upstream callable API):
+
+- **dalien main (fused): 0.90 geomean** — reproduces its documented 0.92,
+  same signature: deep/grid enter the win band at N≈300–1000 and reach
+  0.42–0.52; islands carries a flat ~5% premium.
+- **userspace raw tier: 1.05 geomean.** The crossover survives this
+  architecture: deep/grid at N=1000–30000 run 0.44–0.66 of alien. What's
+  lost vs main is the small-write end (N≤300 at 1.1–1.6×: host-seam and
+  module-let overhead) and batch (many small writes per flush, ~1.0–1.2×).
+- **userspace callable API: ~1.12–1.17 geomean.** The default-API wrapper
+  costs 10–25% over the raw tier on this matrix (worst on islands/batch,
+  mildest on deep large-N where update work dominates).
+
+### The callable wrapper tax: what it is NOT (all measured)
+
+Four mechanisms were implemented and benchmarked; the tax was invariant:
+
+1. Arrow wrapper calling set()/get() (shipped variant).
+2. set()'s body inlined into the write arm (one frame like upstream's
+   signalOper) — no change.
+3. get()'s fast path (memo + version gate) also inlined into both opers —
+   slightly WORSE (more code per closure).
+4. Upstream's exact mechanism — one shared module-level oper per kind,
+   bound per node with the id as primitive `this` (one feedback vector
+   trained by all nodes, cheap bound trampolines) — no better, slightly
+   worse on small-N deep. Requires system.adoptNode(owner, id) (register
+   after mint), which stays as API.
+5. FinalizationRegistry adoption disabled entirely as a diagnostic:
+   ratio 1.00 flat — ownership registration costs nothing at steady state.
+
+Remaining hypothesis consistent with all of the above: this library's read
+path is much larger than alien's (one-entry memo — four compares — plus
+the f64 version-gate load, then link), so V8 stops inlining it through ANY
+additional wrapper layer, while alien's minimal read (flags check + link +
+value load) inlines fully into user getter closures — their wrapper is
+nearly free, ours re-pays a call per read. Chasing that means slimming or
+splitting the read fast path — engine work, independent of API shape.
+
+## Manual vs GC interface ("Dalien Malloc Free" framework)
+
+The suite now carries a second adapter for this library: the raw id tier
+(signalId/computedId/effectId + dispose(scope)) with scope-region
+ownership — bare numeric ids, no handle objects, no FinalizationRegistry,
+100% explicit lifetime. Three interleaved rounds against the default
+GC-handle adapter and alien (2026-07-06, per-cell medians):
+
+- **geomean manual/handles = 1.02** — the leak-free default costs
+  approximately nothing suite-wide. After the freed-seam fix, even
+  createComputations is equal (0.97).
+- The one clear manual win: **createSignals 0.81** (pure mint burst —
+  handle allocation plus registry cell are the only remaining GC-interface
+  costs). Even manual remains ~1.9× alien there: the floor is arena
+  lifetime bookkeeping, not the handle wrapper.
+- Propagation cells drift 1.03–1.09 against manual — within the suite's
+  per-cell noise band; both adapters read and write through identical
+  get(id)/set(id) paths after build, so there is no mechanism for a real
+  steady-state gap.
+- This batch: handles/alien 1.01, manual/alien 1.03 — batch-to-batch drift
+  (the known ±5–10%) now dominates the interface difference entirely.
+
+Conclusion: the honest benchmark config is the handle adapter; the manual
+tier buys nothing except in signal-mint microbenchmarks.
+
+## Tried and rejected: inline 1:1 edges (chain edges)
+
+Prototype (built, measured, reverted): when a subscriber has exactly one
+dependency AND that dependency has exactly one subscriber, store the edge
+inline in the two node records (negated peer id in the Deps/Subs slots; the
+sub's DepsTail doubles as the re-track confirm version) instead of
+allocating a 32-byte link record. Pure chains — deepPropagation's exact
+shape — carry zero link records; the edge graduates to a real link on
+first structural complication.
+
+Measured (adapter-free probes, 3 interleaved rounds, medians):
+
+- deepPropagation steady state: **no change** (~20.3 ms both). Same lesson
+  as the walk audit above: walks are load-fresh, so removing the link-record
+  pointer chase saves loads that were never the bottleneck; update/bracket
+  work dominates propagation cells.
+- broadPropagation: **~9% regression** (58 vs 53 ms). Every hot path pays
+  the dual-representation sign dispatch (link()'s head check, propagate's
+  descent, chainCheck, updateAndShallow), and the branches cost more than
+  the saved loads. Not an inlining artifact (checkDirty was restructured
+  back under V8's 460-bytecode limit — no change) and not deopt churn
+  (--trace-deopt clean in both builds).
+- 1:1 creation (20k signal→computed→computed chains): chain build ~3.0 ms
+  stable vs baseline 2.9–4.3 ms bimodal — at best a small allocation win,
+  nowhere near alien's ~1.8 ms floor, which is reclamation machinery, not
+  link records.
+
+Implementation notes for the record: the design works and passed
+chain/diamond/dispose smoke tests. Two load-bearing subtleties: (1) a
+materialized link must inherit the exact pass version that confirmed the
+inline edge, or linkInsert's same-pass dedup misses on out-of-order
+re-reads and inserts duplicate links; (2) every consumer of a Deps/Subs
+slot — including host-side purge/dispose/queue-climb walkers — needs a sign
+arm; a missing arm dereferences a confirm version as a link id and corrupts
+the arena.
+
 ## Bugs the campaign found
 
 - Dead getter closures stayed pinned (and GC-traced) in host columns after
