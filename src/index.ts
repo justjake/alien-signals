@@ -177,21 +177,21 @@ let hostSet!: (id: SignalId, value: unknown) => void;
 
 // TODO(seeding): port main's adaptive seeding at library level — synthetic
 // graph warm-up keyed on callback-shape diversity (String(fn) sampled on a
-// geometric cadence), as in the fused engine. Not for milomg (its harness
-// pre-warms every cell) but for the write-size crossover bench, where cold
-// first-shape compilation decides the result. See dalien-signals main:
-// adaptive seeding notes (one-shot specialization, seed tax ~0 when idle).
+// geometric cadence), as in the fused engine. Pays where cold first-shape
+// compilation decides the outcome; already-warm steady-state workloads see
+// none of it. See dalien-signals main: adaptive seeding notes (one-shot
+// specialization, seed tax ~0 when idle).
 
 // ---- the system, driven by this library's update/notify/unwatched seams -----
 
 const system = createReactiveSystem({
 	// 2M records x 32 B = 64 MB of virtual address space, reserved at
-	// import (physical memory tracks records actually touched). Sized so
-	// benchmark-scale workloads never grow: growth under warm traffic
-	// leaves two-generation call feedback in long-lived callables (see
-	// BENCHMARKS.md), so the default errs large — virtual space is cheap —
-	// and growCapacity() exists for bigger graphs, ideally called before
-	// the graph is built.
+	// import. Physical memory tracks records actually touched, so this is
+	// a cheap reservation with headroom for common application graphs.
+	// growCapacity() raises it for bigger graphs, best called before the
+	// graph is built: growing under a warm graph leaves long-lived
+	// callables with two-generation call feedback (measured ~1.3x on
+	// sustained recomputes; see BENCHMARKS.md).
 	capacityRecords: 1 << 21,
 	allocated(arena: ReactiveArena): void {
 		M = arena.memory;
@@ -400,11 +400,11 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 	function get<T>(id: SignalIdOf<T>): T {
 		// The version gate: a snapshot equal to the current globalVersion proves
 		// nothing observed has been written since this node was last verified.
-		// (The one-entry read memo that used to sit in front of this gate was
-		// deleted when the callable tier stopped using it: the kind-specialized
-		// opers never consult it, the suite holds alien-parity on repeated-read
-		// cells without it, and its invalidation stores taxed every write and
-		// every recompute bracket.)
+		// (The one-entry read memo that used to sit in front of this gate
+		// was deleted: the kind-specialized opers never consult it, its
+		// invalidation stores taxed every write and every recompute bracket,
+		// and removing it measured neutral-to-better everywhere — including
+		// the repeated-read workloads it was originally built for.)
 		if (D[(id >> Arena.VersionShift) + Arena.VersionOffset] === globalVersion) {
 			if (activeSub !== 0) {
 				link(id, activeSub, cycle);

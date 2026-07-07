@@ -770,16 +770,16 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 	let maintenanceScheduled = false;
 	// Deferred owner registrations as (owner, id) pairs: a registry cell is
 	// weak-GC machinery the collector traces, and creating one per create
-	// inside a creation burst measured worse than queueing (cellx-style
-	// create-heavy cells regressed ~35%). Owners are held strongly until
+	// inside a creation burst measured worse than queueing (create-heavy
+	// workloads regressed ~35%). Owners are held strongly until
 	// the maintenance microtask registers them, so none can be collected
 	// before its registration lands.
 	let pendingRegister: unknown[] = [];
 
 	// The deferral is bounded: past this many queued pairs the queue drains
 	// inline. Unbounded, a 100k-creation burst holds every owner STRONGLY until
-	// the next microtask — a GC inside the burst (or right after it, as
-	// benchmark harnesses do) traces and promotes the lot, and none of it
+	// the next microtask — a GC inside the burst (or right after it, at a
+	// request or frame boundary) traces and promotes the lot, and none of it
 	// can be collected however dead it is. Bounded, at most ~8k owners are
 	// pinned, and the register cost amortizes to the same per-creation price.
 	// Measured on milomg createSignals: 18.5ms unbounded -> 7.7ms bounded
