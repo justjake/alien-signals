@@ -140,7 +140,7 @@ export function mountStepper(root) {
 			<button data-act="read">read total</button>
 			<button data-act="dispose">dispose the effect</button>
 		</div>
-		<svg id="graphview" viewBox="0 0 460 300"></svg>
+		<svg id="graphview" viewBox="0 0 500 300"></svg>
 		<ol id="log"></ol>
 		<h3>the same graph, as raw memory</h3>
 		<div class="records"></div>`;
@@ -185,7 +185,7 @@ export function mountStepper(root) {
 			const k = kindOf(M[id + NODE_SLOTS.Flags]);
 			if (k) nodes.push({ id, kind: k, name: world.states[id >> 3]?.name ?? '(freed)' });
 		}
-		const cols = { signal: 40, computed: 200, effect: 380 };
+		const cols = { signal: 72, computed: 245, effect: 420 };
 		const rows = { signal: 0, computed: 0, effect: 0 };
 		const pos = new Map();
 		for (const nd of nodes) {
