@@ -245,10 +245,12 @@ function updateSignal(id: SignalId, flags: number): boolean {
 // `flags` is the caller's already-loaded word: both call sites (the update
 // seam and get's read ladder) have it in hand, and the bits this function
 // keeps (Hidden, HasChildEffect) cannot change under checkDirty.
-function updateComputed(id: SignalId, flags: number): boolean {
-	const getter = fns[id >> Arena.NodeIndexShift];
+function updateComputed(id: SignalId, flags: number, getter?: NodeFn): boolean {
 	if (getter === undefined) {
-		return true; // freed mid-walk: treat as changed, the walk moves on
+		getter = fns[id >> Arena.NodeIndexShift];
+		if (getter === undefined) {
+			return true; // freed mid-walk: treat as changed, the walk moves on
+		}
 	}
 	if (flags & Host.HasChildEffect) {
 		disposeChildEffects(id);
@@ -682,7 +684,7 @@ function getFresh(id: SignalId): unknown {
 	return getSlow(id);
 }
 
-function getSlow(id: SignalId): unknown {
+function getSlow(id: SignalId, getter?: NodeFn): unknown {
 	const flags = M[id + NodeSlot.Flags];
 	if ((flags & Host.KindMask) === Host.Signal) {
 		if (flags & Flag.Dirty) {
@@ -698,7 +700,7 @@ function getSlow(id: SignalId): unknown {
 		// the version gate until the next write anywhere.
 		D[(id >> Arena.VersionShift) + Arena.VersionOffset] = globalVersion;
 	} else if (flags & Flag.Dirty) {
-		if (updateComputed(id, flags)) {
+		if (updateComputed(id, flags, getter)) {
 			const subs: LinkId = M[id + NodeSlot.Subs];
 			if (subs !== 0) {
 				shallowPropagate(subs);
@@ -707,7 +709,7 @@ function getSlow(id: SignalId): unknown {
 	} else if (flags & Flag.Pending) {
 		const entryVersion = globalVersion;
 		if (checkDirty(M[id + NodeSlot.Deps], id)) {
-			if (updateComputed(id, M[id + NodeSlot.Flags])) {
+			if (updateComputed(id, M[id + NodeSlot.Flags], getter)) {
 				const subs: LinkId = M[id + NodeSlot.Subs];
 				if (subs !== 0) {
 					shallowPropagate(subs);
@@ -964,7 +966,7 @@ function readSignal(id: SignalId): unknown {
 	return currentVals[id >> Arena.NodeIndexShift];
 }
 
-function readComputed(id: SignalId): unknown {
+function readComputed(id: SignalId, getter?: NodeFn): unknown {
 	// The version gate: a snapshot equal to the current globalVersion
 	// proves nothing observed has been written since this node was last
 	// verified.
@@ -974,7 +976,7 @@ function readComputed(id: SignalId): unknown {
 		}
 		return currentVals[id >> Arena.NodeIndexShift];
 	}
-	return getSlow(id);
+	return getSlow(id, getter);
 }
 
 export function signal<T>(): WriteableSignal<T | undefined>;
@@ -1004,7 +1006,7 @@ export function signal<T>(initialValue?: T): WriteableSignal<T | undefined> {
  * ```
  */
 export function computed<T>(getter: (previousValue?: T) => T): ReadableSignal<T> {
-	const oper = () => readComputed(id) as T;
+	const oper = () => readComputed(id, getter as NodeFn) as T;
 	const id = computedId(getter, oper);
 	(oper as { id?: SignalIdOf<T> }).id = id;
 	return oper as ReadableSignal<T>;
