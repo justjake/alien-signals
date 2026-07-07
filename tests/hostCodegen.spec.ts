@@ -49,3 +49,34 @@ test('the built createHost compiles from its own source text', () => {
 	expect(typeof gen.readSignal).toBe('function');
 	expect(typeof gen.state).toBe('function');
 });
+
+// The fakes above cannot reach lazy bodies (a captured module binding
+// inside e.g. disposeEffect only throws when that path runs under a REAL
+// clone). Exercise the whole public surface against the BUILT library
+// with a forced growth, where the codegen path actually engages.
+test('a grown (cloned) generation survives full API smoke', async () => {
+	const lib = await import(join(__dirname, '..', 'esm', 'index.mjs'));
+	lib.growCapacity(1 << 21); // force migration -> cloned host generation
+	await new Promise((r) => setTimeout(r));
+	const s = lib.signal(1);
+	const c = lib.computed(() => s() * 2);
+	let runs = 0;
+	const stop = lib.effect(() => { c(); runs++; });
+	s(5);
+	expect(c()).toBe(10);
+	expect(runs).toBe(2);
+	stop();
+	s(6);
+	expect(runs).toBe(2);
+	const scope = lib.effectScope(() => { lib.effect(() => { c(); }); });
+	scope();
+	const id = lib.signalId(3);
+	lib.set(id, 4);
+	expect(lib.get(id)).toBe(4);
+	lib.dispose(id);
+	lib.startBatch();
+	s(7);
+	lib.endBatch();
+	expect(c()).toBe(14);
+	lib.trigger(() => { s(); });
+});

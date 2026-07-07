@@ -275,6 +275,7 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 	// and reused ever after (released by reset, which clears this cache).
 	let triggerScratch: SignalId = boot.triggerScratch;
 	let triggerScratchBusy = false;
+	let regionFlushScheduled = false;
 
 	function state(): HostBoot {
 		return { activeSub, cycle, globalVersion, batchDepth, runDepth, manualEffects, notifyIndex, queuedLength, currentScope, triggerScratch };
@@ -995,7 +996,6 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 
 
 
-let regionFlushScheduled = false;
 
 
 // ---- public API ---------------------------------------------------------------
