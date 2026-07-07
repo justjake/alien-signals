@@ -185,11 +185,14 @@ let hostSet!: (id: SignalId, value: unknown) => void;
 // ---- the system, driven by this library's update/notify/unwatched seams -----
 
 const system = createReactiveSystem({
-	// 1M records x 32 B = 32 MB of virtual address space, allocated at
-	// import (physical memory tracks records actually touched). The arena
-	// grows automatically when the graph outgrows it; growCapacity() raises
-	// it up front.
-	capacityRecords: 1 << 20,
+	// 2M records x 32 B = 64 MB of virtual address space, reserved at
+	// import (physical memory tracks records actually touched). Sized so
+	// benchmark-scale workloads never grow: growth under warm traffic
+	// leaves two-generation call feedback in long-lived callables (see
+	// BENCHMARKS.md), so the default errs large — virtual space is cheap —
+	// and growCapacity() exists for bigger graphs, ideally called before
+	// the graph is built.
+	capacityRecords: 1 << 21,
 	allocated(arena: ReactiveArena): void {
 		M = arena.memory;
 		D = arena.versions;
