@@ -193,9 +193,12 @@ count(2); // logs: 4 true</code></pre>
 				<h2>Benchmarks, in this tab</h2>
 				<p>
 					Four workloads — bulk creation, a deep chain, a wide fan-out,
-					the field's cone grid — across the selector's four libraries,
-					one round each in this tab. Indicative only; published numbers
-					come from CI (interleaved rounds, isolated processes, medians).
+					the field's cone grid — across the selector's four libraries.
+					Each cell runs in a fresh Worker so no library inherits JIT
+					state, arena contents, or main-thread contention from the page
+					or from other cells. One round each: indicative only; published
+					numbers come from CI (interleaved rounds, isolated processes,
+					medians).
 				</p>
 				<div id="w-bench"></div>
 			</section>
