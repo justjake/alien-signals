@@ -23,6 +23,9 @@ env:
   # committed there); bump FORK_SHA deliberately when the fork moves.
   FORK_REPO: https://github.com/justjake/js-reactivity-benchmark
   FORK_SHA: 38dfb6a11ef9057392cdd49dc09128fab9fc14d0
+  # The fork's core links ../upstream-alien-signals (the comparator build).
+  ALIEN_REPO: https://github.com/stackblitz/alien-signals
+  ALIEN_SHA: c00e63969bf261fc5dce31fae70cb9a90912b06e
 
 jobs:
   build:
@@ -39,6 +42,9 @@ jobs:
         run: |
           git clone --no-checkout "$FORK_REPO" milomg-reactivity-benchmark
           git -C milomg-reactivity-benchmark checkout "$FORK_SHA"
+          git clone --no-checkout "$ALIEN_REPO" upstream-alien-signals
+          git -C upstream-alien-signals checkout "$ALIEN_SHA"
+          (cd upstream-alien-signals && npm install && npm run build)
           # The example imports the fork's adapter SOURCES, which resolve
           # dependencies from the fork's own node_modules.
           pnpm install --dir milomg-reactivity-benchmark --no-frozen-lockfile
