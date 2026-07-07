@@ -208,6 +208,7 @@ const system = createReactiveSystem({
 		} else if (kind >= Host.Effect) {
 			disposeEffect(id);
 		}
+		memoId = -1; // freed or unwatched: the read memo may name this record
 	},
 });
 
@@ -390,6 +391,7 @@ function disposeEffect(id: SignalId): void {
 		return; // already disposed
 	}
 	fns[idx] = undefined;
+	memoId = -1; // freed records recycle their ids; the memo must not
 	freeNode(id, M[id + NodeSlot.Gen]);
 	if (cleanups[idx]) {
 		runCleanup(idx);
@@ -414,6 +416,7 @@ let regionFlushScheduled = false;
 
 function freePendingRegions(): void {
 	regionFlushScheduled = false;
+	memoId = -1;
 	for (let r = 0; r < pendingRegions.length; r++) {
 		const region = pendingRegions[r];
 		for (let i = 0; i < region.length; i += 2) {
@@ -500,6 +503,7 @@ export function reset(): void {
 	queuedLength = 0;
 	activeSub = 0;
 	currentScope = 0;
+	memoId = -1;
 	batchDepth = 0;
 	runDepth = 0;
 	triggerScratch = 0;
@@ -595,14 +599,29 @@ export function signal<T>(initialValue?: T, owner?: WeakKey): Signal<T | undefin
  * Read a signal or computed by handle, tracking it as a dependency of the
  * active subscriber.
  */
+let memoId = -1;
+let memoSub: SignalId = -1 as SignalId;
+let memoVersion = -1;
+let memoCycle = -1;
+let memoVal: unknown;
+
 export function get<T>(id: Signal<T>): T {
+	if (id === memoId && activeSub === memoSub && globalVersion === memoVersion && cycle === memoCycle) {
+		return memoVal as T;
+	}
 	// The version gate: a snapshot equal to the current globalVersion proves
 	// nothing observed has been written since this node was last verified.
 	if (D[(id >> Arena.VersionShift) + Arena.VersionOffset] === globalVersion) {
 		if (activeSub !== 0) {
 			link(id, activeSub, cycle);
 		}
-		return currentVals[id >> Arena.NodeIndexShift] as T;
+		const value = currentVals[id >> Arena.NodeIndexShift];
+		memoId = id;
+		memoSub = activeSub;
+		memoVersion = globalVersion;
+		memoCycle = cycle;
+		memoVal = value;
+		return value as T;
 	}
 	return getSlow(id) as T;
 }
@@ -783,6 +802,7 @@ export function dispose(id: SignalId): void {
 		disposeEffect(id);
 	} else {
 		fns[id >> Arena.NodeIndexShift] = undefined;
+		memoId = -1;
 		freeNode(id, M[id + NodeSlot.Gen]);
 	}
 }
