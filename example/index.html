@@ -3,42 +3,156 @@
 	<head>
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
-		<title>dalien-signals — feel the graph</title>
+		<title>dalien-signals — signals, explained live</title>
 		<link rel="stylesheet" href="/src/style.css" />
 	</head>
 	<body>
 		<main>
 			<header>
 				<h1>dalien-signals</h1>
-				<p>
-					Every pixel below is a <code>computed</code> blending the three
-					cells above it; the top row is <code>signal</code>s. Paint the top
-					row and watch the dependency cone — and only the cone — recompute.
+				<p class="lede">
+					A <em>signal</em> is a value that remembers who read it. When it
+					changes, everything computed from it — and nothing else — updates.
+					You never subscribe, never diff, never re-render the world: the
+					dependency graph assembles itself while your code runs, and a
+					write touches exactly the part of it that could have changed.
+					This page explains how
+					<a href="https://github.com/justjake/dalien-signals">dalien-signals</a>
+					does that, with the real engine running in every demo.
 				</p>
 			</header>
-			<canvas id="grid"></canvas>
-			<section id="hud">
-				<div class="stat"><span id="stat-nodes">–</span><label>nodes in graph</label></div>
-				<div class="stat"><span id="stat-edges">–</span><label>dependency edges</label></div>
-				<div class="stat"><span id="stat-recomputed">–</span><label>recomputed this frame</label></div>
-				<div class="stat"><span id="stat-share">–</span><label>of the graph</label></div>
-				<div class="stat"><span id="stat-frame">–</span><label>frame compute</label></div>
-				<div class="stat"><span id="stat-fps">–</span><label>fps</label></div>
+
+			<section>
+				<h2>Feel it first</h2>
+				<p>
+					The field below is one reactive graph: the top row of pixels is
+					<code>signal</code>s, and every pixel under it is a
+					<code>computed</code> blending the three cells above. About twenty
+					thousand nodes. The drifting emitters write a handful of signals
+					per frame — then everything downstream updates by itself.
+					<strong>Drag across the field to paint your own.</strong> The pale
+					shimmer marks the cells that actually recomputed: a change flows
+					down a widening cone of dependents, and the rest of the graph
+					isn't touched at all.
+				</p>
+				<canvas id="grid"></canvas>
+				<section id="hud">
+					<div class="stat"><span id="stat-nodes">–</span><label>nodes in graph</label></div>
+					<div class="stat"><span id="stat-edges">–</span><label>dependency edges</label></div>
+					<div class="stat"><span id="stat-recomputed">–</span><label>recomputed this frame</label></div>
+					<div class="stat"><span id="stat-share">–</span><label>of the graph</label></div>
+					<div class="stat"><span id="stat-frame">–</span><label>frame compute</label></div>
+					<div class="stat"><span id="stat-fps">–</span><label>fps</label></div>
+				</section>
+				<section id="controls">
+					<button id="btn-wave" class="on">wave</button>
+					<button id="btn-storm">storm</button>
+					<button id="btn-cutoff">equality cutoff: on</button>
+					<button id="btn-invalidate">invalidate everything</button>
+					<span id="note"></span>
+				</section>
+				<p>
+					Two things worth trying. <em>Equality cutoff</em>: each cell
+					rounds its output to a coarse step, so as a ripple fades, cells
+					start producing the <em>same</em> value they had before — and the
+					cascade stops right there. Toggle it off and watch the shimmer
+					cones grow taller. <em>Invalidate everything</em> writes one
+					signal that every cell reads, forcing all twenty thousand nodes to
+					recompute in a single frame — the timer shows what a full-graph
+					pass costs, which is the price this library is designed to almost
+					never pay.
+				</p>
 			</section>
-			<section id="controls">
-				<button id="btn-wave" class="on">wave</button>
-				<button id="btn-storm">storm</button>
-				<button id="btn-cutoff">equality cutoff: on</button>
-				<button id="btn-invalidate">invalidate everything</button>
-				<span id="note"></span>
+
+			<section>
+				<h2>The three primitives</h2>
+				<p>
+					Everything above is built from three functions. A
+					<code>signal</code> stores a value: call it with no argument to
+					read, with an argument to write. A <code>computed</code> derives a
+					cached value from whatever signals and computeds its function
+					reads. An <code>effect</code> runs a function now, and again
+					whenever a value it read changes — that's where rendering, logging,
+					and other side effects live.
+				</p>
+				<pre><code>import { signal, computed, effect } from "dalien-signals";
+
+const count   = signal(1);
+const doubled = computed(() =&gt; count() * 2);
+const isEven  = computed(() =&gt; count() % 2 === 0);
+
+effect(() =&gt; console.log(doubled(), isEven()));
+count(2); // logs: 4 true</code></pre>
+				<div id="w-counter"></div>
+				<p>
+					Notice what the run counter does when you step from 1 to 3: the
+					bottom effect reads both computeds, but it re-runs only when one
+					of them produces a <em>new</em> value. <code>doubled</code>
+					changed, <code>even?</code> came out <code>no</code> again — the
+					same answer as before — so nothing that depends only on
+					<code>even?</code> was disturbed. That's equality cutoff, the same
+					rule that stops the ripples in the field above. And nobody
+					declared any of these relationships: reading inside a computed or
+					effect <em>is</em> the subscription.
+				</p>
 			</section>
-			<section id="anatomy">
+
+			<section>
+				<h2>How a write becomes an update</h2>
+				<p>
+					dalien-signals is a <em>push-pull</em> engine. A write doesn't
+					recompute anything by itself — it publishes doubt, cheaply, and
+					the real work happens later, on demand:
+				</p>
+				<ol class="algo">
+					<li>
+						<b>Push staleness.</b> Writing a signal marks it
+						<code>Dirty</code> and walks its subscriber lists, marking each
+						downstream node <code>Pending</code> — "something under you may
+						have changed." No user code runs during this walk; it's a few
+						integer writes per node.
+					</li>
+					<li>
+						<b>Queue effects.</b> Any effect the walk reaches goes into a
+						queue, once, no matter how many paths led to it.
+					</li>
+					<li>
+						<b>Pull and verify.</b> When an effect runs — or when you read a
+						computed — the node checks its dependencies: did anything I read
+						actually produce a new value? A <code>Pending</code> chain
+						resolves top-down; a node whose inputs all came out equal clears
+						its flag and reports "nothing changed," cutting the cascade.
+					</li>
+					<li>
+						<b>Stamp the verdict.</b> Every committed write increments one
+						global version counter. When a computed finishes verifying, it
+						stores that version; a later read compares the two numbers, and
+						if they match, the value is provably current — the read returns
+						in a couple of loads without walking anything.
+					</li>
+				</ol>
+				<p>
+					Step through it yourself. This little shop — two signals feeding a
+					subtotal, a total, and one effect — narrates each operation and
+					draws its graph live. Try the batch: two writes, one effect run.
+					Try writing the same value: nothing happens at all. Dispose the
+					effect, and watch the computeds lose their subscribers and drop
+					their own dependency edges — an unwatched computed doesn't spend
+					memory on bookkeeping nobody will ever ask about.
+				</p>
+				<div id="w-stepper"></div>
+			</section>
+
+			<section>
 				<h2>A node is eight integers</h2>
 				<p>
-					There are no node objects. The whole graph lives in one
-					<code>Int32Array</code> — the arena — carved into 32-byte
-					records of eight <code>int32</code> slots. A “signal” is a
-					record id: the index of its first slot.
+					Here's the part that makes dalien-signals unusual. Most signal
+					libraries allocate an object per node and wire them together with
+					object references; the garbage collector then traces that web on
+					every collection. dalien-signals stores the whole graph in
+					<em>one</em> <code>Int32Array</code> — an arena — carved into
+					32-byte records of eight <code>int32</code> slots. A "node" is
+					just the index where its record starts:
 				</p>
 				<dl class="slots">
 					<div><dt>0 · Flags</dt><dd>kind tag + state bits: Mutable, Watching, Dirty, Pending, …</dd></div>
@@ -47,34 +161,44 @@
 					<div><dt>3 · Subs</dt><dd>head of the subscriber list — also a link record</dd></div>
 					<div><dt>4 · SubsTail</dt><dd>tail of the subscriber list</dd></div>
 					<div><dt>5 · Gen</dt><dd>generation counter, so stale ids of freed records miss</dd></div>
-					<div><dt>6+7 · Version</dt><dd>one float64 (read through a shared-buffer view): “verified as of global version N”</dd></div>
+					<div><dt>6+7 · Version</dt><dd>one float64 (via a shared-buffer view): "verified as of global version N"</dd></div>
 				</dl>
 				<p>
-					Edges are records too: a <em>link</em> record’s slots name a
+					Edges are records in the same array: a <em>link</em> record names a
 					dependency, a subscriber, and the four neighbors that thread it
-					into both of their lists. Reading a signal inside a computed
-					writes one of these records; that is the entire subscription
-					mechanism.
+					into both of their lists. "Walking the subscriber list" means
+					following integers from slot to slot — no pointer chasing across
+					the heap, no objects for the collector to trace, and neighboring
+					records share cache lines. The tables in the demos above and below
+					are not illustrations: they are that array, decoded row by row,
+					with the cells that changed on your last action highlighted.
 				</p>
 			</section>
-			<section id="inspector-section">
-				<h2>Watch the integers move</h2>
+
+			<section>
+				<h2>Finale: a spreadsheet is a dependency graph</h2>
 				<p>
-					A live graph — two signals, two computeds, one effect — over a
-					real arena. The table is the actual memory; the diagram is drawn
-					by following the pointers in it. Amber cells changed on the last
-					action.
+					A spreadsheet is the oldest reactive system in computing, so let's
+					end with one. Each cell is a signal (what you typed) plus a
+					computed (what it evaluates to). Formulas start with
+					<code>=</code> and are plain JavaScript with one extra function:
+					<code>GET('A:1')</code> reads another cell. Because the formula
+					runs inside the cell's computed, every <code>GET</code> records a
+					real dependency edge in the arena — edit a formula and watch link
+					records appear and age out in the memory view on the right.
 				</p>
-				<div id="inspector"></div>
+				<div id="w-sheet"></div>
 			</section>
+
 			<footer>
 				<p>
-					Painting writes a handful of signals; the change cascades down a
-					widening cone of computeds. With equality cutoff on, cells that
-					settle to the same value stop the cascade — the cone visibly
-					narrows. “Invalidate everything” writes a signal every cell reads,
-					recomputing the entire graph in one frame; the timer shows what
-					that costs.
+					The engine on this page is the production build, unmodified.
+					Read the
+					<a href="https://github.com/justjake/dalien-signals">source and full README</a>,
+					or the
+					<a href="https://github.com/justjake/dalien-signals/blob/dalien-signals/BENCHMARKS.md">benchmark methodology</a>.
+					This page's own HUD, buttons, and widgets are driven by signals
+					and effects too — view source.
 				</p>
 			</footer>
 		</main>

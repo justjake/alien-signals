@@ -36,14 +36,16 @@ export function buildGraph(width, depth) {
 			// Fixed pseudo-random weights per cell keep the field organic
 			// without any per-frame randomness.
 			const h = Math.sin(i * 12.9898 + r * 78.233) * 43758.5453;
-			const wa = 0.28 + (h - Math.floor(h)) * 0.1;
-			const wc = 0.62 - (h - Math.floor(h)) * 0.1;
+			const jitter = (h - Math.floor(h)) * 0.08;
+			const wa = 0.22 + jitter;
+			const wb = 0.5;
+			const wc = 0.25 - jitter;
 			const index = r * width + i;
 			row.push(computed(() => {
 				epoch();
 				recomputed.push(index);
-				const v = a() * wa + b() * 0.36 + c() * wc;
-				return quantize() ? Math.round(v * 48) / 48 : v;
+				const v = a() * wa + b() * wb + c() * wc;
+				return quantize() ? Math.round(v * 96) / 96 : v;
 			}));
 		}
 		rows.push(row);

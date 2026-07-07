@@ -4,7 +4,7 @@
 // unchanged projections free — writing the same fps twice touches nothing.
 import { signal, computed, effect } from 'dalien-signals';
 import { buildGraph } from './graph.js';
-import { mountInspector } from './explain.js';
+import { mountCounter, mountStepper, mountSheet } from './widgets.js';
 
 const WIDTH = 192;
 const DEPTH = 108;
@@ -82,9 +82,10 @@ function readAll() {
 		for (let i = 0; i < WIDTH; i++) {
 			const v = Math.max(0, Math.min(1, row[i]()));
 			const p = (r * WIDTH + i) * 4;
-			data[p] = v * v * 235;
-			data[p + 1] = v * 190;
-			data[p + 2] = 40 + v * 215;
+			// near-black -> indigo -> teal -> amber ramp
+			data[p] = v < 0.6 ? v * 60 : (v - 0.6) * 520;
+			data[p + 1] = v * v * 190;
+			data[p + 2] = 24 + v * (1.4 - v) * 300;
 			data[p + 3] = 255;
 		}
 	}
@@ -93,19 +94,30 @@ function readAll() {
 let frames = 0;
 let fpsWindow = performance.now();
 let phase = 0;
+const emitters = [
+	{ speed: 0.021, span: 0.9, width: 2, gain: 1.0 },
+	{ speed: -0.033, span: 0.55, width: 1, gain: 0.8 },
+	{ speed: 0.013, span: 0.75, width: 3, gain: 0.65 },
+];
 
 function frame() {
 	graph.recomputed.length = 0;
 	if (wave()) {
-		phase += 0.045;
-		const centre = (Math.sin(phase) * 0.5 + 0.5) * WIDTH;
-		for (let dx = -3; dx <= 3; dx++) {
-			graph.sources[(Math.round(centre) + dx + WIDTH) % WIDTH](Math.max(0, 1 - Math.abs(dx) * 0.22));
+		phase += 1;
+		for (const em of emitters) {
+			const centre = (Math.sin(phase * em.speed) * em.span * 0.5 + 0.5) * WIDTH;
+			for (let dx = -em.width; dx <= em.width; dx++) {
+				const i = (Math.round(centre) + dx + WIDTH) % WIDTH;
+				graph.sources[i](em.gain * Math.max(0, 1 - Math.abs(dx) / (em.width + 1)));
+			}
+		}
+		if (phase % 90 === 0) {
+			graph.sources[Math.floor(Math.random() * WIDTH)](1);
 		}
 	}
 	if (storm()) {
-		for (let k = 0; k < 6; k++) {
-			graph.sources[Math.floor(Math.random() * WIDTH)](Math.random());
+		for (let k = 0; k < 4; k++) {
+			graph.sources[Math.floor(Math.random() * WIDTH)](Math.random() * 0.9);
 		}
 	}
 
@@ -118,10 +130,9 @@ function frame() {
 		const f = flash[i];
 		if (f > 0.02) {
 			const p = i * 4;
-			data[p] = Math.min(255, data[p] + f * 160);
-			data[p + 1] = Math.min(255, data[p + 1] + f * 160);
-			data[p + 2] = Math.min(255, data[p + 2] + f * 120);
-			flash[i] = f * 0.82;
+			data[p + 1] = Math.min(255, data[p + 1] + f * 70);
+			data[p + 2] = Math.min(255, data[p + 2] + f * 90);
+			flash[i] = f * 0.78;
 		} else {
 			flash[i] = 0;
 		}
@@ -140,4 +151,6 @@ function frame() {
 }
 requestAnimationFrame(frame);
 
-mountInspector(document.getElementById('inspector'));
+mountCounter(document.getElementById('w-counter'));
+mountStepper(document.getElementById('w-stepper'));
+mountSheet(document.getElementById('w-sheet'));

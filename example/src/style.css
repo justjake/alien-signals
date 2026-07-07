@@ -65,3 +65,38 @@ h3 { font-size: 14px; margin: 18px 0 6px; color: #c8cede; }
 #graphview .edges text { fill: #5b667e; font-size: 9px; }
 #log { color: #9aa1b2; font-size: 13px; padding-left: 20px; }
 #log li { margin: 2px 0; }
+
+.lede { font-size: 17px; max-width: 68ch; color: #c8cede; }
+pre { background: #10131c; border: 1px solid #1c2130; border-radius: 8px; padding: 14px 16px; overflow-x: auto; }
+pre code { color: #c8cede; }
+section > p { max-width: 72ch; color: #b7bdcc; }
+.algo { max-width: 72ch; color: #b7bdcc; padding-left: 22px; }
+.algo li { margin: 8px 0; }
+.algo b { color: #e8eaf0; }
+.counter { display: flex; gap: 12px; align-items: stretch; flex-wrap: wrap; margin: 16px 0; }
+.counter button { width: 44px; font-size: 20px; background: #161a24; color: #e8eaf0; border: 1px solid #2a3040; border-radius: 8px; cursor: pointer; }
+.counter .cell { background: #10131c; border: 1px solid #1c2130; border-radius: 8px; padding: 8px 16px; min-width: 110px; }
+.counter .cell label { display: block; color: #9aa1b2; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; }
+.counter .cell output { font-size: 22px; font-variant-numeric: tabular-nums; }
+#w-stepper .actions, #w-sheet .actions { display: flex; gap: 8px; flex-wrap: wrap; margin: 14px 0 10px; }
+#w-stepper .actions button { background: #161a24; color: #e8eaf0; border: 1px solid #2a3040; padding: 6px 12px; border-radius: 6px; font: inherit; cursor: pointer; }
+#w-stepper #graphview { width: 100%; max-width: 620px; display: block; }
+#w-sheet .panes { display: grid; grid-template-columns: minmax(340px, 5fr) 6fr; gap: 20px; align-items: start; }
+@media (max-width: 980px) { #w-sheet .panes { grid-template-columns: 1fr; } }
+.sheet { border-collapse: collapse; width: 100%; }
+.sheet th { color: #9aa1b2; font-weight: 500; font-size: 12px; padding: 2px 6px; }
+.sheet td { border: 1px solid #1c2130; padding: 0; min-width: 86px; }
+.sheet input { width: 100%; background: transparent; border: 0; color: #7fd4ff; font: 12px ui-monospace, monospace; padding: 5px 6px 0; outline: none; }
+.sheet input:focus { background: #10131c; }
+.sheet output { display: block; padding: 0 6px 5px; font-size: 14px; font-variant-numeric: tabular-nums; }
+.records { max-height: 460px; overflow: auto; border: 1px solid #1c2130; border-radius: 8px; }
+.records table { border-collapse: collapse; font: 11.5px ui-monospace, monospace; width: 100%; }
+.records th, .records td { padding: 3px 6px; text-align: right; border-bottom: 1px solid #1c2130; white-space: nowrap; }
+.records td.decoded { text-align: left; color: #9aa1b2; }
+.records tr.signal th { color: #7fd4ff; }
+.records tr.computed th { color: #b48bff; }
+.records tr.effect th { color: #ffd479; }
+.records tr.link th { color: #6fdc9c; }
+.records tr.freed { opacity: 0.45; }
+.records tr.selected { outline: 1px solid #7fd4ff; }
+.records td.changed { background: #4a3a12; color: #ffd479; }
