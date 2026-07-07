@@ -127,9 +127,28 @@ let D: Float64Array = new Float64Array(0);
 let link!: (dep: SignalId, sub: SignalId, version: number) => LinkId;
 let unlink!: (linkId: LinkId, sub?: SignalId) => LinkId;
 let propagate!: (subsLink: LinkId, innerWrite: boolean) => void;
-let checkDirty!: (depsLink: LinkId, sub: SignalId) => boolean;
 let shallowPropagate!: (subsLink: LinkId) => void;
 let freeNode!: (id: SignalId, gen: SignalGen) => void;
+
+// ---- the hot host tier, compiled per arena generation ------------------------
+// createHost() defines the recompute/flush/read machinery in ONE closure
+// scope over `const` captures of the arena and the five ops. The fused
+// engine's kernel edge is compilation-unit certainty (single-closure
+// constants, a closed set of mutators); this factory gives the hot tier the
+// same shape without moving the source into system.ts. Entry points reach
+// the current generation through these lets — the exact indirection the
+// module already paid — so growth just re-points them at a boundary.
+let host!: ReturnType<typeof createHost>;
+let hostUpdateNode!: (id: SignalId, flags: number) => boolean;
+let hostEnqueueEffect!: (id: SignalId) => void;
+let hostFreedNode!: (id: SignalId) => void;
+let hostUnwatchedNode!: (id: SignalId) => void;
+let hostReadSignal!: (id: SignalId) => unknown;
+let hostReadComputed!: (id: SignalId, getter?: NodeFn) => unknown;
+let hostGetSlow!: (id: SignalId, getter?: NodeFn) => unknown;
+let hostSet!: (id: SignalId, value: unknown) => void;
+let hostFlush!: () => void;
+let hostRunCleanup!: (idx: number) => void;
 
 // TODO(seeding): port main's adaptive seeding at library level — synthetic
 // graph warm-up keyed on callback-shape diversity (String(fn) sampled on a
@@ -152,26 +171,53 @@ const system = createReactiveSystem({
 		link = arena.link;
 		unlink = arena.unlink;
 		propagate = arena.propagate;
-		checkDirty = arena.checkDirty;
 		shallowPropagate = arena.shallowPropagate;
 		freeNode = arena.freeNode;
+		host = createHost(arena);
+		hostUpdateNode = host.updateNode;
+		hostEnqueueEffect = host.enqueueEffect;
+		hostFreedNode = host.freedNode;
+		hostUnwatchedNode = host.unwatchedNode;
+		hostReadSignal = host.readSignal;
+		hostReadComputed = host.readComputed;
+		hostGetSlow = host.getSlow;
+		hostSet = host.set;
+		hostFlush = host.flush;
+		hostRunCleanup = host.runCleanup;
 		// The side columns are NOT presized to capacity: pointer arrays are
 		// traversed by major GC marking, and capacity-sized columns (2M
 		// slots x 5 arrays) put a ~10 ms Mark-Compact tax on every major
 		// collection. Incremental growth costs amortized copying instead,
 		// which measured cheaper everywhere.
 	},
-	update: function updateNode(id, flags): boolean {
+	update: (id, flags) => hostUpdateNode(id, flags),
+	notify: (id) => hostEnqueueEffect(id),
+	freed: (id) => hostFreedNode(id),
+	unwatched: (id) => hostUnwatchedNode(id),
+});
+
+
+// ---- the hot host tier factory (see the entry lets above) --------------------
+function createHost(arena: ReactiveArena) {
+	const M = arena.memory;
+	const D = arena.versions;
+	const link = arena.link;
+	const unlink = arena.unlink;
+	const propagate = arena.propagate;
+	const checkDirty = arena.checkDirty;
+	const shallowPropagate = arena.shallowPropagate;
+
+	function updateNode(id: SignalId, flags: number): boolean {
 		if ((flags & Host.KindMask) === Host.Signal) {
 			return updateSignal(id, flags);
 		}
 		return updateComputed(id, flags);
-	},
+	}
 	// Upstream's notify: queue the effect, then hoist queued ancestors above
 	// it (clearing Watching as the dedup) and reverse the run so outer
 	// effects flush before the children they own. The core already cleared
 	// the entry node's Watching bit before calling here.
-	notify: function enqueueEffect(id): void {
+	function enqueueEffect(id: SignalId): void {
 		let insertIndex = queuedLength;
 		let firstInsertedIndex = insertIndex;
 		let e = id;
@@ -194,12 +240,12 @@ const system = createReactiveSystem({
 			queued[firstInsertedIndex++] = queued[insertIndex];
 			queued[insertIndex] = leftId;
 		}
-	},
+	}
 	// A record went to the free list (explicit free, owner collection, or
 	// sweep): release everything this library holds for the id, or dead
 	// values and closures stay pinned — and traced by every major GC —
 	// until the record is reused.
-	freed: function freedNode(id): void {
+	function freedNode(id: SignalId): void {
 		// A freed record can be recycled after the next sweep. In manual
 		// effect mode the queue outlives writes, so a queued id could
 		// otherwise be reused by an unrelated node before its flush; scrub
@@ -218,9 +264,9 @@ const system = createReactiveSystem({
 		fns[idx] = undefined;
 		cleanups[idx] = undefined;
 		owned[idx] = undefined;
-	},
+	}
 	// Upstream's unwatched, delivered when a node's last subscriber unlinks.
-	unwatched: function unwatchedNode(id): void {
+	function unwatchedNode(id: SignalId): void {
 		const flags = M[id + NodeSlot.Flags];
 		const kind = flags & Host.KindMask;
 		if (kind === Host.Computed) {
@@ -234,125 +280,276 @@ const system = createReactiveSystem({
 		} else if (kind >= Host.Effect) {
 			disposeEffect(id);
 		}
-	},
-});
-
-// ---- update behaviors (upstream index.ts, transliterated) -------------------
-
-function updateSignal(id: SignalId, flags: number): boolean {
-	M[id + NodeSlot.Flags] = (flags & Host.Hidden) | Flag.Mutable;
-	const idx = id >> Arena.NodeIndexShift;
-	return currentVals[idx] !== (currentVals[idx] = pendingVals[idx]);
-}
-
-// `flags` is the caller's already-loaded word: both call sites (the update
-// seam and get's read ladder) have it in hand, and the bits this function
-// keeps (Hidden, HasChildEffect) cannot change under checkDirty.
-function updateComputed(id: SignalId, flags: number, getter?: NodeFn): boolean {
-	if (getter === undefined) {
-		getter = fns[id >> Arena.NodeIndexShift];
-		if (getter === undefined) {
-			return true; // freed mid-walk: treat as changed, the walk moves on
-		}
 	}
-	if (flags & Host.HasChildEffect) {
-		disposeChildEffects(id);
-	}
-	M[id + NodeSlot.DepsTail] = 0;
-	M[id + NodeSlot.Flags] = (flags & Host.Hidden) | Flag.Mutable | Flag.RecursedCheck;
-	const prevSub = activeSub;
-	activeSub = id;
-	++cycle;
-	++M[SysSlot.EnterDepth];
-	const entryVersion = globalVersion;
-	try {
+	function updateSignal(id: SignalId, flags: number): boolean {
+		M[id + NodeSlot.Flags] = (flags & Host.Hidden) | Flag.Mutable;
 		const idx = id >> Arena.NodeIndexShift;
-		const oldValue = currentVals[idx];
-		const changed = oldValue !== (currentVals[idx] = getter(oldValue));
-		// Snapshot the version captured BEFORE the getter ran: a write from
-		// inside it moved globalVersion past entryVersion, so the snapshot
-		// can only miss, never lie. Skipped when the getter throws.
-		D[(id >> Arena.VersionShift) + Arena.VersionOffset] = entryVersion;
-		return changed;
-	} finally {
-		--M[SysSlot.EnterDepth];
-		activeSub = prevSub;
-		M[id + NodeSlot.Flags] &= ~Flag.RecursedCheck;
-		purgeDeps(id);
+		return currentVals[idx] !== (currentVals[idx] = pendingVals[idx]);
 	}
-}
-
-// Re-run an effect the queue delivered (upstream's run).
-function run(id: SignalId, fn: NodeFn): void {
-	const flags = M[id + NodeSlot.Flags];
-	if (
-		flags & Flag.Dirty
-		|| (
-			flags & Flag.Pending
-			&& checkDirty(M[id + NodeSlot.Deps], id)
-		)
-	) {
+	// `flags` is the caller's already-loaded word: both call sites (the update
+	// seam and get's read ladder) have it in hand, and the bits this function
+	// keeps (Hidden, HasChildEffect) cannot change under checkDirty.
+	function updateComputed(id: SignalId, flags: number, getter?: NodeFn): boolean {
+		if (getter === undefined) {
+			getter = fns[id >> Arena.NodeIndexShift];
+			if (getter === undefined) {
+				return true; // freed mid-walk: treat as changed, the walk moves on
+			}
+		}
 		if (flags & Host.HasChildEffect) {
 			disposeChildEffects(id);
 		}
-		const idx = id >> Arena.NodeIndexShift;
-		if (cleanups[idx]) {
-			runCleanup(idx);
-			if (!(M[id + NodeSlot.Flags] & Flag.Live)) {
-				return; // the cleanup disposed this effect
-			}
-		}
 		M[id + NodeSlot.DepsTail] = 0;
-		M[id + NodeSlot.Flags] = (M[id + NodeSlot.Flags] & Host.Hidden) | Flag.Watching | Flag.RecursedCheck;
+		M[id + NodeSlot.Flags] = (flags & Host.Hidden) | Flag.Mutable | Flag.RecursedCheck;
 		const prevSub = activeSub;
 		activeSub = id;
 		++cycle;
 		++M[SysSlot.EnterDepth];
-		++runDepth;
+		const entryVersion = globalVersion;
 		try {
-			cleanups[idx] = fn() as (() => void) | void;
+			const idx = id >> Arena.NodeIndexShift;
+			const oldValue = currentVals[idx];
+			const changed = oldValue !== (currentVals[idx] = getter(oldValue));
+			// Snapshot the version captured BEFORE the getter ran: a write from
+			// inside it moved globalVersion past entryVersion, so the snapshot
+			// can only miss, never lie. Skipped when the getter throws.
+			D[(id >> Arena.VersionShift) + Arena.VersionOffset] = entryVersion;
+			return changed;
 		} finally {
-			--runDepth;
 			--M[SysSlot.EnterDepth];
 			activeSub = prevSub;
 			M[id + NodeSlot.Flags] &= ~Flag.RecursedCheck;
 			purgeDeps(id);
 		}
-	} else if (M[id + NodeSlot.Deps] !== 0) {
-		// Verified clean, not run: re-arm what notify's dedup cleared.
-		M[id + NodeSlot.Flags] = (flags & (Host.Hidden | Host.HasChildEffect)) | Flag.Watching;
 	}
-}
-
-function flush(): void {
-	try {
-		while (notifyIndex < queuedLength) {
-			const id = queued[notifyIndex];
-			queued[notifyIndex++] = 0;
-			// A zeroed entry was scrubbed (freed while queued); a live id
-			// with no callback was disposed while queued.
-			if (id !== 0) {
-				const fn = fns[id >> Arena.NodeIndexShift];
-				if (fn !== undefined) {
-					run(id, fn);
+	// Re-run an effect the queue delivered (upstream's run).
+	function run(id: SignalId, fn: NodeFn): void {
+		const flags = M[id + NodeSlot.Flags];
+		if (
+			flags & Flag.Dirty
+			|| (
+				flags & Flag.Pending
+				&& checkDirty(M[id + NodeSlot.Deps], id)
+			)
+		) {
+			if (flags & Host.HasChildEffect) {
+				disposeChildEffects(id);
+			}
+			const idx = id >> Arena.NodeIndexShift;
+			if (cleanups[idx]) {
+				runCleanup(idx);
+				if (!(M[id + NodeSlot.Flags] & Flag.Live)) {
+					return; // the cleanup disposed this effect
+				}
+			}
+			M[id + NodeSlot.DepsTail] = 0;
+			M[id + NodeSlot.Flags] = (M[id + NodeSlot.Flags] & Host.Hidden) | Flag.Watching | Flag.RecursedCheck;
+			const prevSub = activeSub;
+			activeSub = id;
+			++cycle;
+			++M[SysSlot.EnterDepth];
+			++runDepth;
+			try {
+				cleanups[idx] = fn() as (() => void) | void;
+			} finally {
+				--runDepth;
+				--M[SysSlot.EnterDepth];
+				activeSub = prevSub;
+				M[id + NodeSlot.Flags] &= ~Flag.RecursedCheck;
+				purgeDeps(id);
+			}
+		} else if (M[id + NodeSlot.Deps] !== 0) {
+			// Verified clean, not run: re-arm what notify's dedup cleared.
+			M[id + NodeSlot.Flags] = (flags & (Host.Hidden | Host.HasChildEffect)) | Flag.Watching;
+		}
+	}
+	function flush(): void {
+		try {
+			while (notifyIndex < queuedLength) {
+				const id = queued[notifyIndex];
+				queued[notifyIndex++] = 0;
+				// A zeroed entry was scrubbed (freed while queued); a live id
+				// with no callback was disposed while queued.
+				if (id !== 0) {
+					const fn = fns[id >> Arena.NodeIndexShift];
+					if (fn !== undefined) {
+						run(id, fn);
+					}
+				}
+			}
+		} finally {
+			// Abnormal exit (an effect threw): survivors are re-armed — a change
+			// to THEIR dependencies re-notifies them — but the failed flush does
+			// not resume on unrelated writes (upstream parity).
+			while (notifyIndex < queuedLength) {
+				const id = queued[notifyIndex];
+				queued[notifyIndex++] = 0;
+				if (id !== 0 && fns[id >> Arena.NodeIndexShift] !== undefined) {
+					M[id + NodeSlot.Flags] |= Flag.Watching | Flag.Recursed;
+				}
+			}
+			notifyIndex = 0;
+			queuedLength = 0;
+		}
+	}
+	function runCleanup(idx: number): void {
+		const cleanup = cleanups[idx] as () => void;
+		cleanups[idx] = undefined;
+		const prevSub = activeSub;
+		activeSub = 0;
+		++M[SysSlot.EnterDepth];
+		try {
+			cleanup();
+		} finally {
+			--M[SysSlot.EnterDepth];
+			activeSub = prevSub;
+		}
+	}
+	// Unlink the child effects/scopes a re-running parent created last time:
+	// each unlink empties the child's subscriber list, which delivers
+	// unwatched(), which disposes it. Values and computeds in the walk are left
+	// alone.
+	function disposeChildEffects(sub: SignalId): void {
+		let l: LinkId = M[sub + NodeSlot.DepsTail];
+		while (l !== 0) {
+			const prev: LinkId = M[l + LinkSlot.PrevDep];
+			if ((M[M[l + LinkSlot.Dep] + NodeSlot.Flags] & Host.KindMask) >= Host.Effect) {
+				unlink(l, sub);
+			}
+			l = prev;
+		}
+	}
+	function disposeAllDepsInReverse(sub: SignalId): void {
+		let l: LinkId = M[sub + NodeSlot.DepsTail];
+		while (l !== 0) {
+			const prev: LinkId = M[l + LinkSlot.PrevDep];
+			unlink(l, sub);
+			l = prev;
+		}
+	}
+	// Drop the dependency edges a tracking pass did not re-establish (upstream's
+	// purgeDeps): everything after the pass's depsTail ages out.
+	function purgeDeps(sub: SignalId): void {
+		const depsTail: LinkId = M[sub + NodeSlot.DepsTail];
+		let l: LinkId = depsTail !== 0 ? M[depsTail + LinkSlot.NextDep] : M[sub + NodeSlot.Deps];
+		while (l !== 0) {
+			l = unlink(l, sub);
+		}
+	}
+	function getSlow(id: SignalId, getter?: NodeFn): unknown {
+		const flags = M[id + NodeSlot.Flags];
+		if ((flags & Host.KindMask) === Host.Signal) {
+			if (flags & Flag.Dirty) {
+				// Commit-on-read: a staged write inside an open batch.
+				if (updateSignal(id, flags)) {
+					const subs: LinkId = M[id + NodeSlot.Subs];
+					if (subs !== 0) {
+						shallowPropagate(subs);
+					}
+				}
+			}
+			// A committed signal is current by definition: snapshot so reads hit
+			// the version gate until the next write anywhere.
+			D[(id >> Arena.VersionShift) + Arena.VersionOffset] = globalVersion;
+		} else if (flags & Flag.Dirty) {
+			if (updateComputed(id, flags, getter)) {
+				const subs: LinkId = M[id + NodeSlot.Subs];
+				if (subs !== 0) {
+					shallowPropagate(subs);
+				}
+			}
+		} else if (flags & Flag.Pending) {
+			const entryVersion = globalVersion;
+			if (checkDirty(M[id + NodeSlot.Deps], id)) {
+				if (updateComputed(id, M[id + NodeSlot.Flags], getter)) {
+					const subs: LinkId = M[id + NodeSlot.Subs];
+					if (subs !== 0) {
+						shallowPropagate(subs);
+					}
+				}
+			} else {
+				M[id + NodeSlot.Flags] = flags & ~Flag.Pending;
+				D[(id >> Arena.VersionShift) + Arena.VersionOffset] = entryVersion;
+			}
+		}
+		// A reentrant self-read of a mid-update computed lands here with neither
+		// bit set (the update in progress already cleared them): stale read by
+		// contract.
+		if (activeSub !== 0) {
+			link(id, activeSub, cycle);
+		}
+		return currentVals[id >> Arena.NodeIndexShift];
+	}
+	// Kind-specialized read paths for the callable tier, shaped like the fused
+	// engine's read()/computedRead(): a SIGNAL read is a flags check, a link,
+	// and the value load — the version gate and the read memo exist to make
+	// the kind-dispatching raw get() fast, and putting them on every callable
+	// read is what made the callable tier measure 10-25% over raw (BENCHMARKS
+	// "Write-size crossover matrix"). Verification cost belongs to computeds,
+	// paid per re-verification in readComputed's gate, not per read.
+	function readSignal(id: SignalId): unknown {
+		const flags = M[id + NodeSlot.Flags];
+		if (flags & Flag.Dirty) {
+			// Commit-on-read: a staged write inside an open batch.
+			if (updateSignal(id, flags)) {
+				const subs: LinkId = M[id + NodeSlot.Subs];
+				if (subs !== 0) {
+					shallowPropagate(subs);
 				}
 			}
 		}
-	} finally {
-		// Abnormal exit (an effect threw): survivors are re-armed — a change
-		// to THEIR dependencies re-notifies them — but the failed flush does
-		// not resume on unrelated writes (upstream parity).
-		while (notifyIndex < queuedLength) {
-			const id = queued[notifyIndex];
-			queued[notifyIndex++] = 0;
-			if (id !== 0 && fns[id >> Arena.NodeIndexShift] !== undefined) {
-				M[id + NodeSlot.Flags] |= Flag.Watching | Flag.Recursed;
+		if (activeSub !== 0) {
+			link(id, activeSub, cycle);
+		}
+		return currentVals[id >> Arena.NodeIndexShift];
+	}
+	function readComputed(id: SignalId, getter?: NodeFn): unknown {
+		// The version gate: a snapshot equal to the current globalVersion
+		// proves nothing observed has been written since this node was last
+		// verified.
+		if (D[(id >> Arena.VersionShift) + Arena.VersionOffset] === globalVersion) {
+			if (activeSub !== 0) {
+				link(id, activeSub, cycle);
+			}
+			return currentVals[id >> Arena.NodeIndexShift];
+		}
+		return getSlow(id, getter);
+	}
+	function setHot(id: SignalId, value: unknown): void {
+		const idx = id >> Arena.NodeIndexShift;
+		if (pendingVals[idx] !== (pendingVals[idx] = value)) {
+			M[id + NodeSlot.Flags] = (M[id + NodeSlot.Flags] & Host.Hidden) | Flag.Mutable | Flag.Dirty;
+			// Every committed write invalidates the version snapshots.
+			++globalVersion;
+			const subs: LinkId = M[id + NodeSlot.Subs];
+			if (subs !== 0) {
+				propagate(subs, runDepth !== 0);
+				if (!manualEffects && !batchDepth) {
+					flush();
+				}
 			}
 		}
-		notifyIndex = 0;
-		queuedLength = 0;
 	}
+
+	return {
+		updateNode,
+		enqueueEffect,
+		freedNode,
+		unwatchedNode,
+		readSignal,
+		readComputed,
+		getSlow,
+		set: setHot,
+		flush,
+		runCleanup,
+	};
 }
+
+// ---- update behaviors (upstream index.ts, transliterated) -------------------
+
+
+
+
 
 /** Immediately run every queued effect. Throws inside an open batch. */
 export function flushEffects(): void {
@@ -360,7 +557,7 @@ export function flushEffects(): void {
 		throw new Error('dalien-signals: cannot flush effects inside an open batch');
 	}
 	if (!notifyIndex) {
-		flush();
+		hostFlush();
 	}
 }
 
@@ -373,60 +570,16 @@ export function setEffectMode(mode: 'sync' | 'manual'): 'sync' | 'manual' {
 	const previous = manualEffects ? 'manual' : 'sync';
 	manualEffects = mode === 'manual';
 	if (!manualEffects && !batchDepth && !notifyIndex) {
-		flush();
+		hostFlush();
 	}
 	return previous;
 }
 
 // ---- teardown helpers --------------------------------------------------------
 
-function runCleanup(idx: number): void {
-	const cleanup = cleanups[idx] as () => void;
-	cleanups[idx] = undefined;
-	const prevSub = activeSub;
-	activeSub = 0;
-	++M[SysSlot.EnterDepth];
-	try {
-		cleanup();
-	} finally {
-		--M[SysSlot.EnterDepth];
-		activeSub = prevSub;
-	}
-}
 
-// Unlink the child effects/scopes a re-running parent created last time:
-// each unlink empties the child's subscriber list, which delivers
-// unwatched(), which disposes it. Values and computeds in the walk are left
-// alone.
-function disposeChildEffects(sub: SignalId): void {
-	let l: LinkId = M[sub + NodeSlot.DepsTail];
-	while (l !== 0) {
-		const prev: LinkId = M[l + LinkSlot.PrevDep];
-		if ((M[M[l + LinkSlot.Dep] + NodeSlot.Flags] & Host.KindMask) >= Host.Effect) {
-			unlink(l, sub);
-		}
-		l = prev;
-	}
-}
 
-function disposeAllDepsInReverse(sub: SignalId): void {
-	let l: LinkId = M[sub + NodeSlot.DepsTail];
-	while (l !== 0) {
-		const prev: LinkId = M[l + LinkSlot.PrevDep];
-		unlink(l, sub);
-		l = prev;
-	}
-}
 
-// Drop the dependency edges a tracking pass did not re-establish (upstream's
-// purgeDeps): everything after the pass's depsTail ages out.
-function purgeDeps(sub: SignalId): void {
-	const depsTail: LinkId = M[sub + NodeSlot.DepsTail];
-	let l: LinkId = depsTail !== 0 ? M[depsTail + LinkSlot.NextDep] : M[sub + NodeSlot.Deps];
-	while (l !== 0) {
-		l = unlink(l, sub);
-	}
-}
 
 // The effect/scope teardown (upstream's effectOper + effectScopeOper), shared
 // by dispose() and unwatched() delivery. The graph teardown itself — deps
@@ -444,7 +597,7 @@ function disposeEffect(id: SignalId): void {
 	fns[idx] = undefined;
 	freeNode(id, M[id + NodeSlot.Gen]);
 	if (cleanups[idx]) {
-		runCleanup(idx);
+		hostRunCleanup(idx);
 	}
 	const region = owned[idx];
 	if (region !== undefined) {
@@ -588,7 +741,7 @@ export function startBatch(): void {
 /** Close a batch, flushing effects when the outermost batch closes. */
 export function endBatch(): void {
 	if (!--batchDepth && !manualEffects) {
-		flush();
+		hostFlush();
 	}
 }
 
@@ -661,69 +814,13 @@ export function get<T>(id: SignalIdOf<T>): T {
 		}
 		return currentVals[id >> Arena.NodeIndexShift] as T;
 	}
-	return getSlow(id) as T;
+	return hostGetSlow(id) as T;
 }
 
-function getSlow(id: SignalId, getter?: NodeFn): unknown {
-	const flags = M[id + NodeSlot.Flags];
-	if ((flags & Host.KindMask) === Host.Signal) {
-		if (flags & Flag.Dirty) {
-			// Commit-on-read: a staged write inside an open batch.
-			if (updateSignal(id, flags)) {
-				const subs: LinkId = M[id + NodeSlot.Subs];
-				if (subs !== 0) {
-					shallowPropagate(subs);
-				}
-			}
-		}
-		// A committed signal is current by definition: snapshot so reads hit
-		// the version gate until the next write anywhere.
-		D[(id >> Arena.VersionShift) + Arena.VersionOffset] = globalVersion;
-	} else if (flags & Flag.Dirty) {
-		if (updateComputed(id, flags, getter)) {
-			const subs: LinkId = M[id + NodeSlot.Subs];
-			if (subs !== 0) {
-				shallowPropagate(subs);
-			}
-		}
-	} else if (flags & Flag.Pending) {
-		const entryVersion = globalVersion;
-		if (checkDirty(M[id + NodeSlot.Deps], id)) {
-			if (updateComputed(id, M[id + NodeSlot.Flags], getter)) {
-				const subs: LinkId = M[id + NodeSlot.Subs];
-				if (subs !== 0) {
-					shallowPropagate(subs);
-				}
-			}
-		} else {
-			M[id + NodeSlot.Flags] = flags & ~Flag.Pending;
-			D[(id >> Arena.VersionShift) + Arena.VersionOffset] = entryVersion;
-		}
-	}
-	// A reentrant self-read of a mid-update computed lands here with neither
-	// bit set (the update in progress already cleared them): stale read by
-	// contract.
-	if (activeSub !== 0) {
-		link(id, activeSub, cycle);
-	}
-	return currentVals[id >> Arena.NodeIndexShift];
-}
 
 /** Write a signal by handle. Equal values (Object.is-style ===) are ignored. */
 export function set<T>(id: SignalIdOf<T>, value: T): void {
-	const idx = id >> Arena.NodeIndexShift;
-	if (pendingVals[idx] !== (pendingVals[idx] = value)) {
-		M[id + NodeSlot.Flags] = (M[id + NodeSlot.Flags] & Host.Hidden) | Flag.Mutable | Flag.Dirty;
-		// Every committed write invalidates the version snapshots.
-		++globalVersion;
-		const subs: LinkId = M[id + NodeSlot.Subs];
-		if (subs !== 0) {
-			propagate(subs, runDepth !== 0);
-			if (!manualEffects && !batchDepth) {
-				flush();
-			}
-		}
-	}
+	hostSet(id, value);
 }
 
 /**
@@ -918,51 +1015,16 @@ export type EffectStop = () => void;
  * count();   // 1
  * ```
  */
-// Kind-specialized read paths for the callable tier, shaped like the fused
-// engine's read()/computedRead(): a SIGNAL read is a flags check, a link,
-// and the value load — the version gate and the read memo exist to make
-// the kind-dispatching raw get() fast, and putting them on every callable
-// read is what made the callable tier measure 10-25% over raw (BENCHMARKS
-// "Write-size crossover matrix"). Verification cost belongs to computeds,
-// paid per re-verification in readComputed's gate, not per read.
-function readSignal(id: SignalId): unknown {
-	const flags = M[id + NodeSlot.Flags];
-	if (flags & Flag.Dirty) {
-		// Commit-on-read: a staged write inside an open batch.
-		if (updateSignal(id, flags)) {
-			const subs: LinkId = M[id + NodeSlot.Subs];
-			if (subs !== 0) {
-				shallowPropagate(subs);
-			}
-		}
-	}
-	if (activeSub !== 0) {
-		link(id, activeSub, cycle);
-	}
-	return currentVals[id >> Arena.NodeIndexShift];
-}
 
-function readComputed(id: SignalId, getter?: NodeFn): unknown {
-	// The version gate: a snapshot equal to the current globalVersion
-	// proves nothing observed has been written since this node was last
-	// verified.
-	if (D[(id >> Arena.VersionShift) + Arena.VersionOffset] === globalVersion) {
-		if (activeSub !== 0) {
-			link(id, activeSub, cycle);
-		}
-		return currentVals[id >> Arena.NodeIndexShift];
-	}
-	return getSlow(id, getter);
-}
 
 export function signal<T>(): WriteableSignal<T | undefined>;
 export function signal<T>(initialValue: T): WriteableSignal<T>;
 export function signal<T>(initialValue?: T): WriteableSignal<T | undefined> {
 	const oper = (...value: [T?]) => {
 		if (value.length) {
-			set(id, value[0] as T);
+			hostSet(id, value[0] as T);
 		} else {
-			return readSignal(id);
+			return hostReadSignal(id);
 		}
 	};
 	const id = signalId(initialValue, oper);
@@ -981,7 +1043,7 @@ export function signal<T>(initialValue?: T): WriteableSignal<T | undefined> {
  * ```
  */
 export function computed<T>(getter: (previousValue?: T) => T): ReadableSignal<T> {
-	const oper = () => readComputed(id, getter as NodeFn) as T;
+	const oper = () => hostReadComputed(id, getter as NodeFn) as T;
 	const id = computedId(getter, oper);
 	return oper as ReadableSignal<T>;
 }
@@ -1073,7 +1135,7 @@ export function trigger(fn: () => void): void {
 			freeNode(id, M[id + NodeSlot.Gen]);
 		}
 		if (!--batchDepth && !manualEffects) {
-			flush();
+			hostFlush();
 		}
 	}
 }
