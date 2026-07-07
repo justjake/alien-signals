@@ -12,30 +12,26 @@
 				<h1>dalien-signals</h1>
 				<p class="lede">
 					A <em>signal</em> is a value that remembers who read it. When it
-					changes, everything computed from it — and nothing else — updates.
-					There is no explicit subscription step and no re-rendering pass:
-					the dependency graph assembles itself while code runs, and a
-					write touches exactly the part of it that could have changed.
-					This page explains how
+					changes, everything computed from it — and nothing else —
+					updates. There is no subscription step and no re-rendering pass:
+					the dependency graph assembles itself while code runs.
 					<a href="https://github.com/justjake/dalien-signals">dalien-signals</a>
-					does that, with the real engine running in every demo.
+					stores that graph in a single <code>Int32Array</code>; every demo
+					below runs the production build.
 				</p>
 			</header>
 
 			<section>
 				<h2>Demo: a 20,000-node graph</h2>
 				<p>
-					The field below is one reactive graph: the top row of pixels is
-					<code>signal</code>s, and every pixel under it is a
-					<code>computed</code> blending the three cells above. About twenty
-					thousand nodes. The drifting emitters write a handful of signals
-					per frame, and everything downstream updates by itself. Drag
-					across the field to write signals directly. The pale shimmer
-					marks the cells that actually recomputed: a change flows down a
-					widening cone of dependents, and the rest of the graph is not
-					touched at all. The library selector rebuilds the same graph on
-					other signal implementations for comparison — the page itself
-					keeps running on dalien-signals.
+					The top row of pixels is <code>signal</code>s; every pixel below
+					is a <code>computed</code> blending the three cells above —
+					about twenty thousand nodes. The emitters write a few signals per
+					frame; drag to write directly (right button writes darkness).
+					The pale shimmer marks cells that actually recomputed: a change
+					flows down a cone of dependents and the rest of the graph is not
+					touched. The selector rebuilds the same graph on other signal
+					libraries for comparison.
 				</p>
 				<canvas id="grid"></canvas>
 				<section id="hud">
@@ -67,25 +63,24 @@
 					Two of the controls illustrate specific mechanisms.
 					<em>Equality cutoff</em>: each cell rounds its output to a coarse
 					step, so as a ripple fades, cells begin producing the
-					<em>same</em> value they held before, and the cascade stops at
-					that point. Disabling it makes the recompute cones visibly
-					taller. <em>Invalidate everything</em> writes one signal that
-					every cell reads, forcing all twenty thousand nodes to recompute
-					in a single frame; the timer reports the cost of a full-graph
-					pass, a cost the design avoids in normal operation.
+					<em>same</em> value they held before, and the cascade stops
+					there. Disabling it makes the cones visibly taller.
+					<em>Invalidate everything</em> writes a signal every cell reads,
+					recomputing all twenty thousand nodes in one frame; the timer
+					reports the cost of a full pass.
 				</p>
 			</section>
 
 			<section>
 				<h2>The three primitives</h2>
 				<p>
-					Everything above is built from three functions. A
-					<code>signal</code> stores a value: call it with no argument to
-					read, with an argument to write. A <code>computed</code> derives a
-					cached value from whatever signals and computeds its function
-					reads. An <code>effect</code> runs a function now, and again
-					whenever a value it read changes; rendering, logging, and other
-					side effects belong there.
+					A <code>signal</code> stores a value — call it with no argument
+					to read, with an argument to write. A <code>computed</code>
+					derives and caches a value from the signals and computeds its
+					function reads. An <code>effect</code> runs a function now, then
+					again when a value it read changes. Dependencies are automatic:
+					while a computed or effect runs, the library records every value
+					it reads.
 				</p>
 				<pre><code>import { signal, computed, effect } from "dalien-signals";
 
@@ -97,15 +92,13 @@ effect(() =&gt; console.log(doubled(), isEven()));
 count(2); // logs: 4 true</code></pre>
 				<div id="w-counter"></div>
 				<p>
-					Stepping from 1 to 3 shows the update rule precisely: the run
-					counter's effect reads both computeds, but it re-runs only when
-					one of them produces a <em>new</em> value. <code>doubled</code>
-					changed; <code>even?</code> evaluated to <code>no</code> again,
-					the same answer as before, so nothing that depends only on
-					<code>even?</code> was disturbed. This is equality cutoff — the
-					same rule that stops the ripples in the field above. Note that no
-					relationship was declared anywhere: reading inside a computed or
-					effect <em>is</em> the subscription.
+					Stepping from 1 to 3: the run counter's effect reads both
+					computeds but re-runs only when one produces a <em>new</em>
+					value. <code>doubled</code> changed; <code>even?</code> was
+					<code>no</code> before and after, so nothing downstream of it
+					was disturbed — equality cutoff, the same rule that stops the
+					field's ripples. Reading inside a computed or effect <em>is</em>
+					the subscription.
 				</p>
 			</section>
 
@@ -144,13 +137,11 @@ count(2); // logs: 4 true</code></pre>
 					</li>
 				</ol>
 				<p>
-					The model below — two signals feeding a subtotal, a total, and
-					one effect — narrates each operation and draws its graph live.
-					The batch button issues two writes that produce a single effect
-					run; writing an unchanged value produces no work at all.
-					Disposing the effect removes the computeds' last subscribers, and
-					they drop their own dependency edges in turn: an unwatched
-					computed keeps no bookkeeping that nothing will ask about.
+					Below, two signals feed a subtotal, a total, and one effect; each
+					button narrates the operation it performs. A batch coalesces two
+					writes into one effect run; an unchanged write produces no work;
+					disposing the effect makes the computeds drop their own edges —
+					an unwatched computed keeps no bookkeeping.
 				</p>
 				<div id="w-stepper"></div>
 			</section>
@@ -158,13 +149,12 @@ count(2); // logs: 4 true</code></pre>
 			<section>
 				<h2>Memory layout: eight integers per node</h2>
 				<p>
-					This is where dalien-signals departs from most implementations.
-					Signal libraries typically allocate an object per node, wired with
-					object references; the garbage collector then traces that web on
-					every collection. dalien-signals stores the whole graph in
-					<em>one</em> <code>Int32Array</code> — an arena — carved into
-					32-byte records of eight <code>int32</code> slots. A "node" is
-					just the index where its record starts:
+					Signal libraries typically allocate an object per node, wired
+					with references the garbage collector traces on every
+					collection. dalien-signals stores the whole graph in one
+					<code>Int32Array</code> — an arena of 32-byte records, eight
+					<code>int32</code> slots each. A node is the index where its
+					record starts:
 				</p>
 				<dl class="slots">
 					<div><dt>0 · Flags</dt><dd>kind tag + state bits: Mutable, Watching, Dirty, Pending, …</dd></div>
@@ -176,29 +166,25 @@ count(2); // logs: 4 true</code></pre>
 					<div><dt>6+7 · Version</dt><dd>one float64 (via a shared-buffer view): "verified as of global version N"</dd></div>
 				</dl>
 				<p>
-					Edges are records in the same array: a <em>link</em> record names a
-					dependency, a subscriber, and the four neighbors that thread it
-					into both of their lists. "Walking the subscriber list" means
-					following integers from slot to slot — no pointer chasing across
-					the heap, no objects for the collector to trace, and neighboring
-					records share cache lines. The tables in the demos above and below
-					are not illustrations: they are that array, decoded row by row,
-					with the cells that changed on your last action highlighted.
+					Edges are records in the same array: a <em>link</em> record names
+					a dependency, a subscriber, and the four neighbors threading it
+					into both lists. Walking a list means following integers from
+					slot to slot — nothing for the collector to trace, and adjacent
+					records share cache lines. The memory tables on this page are
+					that array decoded row by row; amber cells changed on the last
+					action.
 				</p>
 			</section>
 
 			<section>
 				<h2>Example: Spreadsheet</h2>
 				<p>
-					The spreadsheet below is built on the same engine. Each cell is a
-					signal (the typed text) plus a
-					computed (what it evaluates to). Formulas start with
-					<code>=</code> and are plain JavaScript with one extra function:
-					<code>GET('A:1')</code> reads another cell. Because the formula
-					runs inside the cell's computed, every <code>GET</code> records a
-					real dependency edge in the arena. Editing a formula rewires
-					those edges; the memory view below shows link records appearing
-					and aging out as it happens.
+					Each cell is a signal (the typed text) plus a computed (its
+					value). Formulas start with <code>=</code> and are plain
+					JavaScript; <code>GET('A:1')</code> reads another cell. The
+					formula runs inside the cell's computed, so every
+					<code>GET</code> records a real dependency edge — edit a formula
+					and the memory view shows link records appearing and aging out.
 				</p>
 				<div id="w-sheet"></div>
 			</section>
@@ -206,25 +192,20 @@ count(2); // logs: 4 true</code></pre>
 			<section>
 				<h2>Benchmarks, in this tab</h2>
 				<p>
-					The same four libraries from the selector, on four workloads
-					shaped like the demos above: bulk creation, a deep chain, a wide
-					fan-out, and the field's cone grid. These run in your browser on
-					your machine — one round each, so treat them as indicative;
-					published numbers come from the repository's CI, which runs
-					interleaved rounds in isolated processes and reports medians.
+					Four workloads — bulk creation, a deep chain, a wide fan-out,
+					the field's cone grid — across the selector's four libraries,
+					one round each in this tab. Indicative only; published numbers
+					come from CI (interleaved rounds, isolated processes, medians).
 				</p>
 				<div id="w-bench"></div>
 			</section>
 
 			<footer>
 				<p>
-					The engine on this page is the production build, unmodified.
-					The
-					<a href="https://github.com/justjake/dalien-signals">source and full README</a>
-					and the
-					<a href="https://github.com/justjake/dalien-signals/blob/dalien-signals/BENCHMARKS.md">benchmark methodology</a>
-					cover the details. The page's own HUD, controls, and widgets are
-					themselves driven by signals and effects.
+					<a href="https://github.com/justjake/dalien-signals">Source and README</a> ·
+					<a href="https://github.com/justjake/dalien-signals/blob/dalien-signals/BENCHMARKS.md">benchmark methodology</a>.
+					The page's own HUD, controls, and widgets are driven by signals
+					and effects.
 				</p>
 			</footer>
 		</main>
