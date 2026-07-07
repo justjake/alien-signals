@@ -218,7 +218,6 @@ const system = createReactiveSystem({
 		fns[idx] = undefined;
 		cleanups[idx] = undefined;
 		owned[idx] = undefined;
-		memoId = -1;
 	},
 	// Upstream's unwatched, delivered when a node's last subscriber unlinks.
 	unwatched: function unwatchedNode(id): void {
@@ -235,7 +234,6 @@ const system = createReactiveSystem({
 		} else if (kind >= Host.Effect) {
 			disposeEffect(id);
 		}
-		memoId = -1; // freed or unwatched: the read memo may name this record
 	},
 });
 
@@ -265,7 +263,6 @@ function updateComputed(id: SignalId, flags: number, getter?: NodeFn): boolean {
 	const prevSub = activeSub;
 	activeSub = id;
 	++cycle;
-	memoId = -1; // a new tracking pass must re-link: no reads may memo across it
 	++M[SysSlot.EnterDepth];
 	const entryVersion = globalVersion;
 	try {
@@ -310,7 +307,6 @@ function run(id: SignalId, fn: NodeFn): void {
 		const prevSub = activeSub;
 		activeSub = id;
 		++cycle;
-		memoId = -1;
 		++M[SysSlot.EnterDepth];
 		++runDepth;
 		try {
@@ -446,7 +442,6 @@ function disposeEffect(id: SignalId): void {
 		return; // already disposed
 	}
 	fns[idx] = undefined;
-	memoId = -1; // freed records recycle their ids; the memo must not
 	freeNode(id, M[id + NodeSlot.Gen]);
 	if (cleanups[idx]) {
 		runCleanup(idx);
@@ -471,7 +466,6 @@ let regionFlushScheduled = false;
 
 function freePendingRegions(): void {
 	regionFlushScheduled = false;
-	memoId = -1;
 	for (let r = 0; r < pendingRegions.length; r++) {
 		const region = pendingRegions[r];
 		for (let i = 0; i < region.length; i += 2) {
@@ -557,7 +551,6 @@ export function reset(): void {
 	queuedLength = 0;
 	activeSub = 0;
 	currentScope = 0;
-	memoId = -1;
 	batchDepth = 0;
 	runDepth = 0;
 	triggerScratch = 0;
@@ -653,39 +646,22 @@ export function signalId<T>(initialValue?: T, owner?: WeakKey): SignalIdOf<T | u
  * Read a signal or computed by handle, tracking it as a dependency of the
  * active subscriber.
  */
-let memoId = -1;
-let memoSub: SignalId = -1 as SignalId;
-let memoVal: unknown;
 
 export function get<T>(id: SignalIdOf<T>): T {
-	// This head must stay TINY: it is the entire cost of a repeated read,
-	// and it has to inline through the callable opers into user getters —
-	// V8 rejects candidates once a hot compile's cumulative inlined size
-	// is spent, and the read path loses exactly those races when it is one
-	// big function (measured: the callable API carried a 10-25% wrapper
-	// tax purely from get() at 184 bytecodes failing to inline). The memo
-	// key is (id, sub) only; every ++globalVersion / ++cycle site clears
-	// memoId instead of the read comparing them.
-	if (id === memoId && activeSub === memoSub) {
-		return memoVal as T;
-	}
-	return getFresh(id) as T;
-}
-
-function getFresh(id: SignalId): unknown {
 	// The version gate: a snapshot equal to the current globalVersion proves
 	// nothing observed has been written since this node was last verified.
+	// (The one-entry read memo that used to sit in front of this gate was
+	// deleted when the callable tier stopped using it: the kind-specialized
+	// opers never consult it, the suite holds alien-parity on repeated-read
+	// cells without it, and its invalidation stores taxed every write and
+	// every recompute bracket.)
 	if (D[(id >> Arena.VersionShift) + Arena.VersionOffset] === globalVersion) {
 		if (activeSub !== 0) {
 			link(id, activeSub, cycle);
 		}
-		const value = currentVals[id >> Arena.NodeIndexShift];
-		memoId = id;
-		memoSub = activeSub;
-		memoVal = value;
-		return value;
+		return currentVals[id >> Arena.NodeIndexShift] as T;
 	}
-	return getSlow(id);
+	return getSlow(id) as T;
 }
 
 function getSlow(id: SignalId, getter?: NodeFn): unknown {
@@ -740,7 +716,6 @@ export function set<T>(id: SignalIdOf<T>, value: T): void {
 		M[id + NodeSlot.Flags] = (M[id + NodeSlot.Flags] & Host.Hidden) | Flag.Mutable | Flag.Dirty;
 		// Every committed write invalidates the version snapshots.
 		++globalVersion;
-		memoId = -1;
 		const subs: LinkId = M[id + NodeSlot.Subs];
 		if (subs !== 0) {
 			propagate(subs, runDepth !== 0);
@@ -865,7 +840,6 @@ export function dispose(id: SignalId): void {
 		disposeEffect(id);
 	} else {
 		fns[id >> Arena.NodeIndexShift] = undefined;
-		memoId = -1;
 		freeNode(id, M[id + NodeSlot.Gen]);
 	}
 }
@@ -1081,7 +1055,6 @@ export function trigger(fn: () => void): void {
 		activeSub = prevSub;
 		M[id + NodeSlot.Flags] &= Host.Hidden;
 		++globalVersion;
-		memoId = -1;
 		let l: LinkId = M[id + NodeSlot.Deps];
 		while (l !== 0) {
 			const dep: SignalId = M[l + LinkSlot.Dep];
