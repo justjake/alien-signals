@@ -912,23 +912,21 @@ export function computedOwner<T, R extends WeakKey>(getter: (previousValue?: T) 
 export interface WriteableSignal<T> {
 	(): T;
 	(value: T): void;
-	/** The underlying record id, for mixing with the raw tier. */
-	readonly id: SignalIdOf<T>;
 }
 
 /** A cached derived value: call to read. */
 export interface ReadableSignal<T> {
 	(): T;
-	/** The underlying record id, for mixing with the raw tier. */
-	readonly id: SignalIdOf<T>;
 }
 
 /** Stops its effect (or effect scope) when called. */
-export interface EffectStop {
-	(): void;
-	/** The underlying record id, for mixing with the raw tier. */
-	readonly id: SignalId;
-}
+export type EffectStop = () => void;
+
+// The callables deliberately carry NO id property: one property store on a
+// fresh closure is a map transition, measured at ~30ns of the ~50ns mint —
+// it alone held createSignals at 1.5x the fused engine. Workflows that
+// want record ids use the raw tier creators (signalId/computedId/effectId/
+// effectScopeId), which return the id itself.
 
 /**
  * Create a reactive value (leak-free default: the returned callable owns
@@ -990,7 +988,6 @@ export function signal<T>(initialValue?: T): WriteableSignal<T | undefined> {
 		}
 	};
 	const id = signalId(initialValue, oper);
-	(oper as { id?: SignalIdOf<T | undefined> }).id = id;
 	return oper as WriteableSignal<T | undefined>;
 }
 
@@ -1008,7 +1005,6 @@ export function signal<T>(initialValue?: T): WriteableSignal<T | undefined> {
 export function computed<T>(getter: (previousValue?: T) => T): ReadableSignal<T> {
 	const oper = () => readComputed(id, getter as NodeFn) as T;
 	const id = computedId(getter, oper);
-	(oper as { id?: SignalIdOf<T> }).id = id;
 	return oper as ReadableSignal<T>;
 }
 
@@ -1020,11 +1016,9 @@ export function computed<T>(getter: (previousValue?: T) => T): ReadableSignal<T>
  */
 export function effect(fn: () => void | (() => void)): EffectStop {
 	const id = effectId(fn);
-	const stop = () => {
+	return () => {
 		dispose(id);
 	};
-	(stop as { id?: SignalId }).id = id;
-	return stop as EffectStop;
 }
 
 /**
@@ -1034,11 +1028,9 @@ export function effect(fn: () => void | (() => void)): EffectStop {
  */
 export function effectScope(fn: () => void): EffectStop {
 	const id = effectScopeId(fn);
-	const stop = () => {
+	return () => {
 		dispose(id);
 	};
-	(stop as { id?: SignalId }).id = id;
-	return stop as EffectStop;
 }
 
 function noopEffectBody(): void {}

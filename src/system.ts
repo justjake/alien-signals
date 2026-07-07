@@ -407,8 +407,9 @@ export interface ReactiveSystem {
 	createNode(owner: WeakKey, hostBits?: number): SignalId;
 	/**
 	 * Tie an ALREADY-MINTED node's lifetime to `owner`, as createNode does
-	 * at mint. For hosts whose owner object needs the id to exist first
-	 * (e.g. a callable bound to the id): allocNode, build the owner, adopt.
+	 * at mint (same deferred registration). For hosts whose owner object
+	 * needs the id to exist first (a callable closing over it): allocNode,
+	 * build the owner, adopt.
 	 */
 	adoptNode(owner: WeakKey, id: SignalId): void;
 	/**
