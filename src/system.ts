@@ -776,6 +776,24 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 	// before its registration lands.
 	let pendingRegister: unknown[] = [];
 
+	// The deferral is bounded: past this many queued pairs the queue drains
+	// inline. Unbounded, a 100k-mint burst holds every owner STRONGLY until
+	// the next microtask — a GC inside the burst (or right after it, as
+	// benchmark harnesses do) traces and promotes the lot, and none of it
+	// can be collected however dead it is. Bounded, at most ~8k owners are
+	// pinned, and the register cost amortizes to the same per-mint price.
+	// Measured on milomg createSignals: 18.5ms unbounded -> 7.7ms bounded
+	// (fused main: 9.1ms).
+	const REGISTER_DRAIN_THRESHOLD = 16384;
+
+	function drainPendingRegister(): void {
+		const registry = shared.registry!;
+		for (let i = 0; i < pendingRegister.length; i += 2) {
+			registry.register(pendingRegister[i] as WeakKey, pendingRegister[i + 1] as SignalId);
+		}
+		pendingRegister.length = 0;
+	}
+
 	// Grow-by-migration: allocate an arena twice the current capacity, copy the
 	// live prefix (ids are arena-relative offsets, so every id survives
 	// verbatim), build the next engine generation over the new `const M` —
@@ -820,11 +838,7 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 	function runMaintenance(): void {
 		maintenanceScheduled = false;
 		if (pendingRegister.length !== 0) {
-			const registry = shared.registry!;
-			for (let i = 0; i < pendingRegister.length; i += 2) {
-				registry.register(pendingRegister[i] as WeakKey, pendingRegister[i + 1] as SignalId);
-			}
-			pendingRegister.length = 0;
+			drainPendingRegister();
 		}
 		const engine = shared.inner;
 		if (engine === undefined || engine.busy()) {
@@ -916,6 +930,9 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 			engine.maybeBoundary();
 			const id = engine.allocNode(hostBits ?? 0);
 			pendingRegister.push(owner, id);
+			if (pendingRegister.length >= REGISTER_DRAIN_THRESHOLD) {
+				drainPendingRegister();
+			}
 			scheduleMaintenance();
 			return id;
 		},
@@ -926,6 +943,9 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 		},
 		adoptNode(owner: WeakKey, id: SignalId): void {
 			pendingRegister.push(owner, id);
+			if (pendingRegister.length >= REGISTER_DRAIN_THRESHOLD) {
+				drainPendingRegister();
+			}
 			scheduleMaintenance();
 		},
 		disposeNode(id: SignalId, gen?: SignalGen): void {
