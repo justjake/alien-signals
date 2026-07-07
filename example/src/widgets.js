@@ -51,7 +51,15 @@ function makeRecordsView(container, world, tickRead) {
 		const { M } = world.arena();
 		const live = touchedRecords(M);
 		const snap = new Int32Array(live.length * 8);
-		let html = `<table><thead><tr><th>id</th><th colspan="8">the record's eight int32 slots</th><th>decoded</th></tr></thead><tbody>`;
+		// Two label rows: node records and link records give the same eight
+		// slots different meanings, so each column is named twice, color-
+		// keyed to the row kinds below.
+		let html = `<table><thead>
+			<tr><th rowspan="2">id</th>
+				<th class="nh">Flags</th><th class="nh">Deps</th><th class="nh">DepsTail</th><th class="nh">Subs</th><th class="nh">SubsTail</th><th class="nh">Gen</th><th class="nh" colspan="2">Version (f64)</th>
+				<th rowspan="2">decoded</th></tr>
+			<tr><th class="lh">Version</th><th class="lh">Dep</th><th class="lh">Sub</th><th class="lh">PrevSub</th><th class="lh">NextSub</th><th class="lh">PrevDep</th><th class="lh">NextDep</th><th class="lh">—</th></tr>
+		</thead><tbody>`;
 		for (let n = 0; n < live.length; n++) {
 			const id = live[n];
 			let cells = '';

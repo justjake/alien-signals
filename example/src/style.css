@@ -100,3 +100,7 @@ section > p { max-width: 72ch; color: #b7bdcc; }
 .records tr.freed { opacity: 0.45; }
 .records tr.selected { outline: 1px solid #7fd4ff; }
 .records td.changed { background: #4a3a12; color: #ffd479; }
+
+.records thead th { position: sticky; top: 0; background: #10131c; font-weight: 500; }
+.records thead .nh { color: #b48bff; }
+.records thead .lh { color: #6fdc9c; font-size: 10px; }
