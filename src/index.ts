@@ -689,21 +689,14 @@ function getSlow(id: SignalId): unknown {
 export function set<T>(id: SignalIdOf<T>, value: T): void {
 	const idx = id >> Arena.NodeIndexShift;
 	if (pendingVals[idx] !== (pendingVals[idx] = value)) {
-		const flags = M[id + NodeSlot.Flags];
-		M[id + NodeSlot.Flags] = (flags & Host.Hidden) | Flag.Mutable | Flag.Dirty;
+		M[id + NodeSlot.Flags] = (M[id + NodeSlot.Flags] & Host.Hidden) | Flag.Mutable | Flag.Dirty;
 		// Every committed write invalidates the version snapshots.
 		++globalVersion;
-		// Still Dirty from an earlier staged write? Then nothing has read
-		// this signal since its wave went out (reads commit and clear
-		// Dirty), so no subscriber changed and the downstream is already
-		// Pending — re-propagating would be a provable no-op walk.
-		if (!(flags & Flag.Dirty)) {
-			const subs: LinkId = M[id + NodeSlot.Subs];
-			if (subs !== 0) {
-				propagate(subs, runDepth !== 0);
-				if (!batchDepth) {
-					flush();
-				}
+		const subs: LinkId = M[id + NodeSlot.Subs];
+		if (subs !== 0) {
+			propagate(subs, runDepth !== 0);
+			if (!batchDepth) {
+				flush();
 			}
 		}
 	}
