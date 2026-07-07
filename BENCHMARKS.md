@@ -41,11 +41,27 @@ unstable 1.11. createSignals sits at main-parity (1.01) after the
 bounded-deferral fix. Against upstream alien the same run gives 1.014
 (main: 1.043) — alien-parity with a leak-free default API.
 
-Remaining gap: sustained recompute microkernels (deep-chain probe ~1.08
-vs main; crossover kernel families ~1.10-1.15) — a ~1.3ns/recompute
-constant with no single owner (D stamp and purge each measured <=0.4ns;
-EnterDepth/seam/trampoline candidates are individually below probe
-resolution).
+Remaining gap: sustained recompute microkernels — deep-chain probe ~1.08
+vs main, crossover matrix 1.18 geomean (uniform across families and
+sizes). Exhaustively bisected; every nameable mechanism measured at zero:
+
+- D stamp, purgeDeps, EnterDepth RMWs, set()'s memo-clear+version bump —
+  nulled individually in built artifacts, each <=0.4ns/recompute.
+- Host-side link dedup (linkHot) — no change; the seam call was already
+  monomorphic and cheap.
+- Batch path — identical 40ns/write gap batched and unbatched.
+- Function-context specialization (main's const-M embedding, its own
+  docs price despecialization at 1.1-1.2x — our exact gap) — isolated
+  probe shows module-let and single-closure-const typed-array access
+  DEAD EVEN on this V8, memory-bound and L1-resident both.
+- Module-boundary fusion — a single-scope esbuild bundle of the split
+  library measures identical to the two-module build.
+- The raw id tier (no opers at all) also sits at ~1.15 vs main: the
+  residual is below the API layer, between the split core+host and the
+  fused engine, and is not attributable to any op we can name from
+  source. Closing it likely means either V8 machine-code archaeology or
+  abandoning the upstream-split architecture — a scope decision, not an
+  optimization.
 
 Goal under test: be 20% faster than upstream alien-signals v3 on the milomg
 reactivity benchmark (geomean of per-test medians ≤ 0.80), with a basic
