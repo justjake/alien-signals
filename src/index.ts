@@ -53,11 +53,12 @@ const enum Host {
 }
 
 /**
- * A signal or computed handle: the node's arena id, with a phantom type
- * parameter carrying the value type through get/set. It is just a number.
+ * A raw handle: the node's arena id with a phantom type parameter carrying
+ * the value type through get/set. It is just a number — the fast tier for
+ * hosts that manage node lifetime themselves (see Signal for the default).
  */
 declare const ValueOf: unique symbol;
-export type Signal<T> = SignalId & { [ValueOf]?: (value: T) => T };
+export type SignalIdOf<T> = SignalId & { [ValueOf]?: (value: T) => T };
 
 /** Property key carrying a stamped owner's node id (see signalOwner). */
 export const SignalIdKey: unique symbol = Symbol('dalien-signals.id');
@@ -65,7 +66,7 @@ export const SignalIdKey: unique symbol = Symbol('dalien-signals.id');
 export const SignalGenKey: unique symbol = Symbol('dalien-signals.gen');
 
 /** An owner object stamped with the node it keeps alive. */
-export type SignalOwner<T, R> = R & { [SignalIdKey]: Signal<T>; [SignalGenKey]: SignalGen };
+export type SignalOwner<T, R> = R & { [SignalIdKey]: SignalIdOf<T>; [SignalGenKey]: SignalGen };
 
 // ---- node state ----------------------------------------------------------------
 // Structure-of-arrays side columns, indexed by record number: the record
@@ -577,9 +578,9 @@ export function isEffectScope(id: SignalId): boolean {
  * get(count);     // 1
  * ```
  */
-export function signal<T>(): Signal<T | undefined>;
-export function signal<T>(initialValue: T, owner?: WeakKey): Signal<T>;
-export function signal<T>(initialValue?: T, owner?: WeakKey): Signal<T | undefined> {
+export function signalId<T>(): SignalIdOf<T | undefined>;
+export function signalId<T>(initialValue: T, owner?: WeakKey): SignalIdOf<T>;
+export function signalId<T>(initialValue?: T, owner?: WeakKey): SignalIdOf<T | undefined> {
 	// With an owner, the record frees itself when the owner is collected —
 	// the GC-managed lifetime for hosts that wrap handles in objects.
 	// Without one, the handle lives until dispose()/reset().
@@ -605,7 +606,7 @@ let memoVersion = -1;
 let memoCycle = -1;
 let memoVal: unknown;
 
-export function get<T>(id: Signal<T>): T {
+export function get<T>(id: SignalIdOf<T>): T {
 	if (id === memoId && activeSub === memoSub && globalVersion === memoVersion && cycle === memoCycle) {
 		return memoVal as T;
 	}
@@ -672,7 +673,7 @@ function getSlow(id: SignalId): unknown {
 }
 
 /** Write a signal by handle. Equal values (Object.is-style ===) are ignored. */
-export function set<T>(id: Signal<T>, value: T): void {
+export function set<T>(id: SignalIdOf<T>, value: T): void {
 	const idx = id >> Arena.NodeIndexShift;
 	if (pendingVals[idx] !== (pendingVals[idx] = value)) {
 		M[id + NodeSlot.Flags] = (M[id + NodeSlot.Flags] & Host.Hidden) | Flag.Mutable | Flag.Dirty;
@@ -700,7 +701,7 @@ export function set<T>(id: Signal<T>, value: T): void {
  * get(doubled); // 4
  * ```
  */
-export function computed<T>(getter: (previousValue?: T) => T, owner?: WeakKey): Signal<T> {
+export function computedId<T>(getter: (previousValue?: T) => T, owner?: WeakKey): SignalIdOf<T> {
 	// Minted DIRTY: the first read takes the update path (upstream's cold
 	// first evaluation), against an empty subscriber list. `owner` as in
 	// signal(): its collection frees the record.
@@ -726,7 +727,7 @@ export function computed<T>(getter: (previousValue?: T) => T, owner?: WeakKey): 
  * dispose(e);
  * ```
  */
-export function effect(fn: () => void | (() => void)): SignalId {
+export function effectId(fn: () => void | (() => void)): SignalId {
 	const id = system.allocNode(Host.Effect | Flag.Watching | Flag.RecursedCheck);
 	const idx = id >> Arena.NodeIndexShift;
 	fns[idx] = fn as NodeFn;
@@ -765,7 +766,7 @@ export function effect(fn: () => void | (() => void)): SignalId {
  * set(count, 1); // No log; the scope is stopped.
  * ```
  */
-export function effectScope(fn: () => void): SignalId {
+export function effectScopeId(fn: () => void): SignalId {
 	const id = system.allocNode(Host.Scope | Flag.Mutable);
 	fns[id >> Arena.NodeIndexShift] = fn as NodeFn;
 	owned[id >> Arena.NodeIndexShift] = [];
@@ -815,7 +816,7 @@ export function dispose(id: SignalId): void {
  * component record, ...):
  *
  * ```ts
- * let id: Signal<number>;
+ * let id: SignalIdOf<number>;
  * const count = signalOwner(0, {
  *   read: () => get(id),
  *   write: (v: number) => set(id, v),
@@ -824,7 +825,7 @@ export function dispose(id: SignalId): void {
  * ```
  */
 export function signalOwner<T, R extends WeakKey>(initialValue: T, owner: R): SignalOwner<T, R> {
-	const id = signal(initialValue, owner);
+	const id = signalId(initialValue, owner);
 	const stamped = owner as SignalOwner<T, R>;
 	stamped[SignalIdKey] = id;
 	stamped[SignalGenKey] = M[id + NodeSlot.Gen];
@@ -833,11 +834,106 @@ export function signalOwner<T, R extends WeakKey>(initialValue: T, owner: R): Si
 
 /** signalOwner's computed twin: see {@link signalOwner}. */
 export function computedOwner<T, R extends WeakKey>(getter: (previousValue?: T) => T, owner: R): SignalOwner<T, R> {
-	const id = computed(getter, owner);
+	const id = computedId(getter, owner);
 	const stamped = owner as SignalOwner<T, R>;
 	stamped[SignalIdKey] = id;
 	stamped[SignalGenKey] = M[id + NodeSlot.Gen];
 	return stamped;
+}
+
+// ---- default handles ----------------------------------------------------------
+// The DEFAULT creators return small handle objects that are their own
+// garbage-collection owners: drop the handle and the node reclaims — the
+// basic API cannot leak. Each handle is one object; reads and writes go
+// through the same module fast paths as the raw id tier (one property load
+// more). Hosts that want zero allocations per node use the raw tier
+// (signalId/computedId + get/set) and manage lifetime explicitly.
+
+/** A reactive value handle. Created by {@link signal}; GC-owned. */
+export class Signal<T> {
+	id: SignalIdOf<T>;
+	constructor(initialValue: T) {
+		this.id = signalId(initialValue, this);
+	}
+	get(): T {
+		return get(this.id);
+	}
+	set(value: T): void {
+		set(this.id, value);
+	}
+}
+
+/** A cached derived-value handle. Created by {@link computed}; GC-owned. */
+export class Computed<T> {
+	id: SignalIdOf<T>;
+	constructor(getter: (previousValue?: T) => T) {
+		this.id = computedId(getter, this);
+	}
+	get(): T {
+		return get(this.id);
+	}
+}
+
+/** An effect (or effect scope) handle. Dispose to stop it. */
+export class Effect {
+	id: SignalId;
+	constructor(id: SignalId) {
+		this.id = id;
+	}
+	dispose(): void {
+		dispose(this.id);
+	}
+}
+
+/**
+ * Create a reactive value (leak-free default: the returned handle owns the
+ * node; dropping it reclaims the record).
+ *
+ * @example
+ * ```ts
+ * const count = signal(0);
+ * count.get();  // 0
+ * count.set(1);
+ * count.get();  // 1
+ * ```
+ */
+export function signal<T>(): Signal<T | undefined>;
+export function signal<T>(initialValue: T): Signal<T>;
+export function signal<T>(initialValue?: T): Signal<T | undefined> {
+	return new Signal(initialValue);
+}
+
+/**
+ * Create a cached value derived from the signals and computeds read by
+ * `getter` (leak-free default: the handle owns the node).
+ *
+ * @example
+ * ```ts
+ * const count = signal(2);
+ * const doubled = computed(() => count.get() * 2);
+ * doubled.get(); // 4
+ * ```
+ */
+export function computed<T>(getter: (previousValue?: T) => T): Computed<T> {
+	return new Computed(getter);
+}
+
+/**
+ * Run `fn` immediately, then rerun it when a value it read changes; returns
+ * a disposable handle. Effects live until disposed (or until their owning
+ * scope disposes) — they are kept alive by the graph, not by the handle.
+ */
+export function effect(fn: () => void | (() => void)): Effect {
+	return new Effect(effectId(fn));
+}
+
+/**
+ * Run `fn` and group every nested effect it creates; disposing the returned
+ * handle stops the group, its effects, and the signals/computeds created
+ * inside it (region ownership).
+ */
+export function effectScope(fn: () => void): Effect {
+	return new Effect(effectScopeId(fn));
 }
 
 function noopEffectBody(): void {}

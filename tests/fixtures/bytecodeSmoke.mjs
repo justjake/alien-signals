@@ -2,17 +2,17 @@
 // function (lazy compilation: uninvoked functions never get bytecode).
 // Used by tests/bytecode.spec.ts via `node --print-bytecode`.
 import {
-	computed,
+	computedId as computed,
 	dispose,
-	effect,
-	effectScope,
+	effectId as effect,
+	effectScopeId as effectScope,
 	endBatch,
 	get,
 	getActiveSub,
 	getFlags,
 	set,
 	setFlags,
-	signal,
+	signalId as signal,
 	startBatch,
 	trigger,
 } from '../../esm/index.mjs';
