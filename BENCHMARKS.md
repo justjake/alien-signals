@@ -63,11 +63,26 @@ items. Landed from that:
 Together: broad family CLOSED to main-parity (0.99-1.00), deep trimmed
 to ~1.07, islands ~1.16 open.
 
-Measured and reverted in round two: read-side D-stamping (main's shape —
-trades 30 stamps for a getSlow round trip per effect read, net worse
-here), store-only EnterDepth via host let (unmeasurable under late-night
-thermal drift; discipline says keep only measured wins), host-side link
-dedup (no change).
+Measured and reverted in round two, settled with a PAIRED-RATIO harness
+(alternate the two builds run-by-run, median of adjacent-pair ratios —
+thermal drift cancels within pairs, ~1% resolution):
+
+- read-side D-stamping (main's shape): 1.028 — a getSlow round trip per
+  effect read costs more than 30 per-recompute stamps. Our stamp scheme
+  BEATS main's here; the difference stays.
+- store-only EnterDepth via host let: 1.021, all pairs worse — the typed
+  RMW pair beats let-inc-plus-store on this V8.
+- host-side link dedup: no change.
+
+Terminal state of the recompute bracket: a null-sum of everything left
+in it (EnterDepth pair, D stamp, purgeDeps) recovers only ~2%, and each
+item is either required for correctness, paid equivalently by main, or
+has had its alternatives measured worse. The bracket is at its floor;
+the residual kernel band (deep/islands ~1.1) is walk-side compiled-code
+difference with no remaining source-nameable candidate — every one was
+measured. Suite scoreboard after all of the above: user/main geomean
+0.959 (13/20 cells at-or-better, worst cell 1.13); crossover matrix
+1.127 (batch 1.085 … islands 1.163).
 
 Earlier bisection record (round one), all measured at zero individually:
 
