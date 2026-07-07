@@ -11,6 +11,11 @@ public API that cannot leak and needs no ceremony.
 | v15 (8-round medians) | raw id tier | **1.022** |
 | v19 (5-round medians) | default GC-owned handles | **1.051** |
 
+Aggregation sensitivity (10 merged rounds, final code): geomean 1.049,
+median cell 1.051, trimmed geomean 1.015, total-suite-time ratio 1.027;
+2/20 cells ≥20% faster, 7/20 faster at all. No honest aggregation
+reaches 0.80.
+
 Campaign trajectory: 1.56 → 1.05 over ~15 landed optimizations. For
 calibration, the fused main-branch engine (seeding, codegen clones, fused
 read/write — this project's historical performance ceiling) measures
