@@ -62,22 +62,24 @@ export function mountBench(root) {
 		if (running()) return;
 		running(true);
 		const out = {};
-		try {
-			for (const suite of SUITES) {
-				out[suite.key] = {};
-				for (const lib of LIBS) {
-					progress(`${suite.label} — ${lib}`);
+		const failures = [];
+		for (const suite of SUITES) {
+			out[suite.key] = {};
+			for (const lib of LIBS) {
+				progress(`${suite.label} — ${lib}`);
+				// A cell failure (a worker can overflow its stack where the
+				// same suite passes under Node) skips that bar, not the run.
+				try {
 					out[suite.key][lib] = await runCell(suite.key, lib, (t) => {
 						progress(`${suite.label} — ${lib} — ${t.test}: ${t.time.toFixed(0)} ms`);
 					});
-					results({ ...out });
+				} catch (err) {
+					failures.push(`${suite.key}/${lib.replace('@preact/signals-core', 'preact').replace('@reactively/core', 'reactively')}: ${err.message ?? err}`);
 				}
+				results({ ...out });
 			}
-			progress('done — one fresh worker per cell, single round, this machine');
-		} catch (err) {
-			progress(`failed: ${err.message ?? err}`);
-			results({ ...out });
 		}
+		progress(`done — one fresh worker per cell, single round, this machine${failures.length ? ` · skipped ${failures.join(' · ')}` : ''}`);
 		running(false);
 	});
 
