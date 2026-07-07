@@ -5,7 +5,8 @@
 	"scripts": {
 		"dev": "vite",
 		"build": "vite build",
-		"preview": "vite preview"
+		"preview": "vite preview",
+		"e2e": "node e2e.mjs"
 	},
 	"dependencies": {
 		"@preact/signals-core": "1.14.3",
@@ -14,6 +15,7 @@
 		"dalien-signals": "file:.."
 	},
 	"devDependencies": {
+		"playwright": "1.61.1",
 		"vite": "^8.1.3"
 	}
 }
