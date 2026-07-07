@@ -13,7 +13,7 @@
 
 The default arena reserves 64 MB of address space (2,097,152 records of 32 bytes). Large zero-filled buffers are typically demand-paged, or lazily committed: allocation reserves virtual address space, but resident physical memory grows only as pages are touched. `growCapacity()` raises the reservation for bigger graphs, and the arena also grows itself when it fills.
 
-**See it live:** [justjake.github.io/dalien-signals](https://justjake.github.io/dalien-signals/) — paint a 20,000-node computation field and watch only the dependency cone recompute, then inspect the actual arena integers of a small graph as you write, batch, and dispose. The site's own HUD runs on the library (`example/`).
+Demo with interactive examples: [justjake.github.io/dalien-signals](https://justjake.github.io/dalien-signals/).
 
 ## How it works
 
@@ -104,12 +104,12 @@ computed can read function-tier signals and vice versa.
 ```ts
 import { signal, get, set, signalId, dispose } from "dalien-signals";
 
-const count = signal(0);      // function tier: GC-owned callable
+const count = signal(0); // function tier: GC-owned callable
 count(1);
 
-const id = signalId(0);       // id tier: a plain integer
+const id = signalId(0); // id tier: a plain integer
 set(id, get(id) + 1);
-dispose(id);                  // explicit end of life
+dispose(id); // explicit end of life
 ```
 
 The function tier in full:
@@ -351,7 +351,7 @@ Whenever a write could invalidate cached work, the engine increments a global wr
 
 `createReactiveSystem` is the graph engine with none of the signal semantics: five raw operations over the arena, allocation, growth, and a set of seams the host fills in. `src/index.ts` — the whole default library — is one client of this surface (`tests/policyBoundary.spec.ts` enforces that it uses nothing else). A host can bring its own semantics:
 
-````ts
+```ts
 import { createReactiveSystem } from "dalien-signals/system";
 
 const sys = createReactiveSystem({
@@ -400,7 +400,7 @@ sys.generationOf(id);            // capture at creation to guard stored ids
 sys.growCapacity(records);       // immediate when idle, else at the next boundary
 sys.reset();                     // rewind the whole arena; every id dies
 sys.stats();                     // capacity, live records, free-list depth
-````
+```
 
 Node state lives in the arena as 32-byte records of eight `int32` slots — flags, dependency-list head and cursor, subscriber-list head and tail, a generation counter, and a float64 version stamp. Edges are records too. The [live inspector](https://justjake.github.io/dalien-signals/) decodes a real arena, record by record, as you mutate a graph.
 
@@ -431,12 +431,12 @@ The first two charts run each library in a fresh process, so one library cannot 
 <details>
 <summary>Node (V8) suite totals (ms, lower is better) — CI run 28848044239 @ ae1b4ae, 2026-07-07</summary>
 
-| framework | sbench | kairo | cellx | dynamic | total |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Dalien Signals | 584 | 958 | 33 | 2219 | 3793 |
-| Reactively | 622 | 1224 | 86 | 2186 | 4119 |
-| Alien Signals | 695 | 914 | 34 | 2581 | 4224 |
-| Preact Signals | 586 | 1000 | 35 | 2817 | 4438 |
+| framework      | sbench | kairo | cellx | dynamic | total |
+| -------------- | -----: | ----: | ----: | ------: | ----: |
+| Dalien Signals |    584 |   958 |    33 |    2219 |  3793 |
+| Reactively     |    622 |  1224 |    86 |    2186 |  4119 |
+| Alien Signals  |    695 |   914 |    34 |    2581 |  4224 |
+| Preact Signals |    586 |  1000 |    35 |    2817 |  4438 |
 
 <img width="1080" alt="Individual benchmark times, Node (V8), one panel per test" src="assets/benchmark-details.png" />
 
@@ -453,12 +453,12 @@ Bun's JavaScriptCore currently runs this library well behind alien-signals (the 
 <details>
 <summary>Bun (JavaScriptCore) suite totals (ms, lower is better) — CI run 28848044239 @ ae1b4ae, 2026-07-07</summary>
 
-| framework | sbench | kairo | cellx | dynamic | total |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Reactively | 504 | 1205 | 78 | 1943 | 3730 |
-| Alien Signals | 688 | 772 | 48 | 2790 | 4298 |
-| Preact Signals | 665 | 716 | 41 | 2956 | 4378 |
-| Dalien Signals | 2679 | 1031 | 134 | 2625 | 6469 |
+| framework      | sbench | kairo | cellx | dynamic | total |
+| -------------- | -----: | ----: | ----: | ------: | ----: |
+| Reactively     |    504 |  1205 |    78 |    1943 |  3730 |
+| Alien Signals  |    688 |   772 |    48 |    2790 |  4298 |
+| Preact Signals |    665 |   716 |    41 |    2956 |  4378 |
+| Dalien Signals |   2679 |  1031 |   134 |    2625 |  6469 |
 
 <img width="1080" alt="Individual benchmark times, Bun (JavaScriptCore), one panel per test" src="assets/benchmark-details-bun.png" />
 

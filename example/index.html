@@ -3,6 +3,7 @@
 	<head>
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<link rel="icon" href="data:," />
 		<title>dalien-signals — an interactive introduction</title>
 		<link rel="stylesheet" href="/src/style.css" />
 	</head>
@@ -11,13 +12,18 @@
 			<header>
 				<h1>dalien-signals</h1>
 				<p class="lede">
-					A <em>signal</em> is a value that remembers who read it. When it
-					changes, everything computed from it — and nothing else —
-					updates. There is no subscription step and no re-rendering pass:
-					the dependency graph assembles itself while code runs.
 					<a href="https://github.com/justjake/dalien-signals">dalien-signals</a>
-					stores that graph in a single <code>Int32Array</code>; every demo
-					below runs the production build.
+					is a data-oriented fork of
+					<a href="https://github.com/stackblitz/alien-signals">alien-signals</a>,
+					a fast <a href="https://github.com/tc39/proposal-signals">signals</a>
+					reactivity library. A <em>signal</em> is a value that remembers
+					who read it: when it changes, everything computed from it — and
+					nothing else — updates. There is no subscription step and no
+					re-rendering pass; the dependency graph assembles itself while
+					code runs. dalien-signals stores that graph in a single
+					<code>Int32Array</code> memory arena, like a contiguous array of
+					structs in C. Every demo below — including this page's own HUD
+					and controls — runs the production build.
 				</p>
 			</header>
 
@@ -28,14 +34,17 @@
 					own row of <code>signal</code>s — even bands flow downward, odd
 					bands upward — and every other pixel is a <code>computed</code>
 					reading three parents plus one <em>hub</em>, a nearby cell that
-					a whole column group also reads. Subscriber counts vary by an
-					order of magnitude, and it shows: writes on ordinary cells
-					cascade in narrow cones, writes that reach a hub flash across
-					their region. The emitters write a few signals per frame; drag
-					to write directly (right button writes darkness). The library
-					and size bars rebuild the same graph on other signal
-					implementations and at other resolutions — up to a node per
-					pixel of a 4k or 8k frame, if the machine grants the memory.
+					a whole column group also reads. Every pixel also carries its
+					own render <code>effect</code>, so each library's scheduler —
+					not a rendering pass — decides exactly which pixels repaint.
+					Subscriber counts vary by an order of magnitude, and it shows:
+					writes on ordinary cells cascade in narrow cones, writes that
+					reach a hub flash across their region. The emitters write a few
+					signals per frame; drag to write directly (right button writes
+					darkness). The library and size bars rebuild the same graph on
+					other signal implementations and at other resolutions, up to a
+					cell and an effect per pixel of a 1080p frame — about 4.1
+					million live nodes.
 				</p>
 				<canvas id="grid"></canvas>
 				<section id="hud">
@@ -61,8 +70,6 @@
 						<button data-v="480p">480p</button>
 						<button data-v="720p">720p</button>
 						<button data-v="1080p">1080p</button>
-						<button data-v="4k">4k</button>
-						<button data-v="8k">8k</button>
 					</span>
 					<span class="libpick" id="mode-bar" role="group" aria-label="mode">
 						<button data-v="off">off</button>
@@ -80,67 +87,77 @@
 					<em>same</em> value they held before, and the cascade stops
 					there. Disabling it makes the cones visibly taller.
 					<em>Invalidate everything</em> writes a signal every cell reads,
-					recomputing all twenty thousand nodes in one frame; the timer
-					reports the cost of a full pass.
+					recomputing every cell in the field in one pass; the timer
+					reports its cost.
 				</p>
 			</section>
 
 			<section>
 				<h2>The three primitives</h2>
 				<p>
-					A <code>signal</code> stores a value — call it with no argument
-					to read, with an argument to write. A <code>computed</code>
-					derives and caches a value from the signals and computeds its
-					function reads. An <code>effect</code> runs a function now, then
-					again when a value it read changes. Dependencies are automatic:
-					while a computed or effect runs, the library records every value
-					it reads.
+					dalien-signals keeps calculations and callbacks in sync with
+					changing values. It provides three main primitives:
 				</p>
-				<pre><code>import { signal, computed, effect } from "dalien-signals";
+				<ul class="algo">
+					<li>A <code>signal</code> stores a value. Call it with no argument to read it, or with an argument to write it.</li>
+					<li>A <code>computed</code> derives and caches a value from signals or other computeds.</li>
+					<li>An <code>effect</code> runs a function now, then again when a value it read changes.</li>
+				</ul>
+				<p>
+					Dependencies are automatic. While a computed or effect runs,
+					the library records every signal and computed it reads —
+					reading inside a computed or effect <em>is</em> the
+					subscription.
+				</p>
+				<pre><code>import { computed, effect, signal } from "dalien-signals";
 
 const count   = signal(1);
 const doubled = computed(() =&gt; count() * 2);
 const isEven  = computed(() =&gt; count() % 2 === 0);
 
-effect(() =&gt; console.log(doubled(), isEven()));
-count(2); // logs: 4 true</code></pre>
+effect(() =&gt; console.log(doubled(), isEven())); // 2 false
+count(2); // 4 true</code></pre>
 				<div id="w-counter"></div>
 				<p>
-					Stepping from 1 to 3: the run counter's effect reads both
-					computeds but re-runs only when one produces a <em>new</em>
-					value. <code>doubled</code> changed; <code>even?</code> was
-					<code>no</code> before and after, so nothing downstream of it
-					was disturbed — equality cutoff, the same rule that stops the
-					field's ripples. Reading inside a computed or effect <em>is</em>
-					the subscription.
+					When <code>count</code> changes, the effect is reached through
+					both computeds but queued only once — and it re-runs only when
+					one of them produces a <em>new</em> value. Stepping the widget
+					from 1 to 3: <code>doubled</code> changed, but
+					<code>even?</code> was <code>no</code> before and after, so
+					nothing downstream of it was disturbed. This is equality
+					cutoff, the same rule that stops the field's ripples.
 				</p>
 			</section>
 
 			<section>
 				<h2>How a write becomes an update</h2>
 				<p>
-					dalien-signals is a <em>push-pull</em> engine. A write does not
-					recompute anything by itself; it records what may have changed,
-					cheaply, and the work happens later, on demand:
+					Recalculating every downstream node on each write would waste
+					work. Recalculating dependents immediately could also run an
+					effect more than once, or before all of its inputs are current.
+					dalien-signals instead uses a <em>push-pull</em> algorithm: a
+					write does not recompute anything by itself; it records what may
+					have changed, cheaply, and the work happens later, on demand.
 				</p>
 				<ol class="algo">
 					<li>
 						<b>Push staleness.</b> Writing a signal marks it
 						<code>Dirty</code> and walks its subscriber lists, marking each
-						downstream node <code>Pending</code> — "something under you may
-						have changed." No user code runs during this walk; it's a few
-						integer writes per node.
+						downstream computed and effect <code>Pending</code> — "something
+						under you may have changed." No user callback runs during this
+						graph walk; it's a few integer writes per node.
 					</li>
 					<li>
 						<b>Queue effects.</b> Any effect the walk reaches goes into a
 						queue, once, no matter how many paths led to it.
 					</li>
 					<li>
-						<b>Pull and verify.</b> When an effect runs — or when you read a
-						computed — the node checks its dependencies: did anything I read
-						actually produce a new value? A <code>Pending</code> chain
-						resolves top-down; a node whose inputs all came out equal clears
-						its flag and reports "nothing changed," cutting the cascade.
+						<b>Pull and verify.</b> Before a computed returns its value, it
+						checks its dependencies and recalculates if necessary. A queued
+						effect reruns and pulls each computed it reads up to date. A
+						<code>Pending</code> chain resolves top-down; if a node's inputs
+						all came out equal, its value has not changed, and the update
+						stops along that path.
 					</li>
 					<li>
 						<b>Stamp the verdict.</b> Every committed write increments one
@@ -184,9 +201,21 @@ count(2); // logs: 4 true</code></pre>
 					a dependency, a subscriber, and the four neighbors threading it
 					into both lists. Walking a list means following integers from
 					slot to slot — nothing for the collector to trace, and adjacent
-					records share cache lines. The memory tables on this page are
+					records share cache lines. A free list chains unused records
+					together, so disposed nodes and edges are recycled in place;
+					values, getters, and callbacks live in ordinary side arrays
+					indexed by the same id. The memory tables on this page are
 					that array decoded row by row; amber cells changed on the last
 					action.
+				</p>
+				<p>
+					The default arena reserves 64 MB of address space — 2,097,152
+					records of 32 bytes. Large zero-filled buffers are demand-paged:
+					allocation reserves virtual address space, but resident physical
+					memory grows only as pages are touched. <code>growCapacity()</code>
+					raises the reservation for bigger graphs — the size bar above
+					calls it before building each field — and the arena also grows
+					itself when it fills.
 				</p>
 			</section>
 

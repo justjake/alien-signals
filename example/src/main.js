@@ -7,32 +7,31 @@ import { makeRuntime } from './adapters.js';
 import { mountCounter, mountStepper, mountSheet } from './widgets.js';
 import { mountBench } from './bench.js';
 
-// One node per pixel at the named resolution.
+// Reserve the arena before any signal exists. Growth rebuilds the engine,
+// and callables created before a rebuild keep mixed call-site feedback
+// afterwards — reserving up front keeps the page's long-lived signals and
+// every tier through 720p on one engine generation. Reservation is
+// address space (512 MB here); pages commit only as records are touched.
+growCapacity(1 << 24);
+
+// One signal or computed per pixel at the named resolution, plus one
+// render effect per pixel on top: at 1080p the arena holds ~4.1 million
+// live nodes.
 const TIERS = {
 	'320p': [568, 320],
 	'480p': [854, 480],
 	'720p': [1280, 720],
 	'1080p': [1920, 1080],
-	'4k': [3840, 2160],
-	'8k': [7680, 4320],
 };
-// Arena records per cell: one node, ~6 dependency links, and a share of a
-// render-tile effect and its links — about 8.2 records, rounded up to the
-// next power of two. The top tiers are multi-GB reservations that the
-// platform may refuse; a refused allocation surfaces in the note rather
-// than crashing the flush.
+// Records per pixel: the cell node plus ~6 dependency links, and the
+// render-effect node plus its one link — about 9 records. The arena
+// doubles itself once it passes 3/4 full, so a tier needs 4/3 of its
+// record count reserved to never rebuild mid-run. The boot reservation
+// covers every tier through 720p (0.9 MP, ~8.3M records); 1080p (2.1 MP,
+// ~18.5M records) grows once, to 1 GB, when selected.
 const TIER_RECORDS = {
-	'320p': 1 << 21,
-	'480p': 1 << 22,
-	'720p': 1 << 23,
 	'1080p': 1 << 25,
-	'4k': 1 << 27,
-	'8k': 1 << 28,
 };
-// Render effects cover 64-column spans: narrow enough that a band write
-// queues dozens of effects rather than thousands, wide enough that effects
-// stay ~1.5% of the pixel count.
-const TILE = 64;
 
 // ---- page state ---------------------------------------------------------------
 const libName = signal('dalien-signals');
@@ -45,7 +44,6 @@ const frameMs = signal(0);
 const avgFrameMs = signal(0);
 const fps = signal(0);
 const note = signal('');
-const frameTimes = [];
 // The whole render bundle — runtime, graph, size-matched buffers — is one
 // signal, rebuilt when the library or tier changes.
 const view = signal(makeView());
@@ -61,47 +59,52 @@ function makeView() {
 	const name = libName();
 	const tier = tierName();
 	const [w, h] = TIERS[tier];
-	if (name === 'dalien-signals') {
+	if (name === 'dalien-signals' && TIER_RECORDS[tier]) {
 		growCapacity(TIER_RECORDS[tier]); // address space is cheap; pages are lazy
 	}
 	const rt = makeRuntime(name);
 	const graph = buildGraph(w, h, rt);
+	const count = w * h;
 	const image = new ImageData(w, h);
 	const data = image.data;
-	const flash = new Float32Array(w * h);
-	// NaN forces every pixel's first comparison to fail, so the creation
-	// pass paints the whole field.
-	const vals = new Float32Array(w * h).fill(NaN);
+	const vals = new Float32Array(count);
+	// Glow bookkeeping: flash[i] is pixel i's glow level, and the first
+	// flashEnd entries of flashList are exactly the pixels with glow > 0.
+	// The render loop decays that list instead of scanning the field, and
+	// flash[i] === 0 doubles as "not in the list", so a pixel is never
+	// appended twice.
+	const flash = new Float32Array(count);
+	const flashList = new Int32Array(count);
 	const get = rt.get;
 	const ids = graph.ids;
 	// Settle the graph before wiring watchers: an untracked pass evaluates
 	// every cell in dependency order, so effect creation links into a
-	// finished graph instead of driving cold cascades from inside each
-	// effect body. Measured on dalien at 1080p: first build 7.5s -> 2.0s.
+	// finished graph and does uniform work per pixel, instead of driving
+	// cold cascades of arbitrary depth from inside each effect body.
+	// Measured on dalien at 1080p: 4x off the first build when render
+	// effects covered 64-pixel tiles (7.5s -> 2.0s); with per-pixel
+	// effects the totals are close (2.8s with, 2.4s without, Node), and
+	// the pass stays for the bounded per-effect creation cost.
 	for (let i = 0; i < ids.length; i++) {
 		get(ids[i]);
 	}
-	const bundle = { rt, graph, w, h, image, flash, vals, dirty: true, glowUntil: 0 };
-	// One render effect per row-tile: each library's own scheduler repaints
-	// exactly the tiles whose cells changed — frame cost tracks the
-	// invalidation cones, not the pixel count.
-	for (let r = 0; r < h; r++) {
-		const base = r * w;
-		for (let x0 = 0; x0 < w; x0 += TILE) {
-			const start = base + x0;
-			const end = base + Math.min(w, x0 + TILE);
-			rt.effect(() => {
-				for (let i = start; i < end; i++) {
-					const v0 = get(ids[i]);
-					if (v0 !== vals[i]) {
-						vals[i] = v0;
-						flash[i] = 1;
-						paintPixel(data, i, v0, 1);
-					}
-				}
-				bundle.dirty = true;
-			});
-		}
+	const bundle = { rt, graph, w, h, image, vals, flash, flashList, flashEnd: 0 };
+	// One render effect per pixel: the finest possible subscription, so
+	// each library's own scheduler decides exactly which pixels repaint.
+	// An effect reruns only when its cell produced a new value (every
+	// library here cuts propagation on equality), so the body repaints
+	// unconditionally — running at all is the proof of change.
+	// The factory keeps each closure's own context to the one pixel index;
+	// the shared buffers are captured once, in the enclosing scope.
+	const renderPixel = (i) => () => {
+		const v0 = get(ids[i]);
+		vals[i] = v0;
+		if (flash[i] === 0) flashList[bundle.flashEnd++] = i;
+		flash[i] = 1;
+		paintPixel(data, i, v0, 1);
+	};
+	for (let i = 0; i < count; i++) {
+		rt.effect(renderPixel(i));
 	}
 	return bundle;
 }
@@ -130,7 +133,11 @@ bindText('stat-frame', () => `${frameMs().toFixed(2)} ms`);
 bindText('stat-avg', () => `${avgFrameMs().toFixed(2)} ms`);
 bindText('stat-fps', () => String(fps()));
 const mb = (bytes) => `${(bytes / (1 << 20)).toFixed(1)} MB`;
-bindText('stat-arena', () => mb((view().graph.nodes + view().graph.edges) * 32));
+// the graph's nodes and edges, plus one render effect (node + link) per pixel
+bindText('stat-arena', () => {
+	const v = view();
+	return mb((v.graph.nodes + v.graph.edges + 2 * v.w * v.h) * 32);
+});
 const heap = signal(NaN);
 bindText('stat-heap', () => (Number.isFinite(heap()) ? mb(heap()) : 'n/a'));
 if (performance.memory) {
@@ -181,8 +188,8 @@ $('btn-invalidate').addEventListener('click', () => {
 //
 // The build itself stays out of the effect flush: it can take seconds at
 // the big tiers (the click would appear to do nothing), and if it throws —
-// growCapacity and the pixel buffers are multi-GB allocations at 4k/8k —
-// an exception inside the flush aborts it and strands every DOM-binding
+// growCapacity and the pixel buffers are gigabyte-scale allocations at
+// 1080p — an exception inside the flush aborts it and strands every DOM-binding
 // effect still queued behind it with stale output. The effect only posts
 // feedback and schedules; the build runs after the note has had a frame
 // to paint, wrapped so failure is reported instead of thrown.
@@ -240,7 +247,7 @@ function finishRebuild(name, tier) {
 	v.rt.set(v.graph.quantize, cutoffOn());
 	canvas.width = v.w;
 	canvas.height = v.h;
-	frameTimes.length = 0;
+	resetFrameTimes();
 	building(false);
 	note(`${name} @ ${tier}: ${v.graph.nodes.toLocaleString()} nodes built in ${v.graph.buildMs.toFixed(1)} ms`);
 }
@@ -289,10 +296,33 @@ function timeFullPass(write) {
 
 // ---- render loop ----------------------------------------------------------------
 // Render effects repaint changed pixels as each library's scheduler runs
-// them; the frame loop only issues writes inside one batch per frame.
+// them; the frame loop issues writes inside one batch per frame, then
+// decays the glow of recently changed pixels.
+
+// Rolling window of frame-compute times. A ring buffer with a running sum
+// keeps the window's storage alive across frames and rebuilds — push/shift
+// moves every element each frame, and `length = 0` drops the backing store
+// just to reallocate it — and makes the average O(1).
+const FRAME_WINDOW = 120;
+const frameTimes = new Float64Array(FRAME_WINDOW);
+let frameTimeCount = 0;
+let frameTimeIndex = 0;
+let frameTimeSum = 0;
+function recordFrameTime(ms) {
+	if (frameTimeCount === FRAME_WINDOW) frameTimeSum -= frameTimes[frameTimeIndex];
+	else frameTimeCount++;
+	frameTimes[frameTimeIndex] = ms;
+	frameTimeIndex = (frameTimeIndex + 1) % FRAME_WINDOW;
+	frameTimeSum += ms;
+	avgFrameMs(frameTimeSum / frameTimeCount);
+}
+function resetFrameTimes() {
+	frameTimeCount = 0;
+	frameTimeIndex = 0;
+	frameTimeSum = 0;
+}
 
 let frames = 0;
-let frameCount = 0;
 let fpsWindow = performance.now();
 let phase = 0;
 const emitters = [
@@ -302,7 +332,6 @@ const emitters = [
 ];
 
 function frame() {
-	frameCount++;
 	if (!building()) {
 		const v = view();
 		const g = v.graph;
@@ -338,30 +367,30 @@ function frame() {
 		});
 		const ms = performance.now() - t0;
 		frameMs(ms);
-		frameTimes.push(ms);
-		if (frameTimes.length > 120) frameTimes.shift();
-		avgFrameMs(frameTimes.reduce((a, b) => a + b, 0) / frameTimes.length);
+		recordFrameTime(ms);
 		recomputedCount(g.stats.recomputes);
 
-		// The glow pass touches every pixel, so it only runs while something
-		// is glowing: ~18 frames of decay after the last change.
-		if (v.dirty) {
-			v.glowUntil = frameCount + 18;
-			v.dirty = false;
-		}
-		if (frameCount <= v.glowUntil) {
-			const { image, flash, vals } = v;
+		// The glow pass walks only the pixels with active glow — the live
+		// prefix of flashList — compacting the list in place as entries
+		// fade out, so its cost tracks recent change, not field size.
+		if (v.flashEnd > 0) {
+			const { image, flash, flashList, vals } = v;
 			const data = image.data;
-			for (let i = 0; i < flash.length; i++) {
-				const f = flash[i];
+			const end = v.flashEnd;
+			let live = 0;
+			for (let k = 0; k < end; k++) {
+				const i = flashList[k];
+				const f = flash[i] * 0.78;
 				if (f > 0.02) {
-					flash[i] = f * 0.78;
-					paintPixel(data, i, vals[i], flash[i]);
-				} else if (f !== 0) {
-					flash[i] = 0;
+					flash[i] = f;
+					flashList[live++] = i;
+					paintPixel(data, i, vals[i], f);
+				} else {
+					flash[i] = 0; // 0 also means "not in the list"
 					paintPixel(data, i, vals[i], 0);
 				}
 			}
+			v.flashEnd = live;
 			ctx.putImageData(image, 0, 0);
 		}
 	}
