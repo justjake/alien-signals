@@ -13,8 +13,8 @@
 				<p class="lede">
 					A <em>signal</em> is a value that remembers who read it. When it
 					changes, everything computed from it — and nothing else — updates.
-					You never subscribe, never diff, never re-render the world: the
-					dependency graph assembles itself while your code runs, and a
+					There is no explicit subscription step and no re-rendering pass:
+					the dependency graph assembles itself while code runs, and a
 					write touches exactly the part of it that could have changed.
 					This page explains how
 					<a href="https://github.com/justjake/dalien-signals">dalien-signals</a>
@@ -23,7 +23,7 @@
 			</header>
 
 			<section>
-				<h2>A large graph, updating sparsely</h2>
+				<h2>Demo: a 20,000-node graph</h2>
 				<p>
 					The field below is one reactive graph: the top row of pixels is
 					<code>signal</code>s, and every pixel under it is a
@@ -62,7 +62,7 @@
 					taller. <em>Invalidate everything</em> writes one signal that
 					every cell reads, forcing all twenty thousand nodes to recompute
 					in a single frame; the timer reports the cost of a full-graph
-					pass — the cost the design exists to avoid.
+					pass, a cost the design avoids in normal operation.
 				</p>
 			</section>
 
@@ -146,7 +146,7 @@ count(2); // logs: 4 true</code></pre>
 			</section>
 
 			<section>
-				<h2>A node is eight integers</h2>
+				<h2>Memory layout: eight integers per node</h2>
 				<p>
 					This is where dalien-signals departs from most implementations.
 					Signal libraries typically allocate an object per node, wired with
@@ -178,10 +178,10 @@ count(2); // logs: 4 true</code></pre>
 			</section>
 
 			<section>
-				<h2>A spreadsheet is a dependency graph</h2>
+				<h2>Example: Spreadsheet</h2>
 				<p>
-					A spreadsheet is the oldest reactive system in computing. In the
-					one below, each cell is a signal (the typed text) plus a
+					The spreadsheet below is built on the same engine. Each cell is a
+					signal (the typed text) plus a
 					computed (what it evaluates to). Formulas start with
 					<code>=</code> and are plain JavaScript with one extra function:
 					<code>GET('A:1')</code> reads another cell. Because the formula
