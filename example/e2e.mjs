@@ -41,6 +41,10 @@ const POLL_MS = 100;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const digits = (text) => Number(text.replace(/[^0-9]/g, ''));
+// Sampled HUD tiles read "<current> / avg <average>"; the current reading
+// is everything before the separator (the whole text before the first
+// sample lands, when the avg segment is omitted).
+const currentReading = (text) => text.split(' / ')[0];
 
 class CheckFailure extends Error {}
 const die = (message) => { throw new CheckFailure(message); };
@@ -238,6 +242,34 @@ async function run(page, url) {
 		return `${s.width}x${s.height}, ${s.lit}/${s.sampled} sampled pixels lit`;
 	});
 
+	await check('HUD tiles: merged current / avg readings', async () => {
+		// One tile per sampled stat; the old separate avg tile must be gone.
+		const hasAvgTile = await page.evaluate(() => document.getElementById('stat-avg') !== null);
+		if (hasAvgTile) die('#stat-avg still exists; the avg belongs inside #stat-frame now');
+		// Every window fills at its own cadence — fps needs ~500 ms, heap 1 s —
+		// so poll until each tile carries both readings.
+		const patterns = {
+			'stat-recomputed': /^[\d,]+ \/ avg [\d,]+$/,
+			'stat-share': /^\d+\.\d% \/ avg \d+\.\d%$/,
+			'stat-frame': /^\d+\.\d{2} ms \/ avg \d+\.\d{2} ms$/,
+			'stat-fps': /^\d+ \/ avg \d+$/,
+			'stat-heap': /^(n\/a|\d+\.\d MB \/ avg \d+\.\d MB)$/, // n/a: no performance.memory
+		};
+		const deadline = Date.now() + 10_000;
+		for (;;) {
+			const texts = {};
+			for (const id of Object.keys(patterns)) texts[id] = await statText(page, id);
+			const bad = Object.keys(patterns).filter((id) => !patterns[id].test(texts[id]));
+			if (bad.length === 0) {
+				return Object.entries(texts).map(([id, text]) => `${id} "${text}"`).join(', ');
+			}
+			if (Date.now() > deadline) {
+				die(`tiles never matched "<current> / avg <average>": ${bad.map((id) => `${id} is "${texts[id]}"`).join(', ')}`);
+			}
+			await sleep(POLL_MS);
+		}
+	});
+
 	await check('activity log: boot setup line and live average', async () => {
 		const log = await readActivity(page);
 		const setup = log.lines.find((line) => /^dalien-signals: graph setup \d+ ms$/.test(line));
@@ -324,7 +356,7 @@ async function run(page, url) {
 		if (before.checksum === after.checksum) die('canvas checksum unchanged over 500 ms: not animating');
 		const deadline = Date.now() + 5_000;
 		let recomputed = 0;
-		while ((recomputed = digits(await statText(page, 'stat-recomputed'))) === 0) {
+		while ((recomputed = digits(currentReading(await statText(page, 'stat-recomputed')))) === 0) {
 			if (Date.now() > deadline) die('#stat-recomputed stayed 0: the wave writes are not recomputing cells');
 			await sleep(POLL_MS);
 		}

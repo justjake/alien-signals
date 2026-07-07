@@ -92,9 +92,79 @@ const cutoffOn = signal(true);
 const building = signal(false);
 const recomputedCount = signal(0);
 const frameMs = signal(0);
-const avgFrameMs = signal(0);
 const fps = signal(0);
+const heap = signal(NaN); // latest usedJSHeapSize sample; NaN when unsupported
 const note = signal('');
+
+// ---- rolling averages -----------------------------------------------------------
+// Every sampled stat pairs its current reading with a rolling average over
+// the same window. A ring buffer with a running sum keeps the window's
+// storage alive across frames and rebuilds — push/shift moves every element
+// each sample, and `length = 0` drops the backing store just to reallocate
+// it — and makes the average O(1). The average signal is NaN until the
+// first sample lands; the stat bindings omit the avg segment then instead
+// of showing a zero that was never measured. One window size, at each
+// metric's own cadence: per frame (frame compute, recomputed cells), per
+// half second (fps), per second (js heap) — so the windows span roughly
+// the last two seconds to two minutes of the running graph.
+const AVG_WINDOW = 120;
+function rollingAverage() {
+	const samples = new Float64Array(AVG_WINDOW);
+	let count = 0;
+	let index = 0;
+	let sum = 0;
+	const average = signal(NaN);
+	return {
+		average,
+		record(value) {
+			if (count === AVG_WINDOW) sum -= samples[index];
+			else count++;
+			samples[index] = value;
+			index = (index + 1) % AVG_WINDOW;
+			sum += value;
+			average(sum / count);
+		},
+		reset() {
+			count = 0;
+			index = 0;
+			sum = 0;
+			average(NaN);
+		},
+	};
+}
+const frameAvg = rollingAverage();
+const recomputedAvg = rollingAverage();
+const fpsAvg = rollingAverage();
+const heapAvg = rollingAverage();
+// The fps counters live up here so resetAverages — which runs during
+// module init via finishRebuild — can restart the fps window without
+// reaching below its own declaration.
+let frames = 0;
+let fpsWindow = performance.now();
+// Averages describe the running graph, so a rebuild starts every window
+// over, and the fps window restarts so its first sample counts only
+// new-graph frames. The heap window is reseeded with a fresh sample right
+// away: its cadence is one second, and an empty window would blank the avg
+// segment for that long even though a current reading is available.
+function resetAverages() {
+	frameAvg.reset();
+	recomputedAvg.reset();
+	fpsAvg.reset();
+	heapAvg.reset();
+	frames = 0;
+	fpsWindow = performance.now();
+	if (performance.memory) {
+		const bytes = performance.memory.usedJSHeapSize;
+		heap(bytes);
+		heapAvg.record(bytes);
+	}
+}
+// The activity log's average lines keep a numeric reading through the
+// empty window right after a rebuild, so every line parses the same way.
+const liveAvgMs = () => {
+	const avg = frameAvg.average();
+	return Number.isFinite(avg) ? avg : 0;
+};
 // The whole render bundle — runtime, graph, size-matched buffers — is one
 // signal, rebuilt when the library or tier changes. A sticky selection
 // can boot straight into a heavy tier; if this machine refuses it (the
@@ -132,7 +202,6 @@ const logAppend = (...lines) => logLines(
 	[...logLines(), ...lines.map((line) => (typeof line === 'string' ? { text: line } : line))].slice(-LOG_LIMIT),
 );
 
-const share = computed(() => `${((recomputedCount() / view().graph.nodes) * 100).toFixed(1)}%`);
 const cutoffLabel = computed(() => `equality cutoff: ${cutoffOn() ? 'on' : 'off'}`);
 
 const $ = (id) => document.getElementById(id);
@@ -213,14 +282,32 @@ function makeView() {
 
 // ---- state => document ----------------------------------------------------------
 const bindText = (id, read) => effect(() => { $(id).textContent = read(); });
+// A sampled stat is one tile reading "<current> / avg <average>": the
+// current value in the tile's .now node, the quieter avg segment in its
+// .avg node (see .stat .avg). Two effects, so each segment updates on its
+// own signal; while a fresh window is still empty (average is NaN) the avg
+// segment is omitted rather than shown as a zero nobody measured.
+const bindStat = (id, fmt, current, average) => {
+	const el = $(id);
+	const now = el.querySelector('.now');
+	const avg = el.querySelector('.avg');
+	effect(() => { now.textContent = fmt(current()); });
+	effect(() => {
+		const a = average();
+		avg.textContent = Number.isFinite(a) ? ` / avg ${fmt(a)}` : '';
+	});
+};
 
 bindText('stat-nodes', () => view().graph.nodes.toLocaleString());
 bindText('stat-edges', () => view().graph.edges.toLocaleString());
-bindText('stat-recomputed', () => recomputedCount().toLocaleString());
-bindText('stat-share', share);
-bindText('stat-frame', () => `${frameMs().toFixed(2)} ms`);
-bindText('stat-avg', () => `${avgFrameMs().toFixed(2)} ms`);
-bindText('stat-fps', () => String(fps()));
+bindStat('stat-recomputed', (n) => Math.round(n).toLocaleString(), recomputedCount, recomputedAvg.average);
+// share of the graph recomputed: nodes is constant per graph and the
+// windows reset on rebuild, so the average share is the averaged count
+// over the same node total — no separate window needed.
+const shareOf = (count) => (count / view().graph.nodes) * 100;
+bindStat('stat-share', (p) => `${p.toFixed(1)}%`, () => shareOf(recomputedCount()), () => shareOf(recomputedAvg.average()));
+bindStat('stat-frame', (ms) => `${ms.toFixed(2)} ms`, frameMs, frameAvg.average);
+bindStat('stat-fps', (f) => String(Math.round(f)), fps, fpsAvg.average);
 const mb = (bytes) => `${(bytes / (1 << 20)).toFixed(1)} MB`;
 // dalien's arena footprint for this graph: nodes, dependency edges, and
 // one render effect (node + link) per pixel, 32 bytes each. Other
@@ -230,10 +317,13 @@ bindText('stat-arena', () => {
 	const v = view();
 	return mb((v.graph.nodes + v.graph.edges + 2 * v.w * v.h) * 32);
 });
-const heap = signal(NaN);
-bindText('stat-heap', () => (Number.isFinite(heap()) ? mb(heap()) : 'n/a'));
+bindStat('stat-heap', (bytes) => (Number.isFinite(bytes) ? mb(bytes) : 'n/a'), heap, heapAvg.average);
 if (performance.memory) {
-	setInterval(() => heap(performance.memory.usedJSHeapSize), 1000);
+	setInterval(() => {
+		const bytes = performance.memory.usedJSHeapSize;
+		heap(bytes);
+		heapAvg.record(bytes);
+	}, 1000);
 	heap(performance.memory.usedJSHeapSize);
 }
 bindText('note', note);
@@ -251,7 +341,7 @@ effect(() => {
 		list.append(div);
 	}
 });
-bindText('activity-live', () => `${runningLib()}: avg frame time ${avgFrameMs().toFixed(1)} ms`);
+bindText('activity-live', () => `${runningLib()}: avg frame time ${liveAvgMs().toFixed(1)} ms`);
 if (bootError) {
 	logAppend({ text: `${sticky.lib} @ ${sticky.tier}: build failed on boot — ${String(bootError)}`, error: true });
 }
@@ -317,32 +407,6 @@ $('btn-invalidate').addEventListener('click', () => {
 	});
 });
 
-// Rolling window of frame-compute times. A ring buffer with a running sum
-// keeps the window's storage alive across frames and rebuilds — push/shift
-// moves every element each frame, and `length = 0` drops the backing store
-// just to reallocate it — and makes the average O(1). Declared before the
-// rebuild section below: finishRebuild resets the window and runs during
-// module init, so the bindings must already be initialized.
-const FRAME_WINDOW = 120;
-const frameTimes = new Float64Array(FRAME_WINDOW);
-let frameTimeCount = 0;
-let frameTimeIndex = 0;
-let frameTimeSum = 0;
-function recordFrameTime(ms) {
-	if (frameTimeCount === FRAME_WINDOW) frameTimeSum -= frameTimes[frameTimeIndex];
-	else frameTimeCount++;
-	frameTimes[frameTimeIndex] = ms;
-	frameTimeIndex = (frameTimeIndex + 1) % FRAME_WINDOW;
-	frameTimeSum += ms;
-	avgFrameMs(frameTimeSum / frameTimeCount);
-}
-function resetFrameTimes() {
-	frameTimeCount = 0;
-	frameTimeIndex = 0;
-	frameTimeSum = 0;
-	avgFrameMs(0); // no samples from the new graph yet
-}
-
 // rebuild is a projection of (library, tier)
 //
 // The build itself stays out of the effect flush: it can take seconds at
@@ -375,7 +439,7 @@ effect(() => {
 		// (builtName was cleared), so it swaps silently.
 		if (builtName !== undefined) {
 			logAppend(
-				`${builtName}: avg frame time ${avgFrameMs().toFixed(1)} ms`,
+				`${builtName}: avg frame time ${liveAvgMs().toFixed(1)} ms`,
 				...(name !== builtName ? [`framework changed to ${name}`] : []),
 				...(tier !== builtTier ? [`graph size changed to ${tier}`] : []),
 			);
@@ -431,7 +495,7 @@ function finishRebuild(name, tier) {
 	v.rt.set(v.graph.quantize, cutoffOn());
 	canvas.width = v.w;
 	canvas.height = v.h;
-	resetFrameTimes();
+	resetAverages();
 	runningLib(name); // the live log line starts averaging under the new name
 	building(false);
 	note(`${name} @ ${tier}: ${v.graph.nodes.toLocaleString()} nodes built in ${v.graph.buildMs.toFixed(1)} ms`);
@@ -484,9 +548,8 @@ function timeFullPass(write) {
 // them; the frame loop issues writes inside one batch per frame, then
 // decays the glow of recently changed pixels.
 
-let frames = 0;
-let fpsWindow = performance.now();
-
+// frames / fpsWindow are declared with the rolling averages above, so
+// resetAverages can restart the fps window on rebuilds.
 function frame() {
 	if (!building()) {
 		const v = view();
@@ -514,8 +577,9 @@ function frame() {
 		// the controller's cone estimates only make sense for its own writes
 		if (m === 'wave') v.driver.observe();
 		frameMs(ms);
-		recordFrameTime(ms);
+		frameAvg.record(ms);
 		recomputedCount(g.stats.recomputes);
+		recomputedAvg.record(g.stats.recomputes);
 
 		// The glow pass walks only the pixels with active glow — the live
 		// prefix of flashList — compacting the list in place as entries
@@ -549,7 +613,9 @@ function frame() {
 	frames++;
 	const now = performance.now();
 	if (now - fpsWindow > 500) {
-		fps(Math.round((frames * 1000) / (now - fpsWindow)));
+		const sample = Math.round((frames * 1000) / (now - fpsWindow));
+		fps(sample);
+		fpsAvg.record(sample);
 		frames = 0;
 		fpsWindow = now;
 	}

@@ -19,7 +19,8 @@ canvas {
 	touch-action: none;
 }
 #hud { display: flex; gap: 28px; flex-wrap: wrap; margin: 14px 0 10px; }
-.stat span { display: block; font-size: 22px; font-variant-numeric: tabular-nums; }
+.stat > span { display: block; font-size: 22px; font-variant-numeric: tabular-nums; }
+.stat .avg { font-size: 14px; color: #9aa1b2; }
 .stat label { color: #9aa1b2; font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; }
 #controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 #controls button {
