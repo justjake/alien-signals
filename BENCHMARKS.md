@@ -211,11 +211,11 @@ upstream callable API):
 - **dalien main (fused): 0.90 geomean** — reproduces its documented 0.92,
   same signature: deep/grid enter the win band at N≈300–1000 and reach
   0.42–0.52; islands carries a flat ~5% premium.
-- **userspace raw tier: 1.05 geomean.** The crossover survives this
+- **this library's raw tier: 1.05 geomean.** The crossover survives this
   architecture: deep/grid at N=1000–30000 run 0.44–0.66 of alien. What's
   lost vs main is the small-write end (N≤300 at 1.1–1.6×: host-seam and
   module-let overhead) and batch (many small writes per flush, ~1.0–1.2×).
-- **userspace callable API: ~1.12–1.17 geomean.** The default-API wrapper
+- **this library's callable API (pre-fix): ~1.12–1.17 geomean.** The default-API wrapper
   costs 10–25% over the raw tier on this matrix (worst on islands/batch,
   mildest on deep large-N where update work dominates).
 

@@ -440,7 +440,7 @@ export declare interface ReactiveSystem {
 }
 ````
 
-`tests/userspacePrimitives.spec.ts` is the proof: signal, computed, and effect implemented entirely from this surface — glitch-free diamonds, equality cut-off, batching, re-tracking, implicit stamping — interoperating both directions with the built-ins in one graph, at parity on the benchmark suite.
+`tests/hostPrimitives.spec.ts` is the proof: signal, computed, and effect implemented entirely from this surface — glitch-free diamonds, equality cut-off, batching, re-tracking, implicit stamping — interoperating both directions with the built-ins in one graph, at parity on the benchmark suite.
 
 ## Constraints
 
