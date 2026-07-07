@@ -11,7 +11,7 @@ import { FRAMEWORKS } from './milomgFrameworks.js';
 const SUITES = {
 	sbench: (fw, log) => sbench(fw, log),
 	kairo: (fw, log) => kairoBench([{ framework: fw, testPullCounts: true }], log),
-	cellx: (fw, log) => cellxbench(fw, log),
+	cellx: (fw, log) => cellxbench([{ framework: fw, testPullCounts: true }], log),
 	dynamic: (fw, log) => dynamicBench([{ framework: fw, testPullCounts: true }], log),
 };
 

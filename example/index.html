@@ -41,19 +41,30 @@
 					<div class="stat"><span id="stat-recomputed">–</span><label>recomputed this frame</label></div>
 					<div class="stat"><span id="stat-share">–</span><label>of the graph</label></div>
 					<div class="stat"><span id="stat-frame">–</span><label>frame compute</label></div>
+					<div class="stat"><span id="stat-avg">–</span><label>avg frame compute</label></div>
 					<div class="stat"><span id="stat-fps">–</span><label>fps</label></div>
 					<div class="stat"><span id="stat-arena">–</span><label>graph memory</label></div>
 					<div class="stat"><span id="stat-heap">–</span><label>js heap</label></div>
 				</section>
 				<section id="controls">
 					<span class="libpick" id="lib-bar" role="group" aria-label="library">
-						<button data-lib="dalien-signals">dalien-signals</button>
-						<button data-lib="alien-signals">alien-signals</button>
-						<button data-lib="@preact/signals-core">preact</button>
-						<button data-lib="@reactively/core">reactively</button>
+						<button data-v="dalien-signals">dalien-signals</button>
+						<button data-v="alien-signals">alien-signals</button>
+						<button data-v="@preact/signals-core">preact</button>
+						<button data-v="@reactively/core">reactively</button>
 					</span>
-					<button id="btn-wave" class="on">wave</button>
-					<button id="btn-storm">storm</button>
+					<span class="libpick" id="tier-bar" role="group" aria-label="graph size">
+						<button data-v="480p">480p</button>
+						<button data-v="720p">720p</button>
+						<button data-v="1080p">1080p</button>
+						<button data-v="4k">4k</button>
+						<button data-v="8k">8k</button>
+					</span>
+					<span class="libpick" id="mode-bar" role="group" aria-label="mode">
+						<button data-v="off">off</button>
+						<button data-v="wave">wave</button>
+						<button data-v="storm">storm</button>
+					</span>
 					<button id="btn-cutoff">equality cutoff: on</button>
 					<button id="btn-invalidate">invalidate everything</button>
 					<span id="note"></span>
