@@ -1,0 +1,81 @@
+framework                        , test                                                         , time    
+Dalien Signals                   , createSignals                                                , 27.96   
+Dalien Signals                   , createComputations                                           , 913.22  
+Dalien Signals                   , updateSignals                                                , 1738.16 
+Dalien Signals                   , avoidablePropagation                                         , 135.29  
+Dalien Signals                   , broadPropagation                                             , 323.64  
+Dalien Signals                   , deepPropagation                                              , 90.74   
+Dalien Signals                   , diamond                                                      , 168.66  
+Dalien Signals                   , mux                                                          , 137.78  
+Dalien Signals                   , repeatedObservers                                            , 29.16   
+Dalien Signals                   , triangle                                                     , 53.26   
+Dalien Signals                   , unstable                                                     , 68.99   
+Dalien Signals                   , molBench                                                     , 23.60   
+Dalien Signals                   , cellx1000                                                    , 38.57   
+Dalien Signals                   , cellx2500                                                    , 94.95   
+Dalien Signals                   , 2-10x5 - lazy80%                                             , 455.80  
+Dalien Signals                   , 6-10x10 - dyn25% - lazy80%                                   , 234.72  
+Dalien Signals                   , 4-1000x12 - dyn5%                                            , 702.00  
+Dalien Signals                   , 25-1000x5                                                    , 685.10  
+Dalien Signals                   , 3-5x500                                                      , 176.02  
+Dalien Signals                   , 6-100x15 - dyn50%                                            , 371.39  
+Alien Signals                    , createSignals                                                , 10.44   
+Alien Signals                    , createComputations                                           , 109.36  
+Alien Signals                    , updateSignals                                                , 568.34  
+Alien Signals                    , avoidablePropagation                                         , 100.34  
+Alien Signals                    , broadPropagation                                             , 200.47  
+Alien Signals                    , deepPropagation                                              , 64.85   
+Alien Signals                    , diamond                                                      , 138.74  
+Alien Signals                    , mux                                                          , 114.58  
+Alien Signals                    , repeatedObservers                                            , 38.60   
+Alien Signals                    , triangle                                                     , 44.83   
+Alien Signals                    , unstable                                                     , 49.48   
+Alien Signals                    , molBench                                                     , 19.95   
+Alien Signals                    , cellx1000                                                    , 10.74   
+Alien Signals                    , cellx2500                                                    , 37.43   
+Alien Signals                    , 2-10x5 - lazy80%                                             , 378.83  
+Alien Signals                    , 6-10x10 - dyn25% - lazy80%                                   , 261.33  
+Alien Signals                    , 4-1000x12 - dyn5%                                            , 665.52  
+Alien Signals                    , 25-1000x5                                                    , 890.82  
+Alien Signals                    , 3-5x500                                                      , 172.17  
+Alien Signals                    , 6-100x15 - dyn50%                                            , 421.10  
+Reactively                       , createSignals                                                , 9.40    
+Reactively                       , createComputations                                           , 91.60   
+Reactively                       , updateSignals                                                , 402.92  
+Reactively                       , avoidablePropagation                                         , 228.07  
+Reactively                       , broadPropagation                                             , 310.09  
+Reactively                       , deepPropagation                                              , 131.56  
+Reactively                       , diamond                                                      , 115.41  
+Reactively                       , mux                                                          , 207.66  
+Reactively                       , repeatedObservers                                            , 27.18   
+Reactively                       , triangle                                                     , 53.63   
+Reactively                       , unstable                                                     , 111.56  
+Reactively                       , molBench                                                     , 20.15   
+Reactively                       , cellx1000                                                    , 22.21   
+Reactively                       , cellx2500                                                    , 55.58   
+Reactively                       , 2-10x5 - lazy80%                                             , 395.15  
+Reactively                       , 6-10x10 - dyn25% - lazy80%                                   , 202.05  
+Reactively                       , 4-1000x12 - dyn5%                                            , 454.51  
+Reactively                       , 25-1000x5                                                    , 449.68  
+Reactively                       , 3-5x500                                                      , 155.76  
+Reactively                       , 6-100x15 - dyn50%                                            , 285.45  
+Preact Signals                   , createSignals                                                , 2.86    
+Preact Signals                   , createComputations                                           , 129.95  
+Preact Signals                   , updateSignals                                                , 532.29  
+Preact Signals                   , avoidablePropagation                                         , 89.51   
+Preact Signals                   , broadPropagation                                             , 207.61  
+Preact Signals                   , deepPropagation                                              , 66.11   
+Preact Signals                   , diamond                                                      , 126.24  
+Preact Signals                   , mux                                                          , 106.46  
+Preact Signals                   , repeatedObservers                                            , 19.37   
+Preact Signals                   , triangle                                                     , 46.12   
+Preact Signals                   , unstable                                                     , 34.93   
+Preact Signals                   , molBench                                                     , 19.49   
+Preact Signals                   , cellx1000                                                    , 9.05    
+Preact Signals                   , cellx2500                                                    , 31.89   
+Preact Signals                   , 2-10x5 - lazy80%                                             , 453.54  
+Preact Signals                   , 6-10x10 - dyn25% - lazy80%                                   , 298.92  
+Preact Signals                   , 4-1000x12 - dyn5%                                            , 724.54  
+Preact Signals                   , 25-1000x5                                                    , 880.19  
+Preact Signals                   , 3-5x500                                                      , 181.19  
+Preact Signals                   , 6-100x15 - dyn50%                                            , 417.59  
