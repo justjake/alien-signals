@@ -907,8 +907,9 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 	// engine's read()/computedRead(): a SIGNAL read is a flags check, a link,
 	// and the value load — the version gate and the read memo exist to make
 	// the kind-dispatching raw get() fast, and putting them on every callable
-	// read is what made the callable tier measure 10-25% over raw (BENCHMARKS
-	// "Write-size crossover matrix"). Verification cost belongs to computeds,
+	// read measured 10% to 25% slower than the raw tier, by workload family
+	// (BENCHMARKS "Write-size crossover matrix"). Verification belongs to
+	// computeds,
 	// paid per re-verification in readComputed's gate, not per read.
 	function readSignal(id: SignalId): unknown {
 		const flags = M[id + NodeSlot.Flags];
