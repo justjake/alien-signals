@@ -104,3 +104,23 @@ test('a member disposed early is not double-freed by its scope', async () => {
 	expect(get(stranger)).toBe(42);
 	dispose(stranger);
 });
+
+test('a GC-owned scope tears down when its owner is collected', async () => {
+	expect(typeof globalThis.gc).toBe('function');
+	let s!: ReturnType<typeof signalRaw<number>>;
+	(() => {
+		const handle = { name: 'scope-handle' };
+		effectScopeRaw(() => {
+			s = signalRaw(7);
+		}, handle);
+	})();
+	expect(isSignal(s)).toBe(true);
+	for (let i = 0; i < 10; i++) {
+		globalThis.gc!();
+		await new Promise((resolve) => setTimeout(resolve, 1));
+	}
+	// Owner collected -> scope disposed -> region freed (another tick for
+	// the deferred region flush).
+	await new Promise((resolve) => setTimeout(resolve, 1));
+	expect(isSignal(s)).toBe(false);
+});
