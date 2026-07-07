@@ -854,21 +854,17 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 			M[id + NodeSlot.Flags] = (flags & (Host.Hidden | Host.HasChildEffect)) | Flag.Watching;
 		}
 	}
+	// The exception cleanup lives in a catch, not a finally: a finally's
+	// bytecode runs on the normal path too, and this function's first call
+	// carries the whole queue — the drain loop below gets on-stack-replaced
+	// and the function compiled before a normal exit has ever executed, so
+	// finally-block feedback stays empty and every later call re-deopts at
+	// the same untrained compare. A catch body only ever runs via a throw,
+	// so the normal path carries no never-executed bytecode.
 	function flush(): void {
 		try {
-			while (notifyIndex < queuedLength) {
-				const i = notifyIndex++;
-				const id = queued[i];
-				// A generation mismatch means the record was freed (and
-				// possibly reused) while queued: skip the stranger.
-				if (M[id + NodeSlot.Gen] === queuedGens[i]) {
-					const fn = fns[id >> Arena.NodeIndexShift];
-					if (fn !== undefined) {
-						run(id, fn);
-					}
-				}
-			}
-		} finally {
+			drainQueue();
+		} catch (e) {
 			// Abnormal exit (an effect threw): survivors are re-armed — a change
 			// to THEIR dependencies re-notifies them — but the failed flush does
 			// not resume on unrelated writes (upstream parity).
@@ -881,7 +877,24 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 			}
 			notifyIndex = 0;
 			queuedLength = 0;
+			throw e;
 		}
+	}
+	function drainQueue(): void {
+		while (notifyIndex < queuedLength) {
+			const i = notifyIndex++;
+			const id = queued[i];
+			// A generation mismatch means the record was freed (and
+			// possibly reused) while queued: skip the stranger.
+			if (M[id + NodeSlot.Gen] === queuedGens[i]) {
+				const fn = fns[id >> Arena.NodeIndexShift];
+				if (fn !== undefined) {
+					run(id, fn);
+				}
+			}
+		}
+		notifyIndex = 0;
+		queuedLength = 0;
 	}
 	function runCleanup(idx: number): void {
 		const cleanup = cleanups[idx] as () => void;
