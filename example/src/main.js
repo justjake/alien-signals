@@ -60,16 +60,20 @@ const image = ctx.createImageData(WIDTH, DEPTH);
 const data = image.data;
 const flash = new Float32Array(WIDTH * DEPTH);
 
+// Left button paints lightness; right button paints darkness (erases).
 let painting = false;
+canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 canvas.addEventListener('pointerdown', (e) => { painting = true; canvas.setPointerCapture(e.pointerId); paint(e); });
 canvas.addEventListener('pointermove', (e) => { if (painting) paint(e); });
 canvas.addEventListener('pointerup', () => { painting = false; });
 
 function paint(e) {
+	const dark = (e.buttons & 2) !== 0 || e.button === 2;
 	const rect = canvas.getBoundingClientRect();
 	const x = Math.floor(((e.clientX - rect.left) / rect.width) * WIDTH);
 	for (let dx = -2; dx <= 2; dx++) {
-		graph.sources[(x + dx + WIDTH) % WIDTH](1 - Math.abs(dx) * 0.18);
+		const v = dark ? 0 : 1 - Math.abs(dx) * 0.18;
+		graph.sources[(x + dx + WIDTH) % WIDTH](v);
 	}
 }
 
