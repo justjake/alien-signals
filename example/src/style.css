@@ -105,3 +105,11 @@ section > p { max-width: 72ch; color: #b7bdcc; }
 
 .libpick { color: #9aa1b2; font-size: 13px; display: flex; gap: 8px; align-items: center; }
 .libpick select { background: #161a24; color: #e8eaf0; border: 1px solid #2a3040; border-radius: 6px; padding: 6px 8px; font: inherit; }
+
+#w-bench .actions { display: flex; gap: 12px; align-items: center; margin: 14px 0; }
+#w-bench button { background: #161a24; color: #e8eaf0; border: 1px solid #2a3040; padding: 7px 14px; border-radius: 6px; font: inherit; cursor: pointer; }
+#w-bench button:disabled { opacity: 0.5; cursor: default; }
+#w-bench svg { width: 100%; max-width: 780px; }
+#w-bench .bench-name { fill: #e8eaf0; font: 600 13px ui-sans-serif, system-ui; }
+#w-bench .lib { fill: #9aa1b2; font: 11px ui-sans-serif, system-ui; text-anchor: end; }
+#w-bench .val { fill: #9aa1b2; font: 11px ui-monospace, monospace; }

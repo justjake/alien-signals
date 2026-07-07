@@ -6,6 +6,7 @@ import { signal, computed, effect } from 'dalien-signals';
 import { buildGraph } from './graph.js';
 import { ADAPTERS } from './adapters.js';
 import { mountCounter, mountStepper, mountSheet } from './widgets.js';
+import { mountBench } from './bench.js';
 
 const WIDTH = 192;
 const DEPTH = 108;
@@ -200,3 +201,4 @@ requestAnimationFrame(frame);
 mountCounter(document.getElementById('w-counter'));
 mountStepper(document.getElementById('w-stepper'));
 mountSheet(document.getElementById('w-sheet'));
+mountBench(document.getElementById('w-bench'));
