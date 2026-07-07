@@ -1,0 +1,301 @@
+framework                        , test                                                         , time    
+Alien Signals                    , createSignals                                                , 5.08    
+Alien Signals                    , createComputations                                           , 82.10   
+Alien Signals                    , updateSignals                                                , 525.62  
+Alien Signals                    , avoidablePropagation                                         , 100.89  
+Alien Signals                    , broadPropagation                                             , 194.21  
+Alien Signals                    , deepPropagation                                              , 61.38   
+Alien Signals                    , diamond                                                      , 129.29  
+Alien Signals                    , mux                                                          , 109.27  
+Alien Signals                    , repeatedObservers                                            , 33.23   
+Alien Signals                    , triangle                                                     , 44.69   
+Alien Signals                    , unstable                                                     , 46.28   
+Alien Signals                    , molBench                                                     , 19.74   
+Alien Signals                    , cellx1000                                                    , 8.69    
+Alien Signals                    , cellx2500                                                    , 25.25   
+Alien Signals                    , 2-10x5 - lazy80%                                             , 342.85  
+Alien Signals                    , 6-10x10 - dyn25% - lazy80%                                   , 237.00  
+Alien Signals                    , 4-1000x12 - dyn5%                                            , 580.76  
+Alien Signals                    , 25-1000x5                                                    , 763.60  
+Alien Signals                    , 3-5x500                                                      , 152.33  
+Alien Signals                    , 6-100x15 - dyn50%                                            , 367.23  
+Dalien Signals                   , createSignals                                                , 9.98    
+Dalien Signals                   , createComputations                                           , 82.72   
+Dalien Signals                   , updateSignals                                                , 411.91  
+Dalien Signals                   , avoidablePropagation                                         , 107.17  
+Dalien Signals                   , broadPropagation                                             , 163.23  
+Dalien Signals                   , deepPropagation                                              , 61.12   
+Dalien Signals                   , diamond                                                      , 139.56  
+Dalien Signals                   , mux                                                          , 104.03  
+Dalien Signals                   , repeatedObservers                                            , 23.20   
+Dalien Signals                   , triangle                                                     , 47.98   
+Dalien Signals                   , unstable                                                     , 56.25   
+Dalien Signals                   , molBench                                                     , 21.52   
+Dalien Signals                   , cellx1000                                                    , 12.99   
+Dalien Signals                   , cellx2500                                                    , 33.09   
+Dalien Signals                   , 2-10x5 - lazy80%                                             , 363.37  
+Dalien Signals                   , 6-10x10 - dyn25% - lazy80%                                   , 226.80  
+Dalien Signals                   , 4-1000x12 - dyn5%                                            , 531.24  
+Dalien Signals                   , 25-1000x5                                                    , 549.99  
+Dalien Signals                   , 3-5x500                                                      , 145.16  
+Dalien Signals                   , 6-100x15 - dyn50%                                            , 333.88  
+Dalien Malloc Free               , createSignals                                                , 8.43    
+Dalien Malloc Free               , createComputations                                           , 75.01   
+Dalien Malloc Free               , updateSignals                                                , 478.92  
+Dalien Malloc Free               , avoidablePropagation                                         , 116.77  
+Dalien Malloc Free               , broadPropagation                                             , 165.57  
+Dalien Malloc Free               , deepPropagation                                              , 59.90   
+Dalien Malloc Free               , diamond                                                      , 137.99  
+Dalien Malloc Free               , mux                                                          , 111.51  
+Dalien Malloc Free               , repeatedObservers                                            , 23.55   
+Dalien Malloc Free               , triangle                                                     , 43.95   
+Dalien Malloc Free               , unstable                                                     , 38.30   
+Dalien Malloc Free               , molBench                                                     , 24.18   
+Dalien Malloc Free               , cellx1000                                                    , 9.75    
+Dalien Malloc Free               , cellx2500                                                    , 18.24   
+Dalien Malloc Free               , 2-10x5 - lazy80%                                             , 345.39  
+Dalien Malloc Free               , 6-10x10 - dyn25% - lazy80%                                   , 203.16  
+Dalien Malloc Free               , 4-1000x12 - dyn5%                                            , 450.64  
+Dalien Malloc Free               , 25-1000x5                                                    , 512.35  
+Dalien Malloc Free               , 3-5x500                                                      , 139.64  
+Dalien Malloc Free               , 6-100x15 - dyn50%                                            , 303.96  
+Angular Signals                  , createSignals                                                , 28.28   
+Angular Signals                  , createComputations                                           , 524.76  
+Angular Signals                  , updateSignals                                                , 1049.56 
+Angular Signals                  , avoidablePropagation                                         , 167.39  
+Angular Signals                  , broadPropagation                                             , 306.17  
+Angular Signals                  , deepPropagation                                              , 96.51   
+Angular Signals                  , diamond                                                      , 187.32  
+Angular Signals                  , mux                                                          , 249.34  
+Angular Signals                  , repeatedObservers                                            , 30.62   
+Angular Signals                  , triangle                                                     , 62.88   
+Angular Signals                  , unstable                                                     , 65.84   
+Angular Signals                  , molBench                                                     , 20.45   
+Angular Signals                  , cellx1000                                                    , 16.84   
+Angular Signals                  , cellx2500                                                    , 64.37   
+Angular Signals                  , 2-10x5 - lazy80%                                             , 526.71  
+Angular Signals                  , 6-10x10 - dyn25% - lazy80%                                   , 339.00  
+Angular Signals                  , 4-1000x12 - dyn5%                                            , 706.76  
+Angular Signals                  , 25-1000x5                                                    , 901.21  
+Angular Signals                  , 3-5x500                                                      , 230.24  
+Angular Signals                  , 6-100x15 - dyn50%                                            , 459.29  
+Compostate                       , createSignals                                                , 11.70   
+Compostate                       , createComputations                                           , 305.14  
+Compostate                       , updateSignals                                                , 1700.64 
+Compostate                       , avoidablePropagation                                         , 239.03  
+Compostate                       , broadPropagation                                             , 1054.56 
+Compostate                       , deepPropagation                                              , 366.52  
+Compostate                       , diamond                                                      , 670.46  
+Compostate                       , mux                                                          , 240.01  
+Compostate                       , repeatedObservers                                            , 96.58   
+Compostate                       , triangle                                                     , 320.90  
+Compostate                       , unstable                                                     , 170.62  
+Compostate                       , molBench                                                     , 32.71   
+Compostate                       , cellx1000                                                    , 87.39   
+Compostate                       , cellx2500                                                    , 232.69  
+Compostate                       , 2-10x5 - lazy80%                                             , 2884.43 
+Compostate                       , 6-10x10 - dyn25% - lazy80%                                   , 2933.38 
+Compostate                       , 4-1000x12 - dyn5%                                            , 3909.30 
+Compostate                       , 25-1000x5                                                    , 9400.04 
+Compostate                       , 3-5x500                                                      , 2223.03 
+Compostate                       , 6-100x15 - dyn50%                                            , 3323.61 
+MobX                             , createSignals                                                , 10.27   
+MobX                             , createComputations                                           , 725.16  
+MobX                             , updateSignals                                                , 1706.74 
+MobX                             , avoidablePropagation                                         , 663.15  
+MobX                             , broadPropagation                                             , 1016.85 
+MobX                             , deepPropagation                                              , 369.71  
+MobX                             , diamond                                                      , 674.73  
+MobX                             , mux                                                          , 395.27  
+MobX                             , repeatedObservers                                            , 66.87   
+MobX                             , triangle                                                     , 212.90  
+MobX                             , unstable                                                     , 124.69  
+MobX                             , molBench                                                     , 23.13   
+MobX                             , cellx1000                                                    , 48.56   
+MobX                             , cellx2500                                                    , 158.29  
+MobX                             , 2-10x5 - lazy80%                                             , 1588.34 
+MobX                             , 6-10x10 - dyn25% - lazy80%                                   , 904.25  
+MobX                             , 4-1000x12 - dyn5%                                            , 1518.06 
+MobX                             , 25-1000x5                                                    , 2072.13 
+MobX                             , 3-5x500                                                      , 597.56  
+MobX                             , 6-100x15 - dyn50%                                            , 1070.40 
+Preact Signals                   , createSignals                                                , 0.92    
+Preact Signals                   , createComputations                                           , 113.69  
+Preact Signals                   , updateSignals                                                , 554.04  
+Preact Signals                   , avoidablePropagation                                         , 84.47   
+Preact Signals                   , broadPropagation                                             , 198.93  
+Preact Signals                   , deepPropagation                                              , 76.71   
+Preact Signals                   , diamond                                                      , 119.71  
+Preact Signals                   , mux                                                          , 101.94  
+Preact Signals                   , repeatedObservers                                            , 19.14   
+Preact Signals                   , triangle                                                     , 51.93   
+Preact Signals                   , unstable                                                     , 35.25   
+Preact Signals                   , molBench                                                     , 19.52   
+Preact Signals                   , cellx1000                                                    , 9.54    
+Preact Signals                   , cellx2500                                                    , 22.58   
+Preact Signals                   , 2-10x5 - lazy80%                                             , 420.07  
+Preact Signals                   , 6-10x10 - dyn25% - lazy80%                                   , 285.40  
+Preact Signals                   , 4-1000x12 - dyn5%                                            , 648.00  
+Preact Signals                   , 25-1000x5                                                    , 841.64  
+Preact Signals                   , 3-5x500                                                      , 170.43  
+Preact Signals                   , 6-100x15 - dyn50%                                            , 398.09  
+Reactively                       , createSignals                                                , 2.80    
+Reactively                       , createComputations                                           , 115.61  
+Reactively                       , updateSignals                                                , 326.71  
+Reactively                       , avoidablePropagation                                         , 215.21  
+Reactively                       , broadPropagation                                             , 296.99  
+Reactively                       , deepPropagation                                              , 126.14  
+Reactively                       , diamond                                                      , 114.70  
+Reactively                       , mux                                                          , 173.79  
+Reactively                       , repeatedObservers                                            , 26.63   
+Reactively                       , triangle                                                     , 50.55   
+Reactively                       , unstable                                                     , 98.75   
+Reactively                       , molBench                                                     , 20.11   
+Reactively                       , cellx1000                                                    , 20.04   
+Reactively                       , cellx2500                                                    , 48.61   
+Reactively                       , 2-10x5 - lazy80%                                             , 362.79  
+Reactively                       , 6-10x10 - dyn25% - lazy80%                                   , 176.58  
+Reactively                       , 4-1000x12 - dyn5%                                            , 397.71  
+Reactively                       , 25-1000x5                                                    , 384.50  
+Reactively                       , 3-5x500                                                      , 135.32  
+Reactively                       , 6-100x15 - dyn50%                                            , 246.57  
+s-js                             , createSignals                                                , 2.86    
+s-js                             , createComputations                                           , 71.11   
+s-js                             , updateSignals                                                , 568.89  
+s-js                             , avoidablePropagation                                         , 191.88  
+s-js                             , broadPropagation                                             , 181.74  
+s-js                             , deepPropagation                                              , 54.76   
+s-js                             , diamond                                                      , 153.08  
+s-js                             , mux                                                          , 169.50  
+s-js                             , repeatedObservers                                            , 46.71   
+s-js                             , triangle                                                     , 50.94   
+s-js                             , unstable                                                     , 71.11   
+s-js                             , molBench                                                     , 30.81   
+s-js                             , cellx1000                                                    , 10.18   
+s-js                             , cellx2500                                                    , 28.82   
+s-js                             , 2-10x5 - lazy80%                                             , 867.07  
+s-js                             , 6-10x10 - dyn25% - lazy80%                                   , 370.33  
+s-js                             , 4-1000x12 - dyn5%                                            , 522.67  
+s-js                             , 25-1000x5                                                    , 837.94  
+s-js                             , 3-5x500                                                      , 216.51  
+s-js                             , 6-100x15 - dyn50%                                            , 454.33  
+SolidJS                          , createSignals                                                , 8.31    
+SolidJS                          , createComputations                                           , 140.37  
+SolidJS                          , updateSignals                                                , 948.85  
+SolidJS                          , avoidablePropagation                                         , 279.51  
+SolidJS                          , broadPropagation                                             , 483.88  
+SolidJS                          , deepPropagation                                              , 172.98  
+SolidJS                          , diamond                                                      , 330.97  
+SolidJS                          , mux                                                          , 204.69  
+SolidJS                          , repeatedObservers                                            , 95.84   
+SolidJS                          , triangle                                                     , 122.86  
+SolidJS                          , unstable                                                     , 124.85  
+SolidJS                          , molBench                                                     , 25.45   
+SolidJS                          , cellx1000                                                    , 16.93   
+SolidJS                          , cellx2500                                                    , 46.72   
+SolidJS                          , 2-10x5 - lazy80%                                             , 1885.42 
+SolidJS                          , 6-10x10 - dyn25% - lazy80%                                   , 675.81  
+SolidJS                          , 4-1000x12 - dyn5%                                            , 1254.32 
+SolidJS                          , 25-1000x5                                                    , 1530.01 
+SolidJS                          , 3-5x500                                                      , 425.46  
+SolidJS                          , 6-100x15 - dyn50%                                            , 732.43  
+Pota                             , createSignals                                                , 8.95    
+Pota                             , createComputations                                           , 130.32  
+Pota                             , updateSignals                                                , 933.66  
+Pota                             , avoidablePropagation                                         , 367.36  
+Pota                             , broadPropagation                                             , 511.60  
+Pota                             , deepPropagation                                              , 202.96  
+Pota                             , diamond                                                      , 332.96  
+Pota                             , mux                                                          , 223.63  
+Pota                             , repeatedObservers                                            , 103.50  
+Pota                             , triangle                                                     , 132.57  
+Pota                             , unstable                                                     , 129.30  
+Pota                             , molBench                                                     , 24.90   
+Pota                             , cellx1000                                                    , 21.98   
+Pota                             , cellx2500                                                    , 68.63   
+Pota                             , 2-10x5 - lazy80%                                             , 965.83  
+Pota                             , 6-10x10 - dyn25% - lazy80%                                   , 540.09  
+Pota                             , 4-1000x12 - dyn5%                                            , 1059.95 
+Pota                             , 25-1000x5                                                    , 1336.22 
+Pota                             , 3-5x500                                                      , 428.27  
+Pota                             , 6-100x15 - dyn50%                                            , 697.67  
+Svelte v5                        , createSignals                                                , 2.17    
+Svelte v5                        , createComputations                                           , 90.41   
+Svelte v5                        , updateSignals                                                , 1101.33 
+Svelte v5                        , avoidablePropagation                                         , 447.35  
+Svelte v5                        , broadPropagation                                             , 295.44  
+Svelte v5                        , deepPropagation                                              , 125.89  
+Svelte v5                        , diamond                                                      , 341.39  
+Svelte v5                        , mux                                                          , 147.79  
+Svelte v5                        , repeatedObservers                                            , 59.79   
+Svelte v5                        , triangle                                                     , 99.17   
+Svelte v5                        , unstable                                                     , 116.15  
+Svelte v5                        , molBench                                                     , 22.27   
+Svelte v5                        , cellx1000                                                    , 15.14   
+Svelte v5                        , cellx2500                                                    , 41.92   
+Svelte v5                        , 2-10x5 - lazy80%                                             , 1017.41 
+Svelte v5                        , 6-10x10 - dyn25% - lazy80%                                   , 325.69  
+Svelte v5                        , 4-1000x12 - dyn5%                                            , 921.90  
+Svelte v5                        , 25-1000x5                                                    , 1056.58 
+Svelte v5                        , 3-5x500                                                      , 185.77  
+Svelte v5                        , 6-100x15 - dyn50%                                            , 386.65  
+amadeus-it-group/tansu           , createSignals                                                , 40.50   
+amadeus-it-group/tansu           , createComputations                                           , 682.33  
+amadeus-it-group/tansu           , updateSignals                                                , 1614.78 
+amadeus-it-group/tansu           , avoidablePropagation                                         , 236.37  
+amadeus-it-group/tansu           , broadPropagation                                             , 436.76  
+amadeus-it-group/tansu           , deepPropagation                                              , 136.30  
+amadeus-it-group/tansu           , diamond                                                      , 249.71  
+amadeus-it-group/tansu           , mux                                                          , 238.97  
+amadeus-it-group/tansu           , repeatedObservers                                            , 54.10   
+amadeus-it-group/tansu           , triangle                                                     , 78.71   
+amadeus-it-group/tansu           , unstable                                                     , 118.87  
+amadeus-it-group/tansu           , molBench                                                     , 20.90   
+amadeus-it-group/tansu           , cellx1000                                                    , 36.56   
+amadeus-it-group/tansu           , cellx2500                                                    , 184.62  
+amadeus-it-group/tansu           , 2-10x5 - lazy80%                                             , 704.26  
+amadeus-it-group/tansu           , 6-10x10 - dyn25% - lazy80%                                   , 412.31  
+amadeus-it-group/tansu           , 4-1000x12 - dyn5%                                            , 975.72  
+amadeus-it-group/tansu           , 25-1000x5                                                    , 1045.82 
+amadeus-it-group/tansu           , 3-5x500                                                      , 304.60  
+amadeus-it-group/tansu           , 6-100x15 - dyn50%                                            , 546.87  
+Vue                              , createSignals                                                , 6.01    
+Vue                              , createComputations                                           , 227.35  
+Vue                              , updateSignals                                                , 506.11  
+Vue                              , avoidablePropagation                                         , 157.30  
+Vue                              , broadPropagation                                             , 220.30  
+Vue                              , deepPropagation                                              , 92.68   
+Vue                              , diamond                                                      , 155.03  
+Vue                              , mux                                                          , 162.76  
+Vue                              , repeatedObservers                                            , 27.09   
+Vue                              , triangle                                                     , 56.97   
+Vue                              , unstable                                                     , 45.48   
+Vue                              , molBench                                                     , 40.87   
+Vue                              , cellx1000                                                    , 20.03   
+Vue                              , cellx2500                                                    , 58.89   
+Vue                              , 2-10x5 - lazy80%                                             , 463.60  
+Vue                              , 6-10x10 - dyn25% - lazy80%                                   , 348.54  
+Vue                              , 4-1000x12 - dyn5%                                            , 908.88  
+Vue                              , 25-1000x5                                                    , 1091.21 
+Vue                              , 3-5x500                                                      , 227.34  
+Vue                              , 6-100x15 - dyn50%                                            , 484.24  
+x-reactivity                     , createSignals                                                , 9.49    
+x-reactivity                     , createComputations                                           , 354.81  
+x-reactivity                     , updateSignals                                                , 1898.33 
+x-reactivity                     , avoidablePropagation                                         , 348.63  
+x-reactivity                     , broadPropagation                                             , 597.53  
+x-reactivity                     , deepPropagation                                              , 186.66  
+x-reactivity                     , diamond                                                      , 431.48  
+x-reactivity                     , mux                                                          , 223.95  
+x-reactivity                     , repeatedObservers                                            , 77.24   
+x-reactivity                     , triangle                                                     , 130.73  
+x-reactivity                     , unstable                                                     , 152.31  
+x-reactivity                     , molBench                                                     , 25.78   
+x-reactivity                     , cellx1000                                                    , 28.60   
+x-reactivity                     , cellx2500                                                    , 77.82   
+x-reactivity                     , 2-10x5 - lazy80%                                             , 2155.96 
+x-reactivity                     , 6-10x10 - dyn25% - lazy80%                                   , 577.95  
+x-reactivity                     , 4-1000x12 - dyn5%                                            , 876.46  
+x-reactivity                     , 25-1000x5                                                    , 1091.39 
+x-reactivity                     , 3-5x500                                                      , 343.02  
+x-reactivity                     , 6-100x15 - dyn50%                                            , 578.95  
