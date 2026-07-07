@@ -18,7 +18,17 @@ canvas {
 	cursor: crosshair;
 	touch-action: none;
 }
-#hud { display: flex; gap: 28px; flex-wrap: wrap; margin: 14px 0 10px; }
+/* Grid tracks size from the container, not the content: a value gaining
+   a digit cannot move its neighbors. tabular-nums (below) keeps digits
+   equal-width so values don't wiggle inside their own tile either. */
+#hud {
+	display: grid;
+	grid-template-columns: repeat(auto-fill, minmax(225px, 1fr));
+	gap: 14px 20px;
+	margin: 14px 0 10px;
+}
+.stat { min-width: 0; }
+.stat > span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .stat > span { display: block; font-size: 22px; font-variant-numeric: tabular-nums; }
 .stat .avg { font-size: 14px; color: #9aa1b2; }
 .stat label { color: #9aa1b2; font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; }
