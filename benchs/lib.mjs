@@ -5,9 +5,7 @@
 
 export const KAIRO = new Set(['avoidablePropagation', 'broadPropagation', 'deepPropagation', 'diamond', 'mux', 'repeatedObservers', 'triangle', 'unstable', 'molBench']);
 
-// sbench test names differ between the milomg and transitive-bullshit forks
-// (createSignals vs createDataSignals/createComputations0to1/...), but all
-// share the create*/update* prefixes.
+// sbench test names all share the create*/update* prefixes.
 export const suiteOf = (test) => (test.startsWith('create') || test.startsWith('update')) ? 'sbench'
 	: KAIRO.has(test) ? 'kairo'
 	: test.startsWith('cellx') ? 'cellx'
