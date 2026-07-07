@@ -17,6 +17,9 @@ export default defineConfig({
 			{ find: /^alien-signals\/esm$/, replacement: here('./node_modules/alien-signals/esm/index.mjs') },
 			{ find: /^alien-signals$/, replacement: here('./node_modules/alien-signals/esm/index.mjs') },
 			{ find: /^@preact\/signals-core$/, replacement: here('./node_modules/@preact/signals-core/dist/signals-core.mjs') },
+			// the pinned harness's adapter imports the React-flavoured package name;
+			// signals-core exports the same signal/computed/effect/batch surface
+			{ find: /^@preact\/signals$/, replacement: here('./node_modules/@preact/signals-core/dist/signals-core.mjs') },
 			{ find: /^@reactively\/core$/, replacement: here('./node_modules/@reactively/core/dist/core.js') },
 		],
 	},
