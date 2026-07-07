@@ -4,11 +4,16 @@
 // unchanged projections free — writing the same fps twice touches nothing.
 import { signal, computed, effect } from 'dalien-signals';
 import { buildGraph } from './graph.js';
+import { ADAPTERS } from './adapters.js';
 import { mountCounter, mountStepper, mountSheet } from './widgets.js';
 
 const WIDTH = 192;
 const DEPTH = 108;
-const graph = buildGraph(WIDTH, DEPTH);
+// The field can be driven by any of the adapter libraries; the page's own
+// state stays on dalien-signals regardless.
+const libName = signal('dalien-signals');
+const graphSig = signal(buildGraph(WIDTH, DEPTH, ADAPTERS[libName()]));
+let firstBuild = true;
 
 // ---- page state ---------------------------------------------------------------
 const wave = signal(true);
@@ -16,17 +21,18 @@ const storm = signal(false);
 const recomputedCount = signal(0);
 const frameMs = signal(0);
 const fps = signal(0);
-const note = signal(`graph built in ${graph.buildMs.toFixed(1)} ms`);
-const share = computed(() => `${((recomputedCount() / graph.nodes) * 100).toFixed(1)}%`);
-const cutoffLabel = computed(() => `equality cutoff: ${graph.quantize() ? 'on' : 'off'}`);
+const cutoffOn = signal(true);
+const note = signal(`graph built in ${graphSig().buildMs.toFixed(1)} ms`);
+const share = computed(() => `${((recomputedCount() / graphSig().nodes) * 100).toFixed(1)}%`);
+const cutoffLabel = computed(() => `equality cutoff: ${cutoffOn() ? 'on' : 'off'}`);
 
 // ---- state => document ----------------------------------------------------------
 const $ = (id) => document.getElementById(id);
 const bindText = (id, read) => effect(() => { $(id).textContent = read(); });
 const bindClass = (id, cls, read) => effect(() => { $(id).classList.toggle(cls, read()); });
 
-bindText('stat-nodes', () => graph.nodes.toLocaleString());
-bindText('stat-edges', () => graph.edges.toLocaleString());
+bindText('stat-nodes', () => graphSig().nodes.toLocaleString());
+bindText('stat-edges', () => graphSig().edges.toLocaleString());
 bindText('stat-recomputed', () => recomputedCount().toLocaleString());
 bindText('stat-share', share);
 bindText('stat-frame', () => `${frameMs().toFixed(2)} ms`);
@@ -34,7 +40,7 @@ bindText('stat-fps', () => String(fps()));
 // Every node and every edge is one 32-byte record in the arena — the whole
 // graph's storage is arithmetic, not a heap profile.
 const mb = (bytes) => `${(bytes / (1 << 20)).toFixed(1)} MB`;
-bindText('stat-arena', () => mb((graph.nodes + graph.edges) * 32));
+bindText('stat-arena', () => mb((graphSig().nodes + graphSig().edges) * 32));
 const heap = signal(NaN);
 bindText('stat-heap', () => (Number.isFinite(heap()) ? mb(heap()) : 'n/a'));
 if (performance.memory) {
@@ -49,8 +55,15 @@ bindClass('btn-storm', 'on', storm);
 // ---- input => state --------------------------------------------------------------
 $('btn-wave').addEventListener('click', () => wave(!wave()));
 $('btn-storm').addEventListener('click', () => storm(!storm()));
-$('btn-cutoff').addEventListener('click', () => timeFullPass(() => graph.quantize(!graph.quantize())));
-$('btn-invalidate').addEventListener('click', () => timeFullPass(() => graph.epoch(graph.epoch() + 1)));
+$('btn-cutoff').addEventListener('click', () => {
+	cutoffOn(!cutoffOn());
+	timeFullPass(() => graphSig().quantize.write(cutoffOn()));
+});
+$('btn-invalidate').addEventListener('click', () => {
+	const g = graphSig();
+	timeFullPass(() => g.epoch.write(g.epoch.read() + 1));
+});
+$('lib-select').addEventListener('change', (e) => libName(e.target.value));
 
 const canvas = $('grid');
 canvas.width = WIDTH;
@@ -59,6 +72,22 @@ const ctx = canvas.getContext('2d');
 const image = ctx.createImageData(WIDTH, DEPTH);
 const data = image.data;
 const flash = new Float32Array(WIDTH * DEPTH);
+
+// Rebuilding the field is a projection of state: the selected library
+// determines the graph. (Registered after `flash` exists — the effect body
+// runs at creation.)
+effect(() => {
+	const name = libName();
+	if (firstBuild) {
+		firstBuild = false; // the initial graph was built eagerly above
+		return;
+	}
+	const g = buildGraph(WIDTH, DEPTH, ADAPTERS[name]);
+	g.quantize.write(cutoffOn());
+	flash.fill(0);
+	graphSig(g);
+	note(`${name}: ${g.nodes.toLocaleString()} nodes built in ${g.buildMs.toFixed(1)} ms`);
+});
 
 // Left button paints lightness; right button paints darkness (erases).
 let painting = false;
@@ -71,18 +100,20 @@ function paint(e) {
 	const dark = (e.buttons & 2) !== 0 || e.button === 2;
 	const rect = canvas.getBoundingClientRect();
 	const x = Math.floor(((e.clientX - rect.left) / rect.width) * WIDTH);
+	const sources = graphSig().sources;
 	for (let dx = -2; dx <= 2; dx++) {
 		const v = dark ? 0 : 1 - Math.abs(dx) * 0.18;
-		graph.sources[(x + dx + WIDTH) % WIDTH](v);
+		sources[(x + dx + WIDTH) % WIDTH].write(v);
 	}
 }
 
 function timeFullPass(write) {
-	graph.recomputed.length = 0;
+	const g = graphSig();
+	g.recomputed.length = 0;
 	const t0 = performance.now();
 	write();
 	readAll();
-	note(`${graph.recomputed.length.toLocaleString()} recomputes in ${(performance.now() - t0).toFixed(1)} ms`);
+	note(`${g.recomputed.length.toLocaleString()} recomputes in ${(performance.now() - t0).toFixed(1)} ms`);
 }
 
 // ---- render loop ----------------------------------------------------------------
@@ -90,11 +121,11 @@ function timeFullPass(write) {
 // their version snapshot in a couple of loads. The frame's work is
 // proportional to the invalidation cone, not to the graph.
 function readAll() {
-	const rows = graph.rows;
+	const rows = graphSig().rows;
 	for (let r = 0; r < DEPTH; r++) {
 		const row = rows[r];
 		for (let i = 0; i < WIDTH; i++) {
-			const v = Math.max(0, Math.min(1, row[i]()));
+			const v = Math.max(0, Math.min(1, row[i].read()));
 			const p = (r * WIDTH + i) * 4;
 			// near-black -> indigo -> teal -> amber ramp
 			data[p] = v < 0.6 ? v * 60 : (v - 0.6) * 520;
@@ -115,23 +146,24 @@ const emitters = [
 ];
 
 function frame() {
-	graph.recomputed.length = 0;
+	const g = graphSig();
+	g.recomputed.length = 0;
 	if (wave()) {
 		phase += 1;
 		for (const em of emitters) {
 			const centre = (Math.sin(phase * em.speed) * em.span * 0.5 + 0.5) * WIDTH;
 			for (let dx = -em.width; dx <= em.width; dx++) {
 				const i = (Math.round(centre) + dx + WIDTH) % WIDTH;
-				graph.sources[i](em.gain * Math.max(0, 1 - Math.abs(dx) / (em.width + 1)));
+				g.sources[i].write(em.gain * Math.max(0, 1 - Math.abs(dx) / (em.width + 1)));
 			}
 		}
 		if (phase % 90 === 0) {
-			graph.sources[Math.floor(Math.random() * WIDTH)](1);
+			g.sources[Math.floor(Math.random() * WIDTH)].write(1);
 		}
 	}
 	if (storm()) {
 		for (let k = 0; k < 4; k++) {
-			graph.sources[Math.floor(Math.random() * WIDTH)](Math.random() * 0.9);
+			g.sources[Math.floor(Math.random() * WIDTH)].write(Math.random() * 0.9);
 		}
 	}
 
@@ -139,7 +171,7 @@ function frame() {
 	readAll();
 	frameMs(performance.now() - t0);
 
-	for (const index of graph.recomputed) flash[index] = 1;
+	for (const index of g.recomputed) flash[index] = 1;
 	for (let i = 0; i < flash.length; i++) {
 		const f = flash[i];
 		if (f > 0.02) {
@@ -153,7 +185,7 @@ function frame() {
 	}
 	ctx.putImageData(image, 0, 0);
 
-	recomputedCount(graph.recomputed.length);
+	recomputedCount(g.recomputed.length);
 	frames++;
 	const now = performance.now();
 	if (now - fpsWindow > 500) {

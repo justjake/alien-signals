@@ -8,6 +8,15 @@ importers:
 
   .:
     dependencies:
+      '@preact/signals-core':
+        specifier: ^1.14.4
+        version: 1.14.4
+      '@reactively/core':
+        specifier: ^0.0.8
+        version: 0.0.8
+      alien-signals:
+        specifier: ^3.2.1
+        version: 3.2.1
       dalien-signals:
         specifier: file:..
         version: file:..
@@ -35,6 +44,12 @@ packages:
 
   '@oxc-project/types@0.138.0':
     resolution: {integrity: sha512-1a7ZKmrRTCoN1XMZ4L0PyyqrMnrNlLyPuOkdSX2MZg7IiIGRUyurNhAm73ptDOraoBcIordsIGKNPKUzy3ZmfA==}
+
+  '@preact/signals-core@1.14.4':
+    resolution: {integrity: sha512-HNB6HYeYKhQbJ1aKl+YRjrS4+QWHLKX6qKoUsfS/m0vqzsVaEBiZiaKbG/e+NKk2ch5ALQr/ihWaMHxiCuuWHA==}
+
+  '@reactively/core@0.0.8':
+    resolution: {integrity: sha512-5uAnNf2gQSm3gM7z6Lx079H1/MuDQQI+5aYfwyDFGR9nHZj8yblLY/6aOJVWp+NcBwXVBKuWQ28qWHD9F1qN1w==}
 
   '@rolldown/binding-android-arm64@1.1.4':
     resolution: {integrity: sha512-EZLpf/8y7GXkkra90ML47kzik/GMP3EMcE9bPyHmRfxLC6z9+aW5A8poCsoxjrT5GfEcNAAvWwUHjvP1pUQkfw==}
@@ -130,6 +145,9 @@ packages:
 
   '@tybys/wasm-util@0.10.3':
     resolution: {integrity: sha512-F3fo1MYrRJYL3zER0OUOmkutjr1Vp23m7OsSgp7nq4SP6OqX6C/56XFIPAl5bt3zaBRjmW7SGz3u/6LwFpYcOg==}
+
+  alien-signals@3.2.1:
+    resolution: {integrity: sha512-I8FjmltrfnDFoZedi5CG8DghVYNhzb/Ijluz7tCSJH0xpd0484Kowhbb1XDYOxfJpU1p5wnM2X54dA+IfGyD1g==}
 
   dalien-signals@file:..:
     resolution: {directory: .., type: directory}
@@ -324,6 +342,10 @@ snapshots:
 
   '@oxc-project/types@0.138.0': {}
 
+  '@preact/signals-core@1.14.4': {}
+
+  '@reactively/core@0.0.8': {}
+
   '@rolldown/binding-android-arm64@1.1.4':
     optional: true
 
@@ -379,6 +401,8 @@ snapshots:
     dependencies:
       tslib: 2.8.1
     optional: true
+
+  alien-signals@3.2.1: {}
 
   dalien-signals@file:..: {}
 

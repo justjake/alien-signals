@@ -33,7 +33,9 @@
 					across the field to write signals directly. The pale shimmer
 					marks the cells that actually recomputed: a change flows down a
 					widening cone of dependents, and the rest of the graph is not
-					touched at all.
+					touched at all. The library selector rebuilds the same graph on
+					other signal implementations for comparison — the page itself
+					keeps running on dalien-signals.
 				</p>
 				<canvas id="grid"></canvas>
 				<section id="hud">
@@ -47,6 +49,14 @@
 					<div class="stat"><span id="stat-heap">–</span><label>js heap (browser estimate)</label></div>
 				</section>
 				<section id="controls">
+					<label class="libpick">library
+						<select id="lib-select">
+							<option value="dalien-signals" selected>dalien-signals</option>
+							<option value="alien-signals">alien-signals</option>
+							<option value="@preact/signals-core">@preact/signals-core</option>
+							<option value="@reactively/core">@reactively/core</option>
+						</select>
+					</label>
 					<button id="btn-wave" class="on">wave</button>
 					<button id="btn-storm">storm</button>
 					<button id="btn-cutoff">equality cutoff: on</button>
