@@ -32,9 +32,20 @@ Measured and rejected:
   experiment: per-mint weak cells in bursts cost more than the deferred
   queue, in every era.
 
-Remaining gaps (single-round; multi-round scoreboard pending):
-createSignals ~1.6 vs main, repeatedObservers/unstable ~1.2, dynamic
-band ~1.1–1.3, crossover microkernels ~1.15/main uniformly.
+**Final scoreboard (3 interleaved rounds, per-cell medians, 2026-07-07):
+user/main geomean 0.972 — this branch is now FASTER than the fused
+engine on milomg.** 8/20 cells win outright (createComputations 0.68,
+cellx2500 0.75, cellx1000 0.80, triangle 0.90, broad 0.92, diamond 0.94,
+25-1000x5 0.95, 2-10x5 0.98); 19/20 within 10% of main; worst cell
+unstable 1.11. createSignals sits at main-parity (1.01) after the
+bounded-deferral fix. Against upstream alien the same run gives 1.014
+(main: 1.043) — alien-parity with a leak-free default API.
+
+Remaining gap: sustained recompute microkernels (deep-chain probe ~1.08
+vs main; crossover kernel families ~1.10-1.15) — a ~1.3ns/recompute
+constant with no single owner (D stamp and purge each measured <=0.4ns;
+EnterDepth/seam/trampoline candidates are individually below probe
+resolution).
 
 Goal under test: be 20% faster than upstream alien-signals v3 on the milomg
 reactivity benchmark (geomean of per-test medians ≤ 0.80), with a basic
