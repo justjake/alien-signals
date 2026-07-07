@@ -8,7 +8,7 @@ import { makeMiniLib } from './helpers/miniLib';
 // whose entry points forward. These tests drive growth through a userspace
 // kind library, which is the only way nodes exist now.
 
-test('userspace nodes minted before growth keep working after it', () => {
+test('userspace nodes created before growth keep working after it', () => {
 	const lib = makeMiniLib({ capacityRecords: 64 });
 	const s = lib.signal(1);
 	const c = lib.computed(() => s() * 10);
@@ -50,7 +50,7 @@ test('growth preserves the graph mid-batch', () => {
 	expect(seen).toBe(7);
 });
 
-test('disposers minted before growth free the right record after it', () => {
+test('disposers created before growth free the right record after it', () => {
 	const lib = makeMiniLib({ capacityRecords: 64 });
 	const s = lib.signal(0);
 	let runs = 0;
@@ -95,7 +95,7 @@ test('reset() after growth keeps the grown capacity and works', () => {
 	expect(seen).toBe(3);
 });
 
-test('system.arena tracks the current generation; stale mint refs forward', () => {
+test('system.arena tracks the current generation; stale create refs forward', () => {
 	const lib = makeMiniLib({ capacityRecords: 64 });
 	const arenaBefore = lib.sys.arena;
 	const s = lib.signal(5);

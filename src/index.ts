@@ -1,7 +1,7 @@
 /**
  * The default signal library: signal, computed, effect, and effectScope over
  * NUMERIC HANDLES — `signal()` returns a SignalId and `get(id)`/`set(id, v)`
- * are module functions, so minting a node allocates NO JavaScript object at
+ * are module functions, so creating a node allocates NO JavaScript object at
  * all (an arena record plus a value-column store), and reads dispatch
  * through one monomorphic function instead of per-node closures.
  *
@@ -15,7 +15,7 @@
  *
  * Lifetime, in precedence order: an explicit `owner` argument ties a
  * node's life to that object (freed by the garbage collector when the owner
- * goes); otherwise the innermost effectScope OWNS nodes minted inside it
+ * goes); otherwise the innermost effectScope OWNS nodes created inside it
  * and frees them when it disposes (region ownership — the leak-free default
  * for structured code); at top level, handles are caller-managed via
  * dispose()/reset(), like any global. Effects always belong to the
@@ -62,7 +62,7 @@ export type SignalIdOf<T> = SignalId & { [ValueOf]?: (value: T) => T };
 
 /** Property key carrying a stamped owner's node id (see signalOwner). */
 export const SignalIdKey: unique symbol = Symbol('dalien-signals.id');
-/** Property key carrying a stamped owner's mint generation. */
+/** Property key carrying a stamped owner's create generation. */
 export const SignalGenKey: unique symbol = Symbol('dalien-signals.gen');
 
 /** An owner object stamped with the node it keeps alive. */
@@ -89,7 +89,7 @@ const owned: (number[] | undefined)[] = [];
 // ---- host-owned tracking state (upstream's module lets) ---------------------
 
 /**
- * The innermost live effectScope: signals and computeds minted inside it
+ * The innermost live effectScope: signals and computeds created inside it
  * belong to it and are freed when it disposes (region ownership — the
  * leak-free default for structured code). An explicit `owner` argument
  * takes precedence; outside any scope, handles are caller-managed.
@@ -271,7 +271,7 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 	let notifyIndex = boot.notifyIndex;
 	let queuedLength = boot.queuedLength;
 	let currentScope: SignalId = boot.currentScope;
-	// One persistent scratch subscriber for trigger(), minted on first use
+	// One persistent scratch subscriber for trigger(), created on first use
 	// and reused ever after (released by reset, which clears this cache).
 	let triggerScratch: SignalId = boot.triggerScratch;
 	let triggerScratchBusy = false;
@@ -422,7 +422,7 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 	 * ```
 	 */
 	function computedId<T>(getter: (previousValue?: T) => T, owner?: WeakKey): SignalIdOf<T> {
-		// Minted DIRTY: the first read takes the update path (upstream's cold
+		// Created DIRTY: the first read takes the update path (upstream's cold
 		// first evaluation), against an empty subscriber list. `owner` as in
 		// signal(): its collection frees the record.
 		const id = owner !== undefined
@@ -543,7 +543,7 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 		}
 		const region = owned[idx];
 		if (region !== undefined) {
-			// A scope frees the signals/computeds minted inside it — DEFERRED to
+			// A scope frees the signals/computeds created inside it — DEFERRED to
 			// a microtask, so disposal costs land off the disposing caller's
 			// clock (where garbage-collected graphs pay theirs). Gen-guarded:
 			// members freed early, or whose records were reused, no-op.
@@ -1158,7 +1158,7 @@ export function setEffectMode(mode: 'sync' | 'manual'): 'sync' | 'manual' {
 
 
 /**
- * AUTOMATIC memory management with a handle object: mint a signal whose
+ * AUTOMATIC memory management with a handle object: create a signal whose
  * record frees itself when `owner` is garbage collected, stamp the id and
  * generation onto the owner, and return it. The owner is whatever object
  * represents the signal to your code (a wrapper with read/write methods, a
@@ -1214,7 +1214,7 @@ export interface ReadableSignal<T> {
 export type EffectStop = () => void;
 
 // The callables deliberately carry NO id property: one property store on a
-// fresh closure is a map transition, measured at ~30ns of the ~50ns mint —
+// fresh closure is a map transition, measured at ~30ns of the ~50ns create —
 // it alone held createSignals at 1.5x the fused engine. Workflows that
 // want record ids use the raw tier creators (signalId/computedId/effectId/
 // effectScopeId), which return the id itself.

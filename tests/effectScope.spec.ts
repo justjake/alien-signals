@@ -73,7 +73,7 @@ test('scope as intermediate parent: cleanup order respects nesting', () => {
 	]);
 });
 
-test('a scope owns the signals and computeds minted inside it', async () => {
+test('a scope owns the signals and computeds created inside it', async () => {
 	let s!: ReturnType<typeof signalRaw<number>>;
 	let c!: ReturnType<typeof computed<number>>;
 	const scope = effectScopeRaw(() => {

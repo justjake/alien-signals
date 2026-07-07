@@ -15,7 +15,7 @@ in isolation:
    Suite user/main went ~1.15 → ~1.01 geomean; 8 cells now beat main
    (createComputations 0.71–0.75, cellx 0.72–0.88, diamond 0.90).
 2. **No .id on callables**: one property store on a fresh closure is a
-   map transition — ~30ns of a ~50ns mint. Dropping it took the mint
+   map transition — ~30ns of a ~50ns create. Dropping it took the creation
    burst from 3× main to parity. Id workflows use the raw tier.
 3. **Getter threading** (readComputed carries the oper-captured getter to
    read-driven recomputes; walk-driven updates still load fns[]) —
@@ -29,7 +29,7 @@ Measured and rejected:
   rounds — deferred wins the geomean 1.038 vs 1.057 AND the createSignals
   cell itself (2.02 vs 2.52 of main); single rounds that favored immediate
   were the cell's own ±30% noise. Same verdict as the v16 handle-era
-  experiment: per-mint weak cells in bursts cost more than the deferred
+  experiment: per-creation weak cells in bursts cost more than the deferred
   queue, in every era.
 
 **Final scoreboard (3 interleaved rounds, per-cell medians, 2026-07-07):
@@ -136,10 +136,10 @@ a propagation band at 1.05–1.15.
 1. **Automatic reclamation has a cost floor that alien does not pay.**
    Alien's nodes are plain GC objects: dropping a handle reclaims the node
    for free. Any arena must track lifetime explicitly. Everything was
-   measured: immediate FinalizationRegistry cells (~14 ns/mint, but
-   per-mint weak cells in a burst regressed create-heavy cells ~35%),
+   measured: immediate FinalizationRegistry cells (~14 ns/create, but
+   per-creation weak cells in a burst regressed create-heavy cells ~35%),
    deferred registration (pins owners through in-window scavenges),
-   WeakMap side tables (~400 ns/mint at scale), unregister tokens
+   WeakMap side tables (~400 ns/create at scale), unregister tokens
    (~150–370 ns), owner stamping (~20 ns of shape transitions). The
    shipped scheme — deferred registration drained by a maintenance
    microtask — is the cheapest honest one found.
@@ -202,7 +202,7 @@ Four mechanisms were implemented and benchmarked; the tax was invariant:
    bound per node with the id as primitive `this` (one feedback vector
    trained by all nodes, cheap bound trampolines) — no better, slightly
    worse on small-N deep. Requires system.adoptNode(owner, id) (register
-   after mint), which stays as API.
+   after create), which stays as API.
 5. FinalizationRegistry adoption disabled entirely as a diagnostic:
    ratio 1.00 flat — ownership registration costs nothing at steady state.
 
@@ -225,7 +225,7 @@ GC-handle adapter and alien (2026-07-06, per-cell medians):
 - **geomean manual/handles = 1.02** — the leak-free default costs
   approximately nothing suite-wide. After the freed-seam fix, even
   createComputations is equal (0.97).
-- The one clear manual win: **createSignals 0.81** (pure mint burst —
+- The one clear manual win: **createSignals 0.81** (pure creation burst —
   handle allocation plus registry cell are the only remaining GC-interface
   costs). Even manual remains ~1.9× alien there: the floor is arena
   lifetime bookkeeping, not the handle wrapper.
@@ -237,7 +237,7 @@ GC-handle adapter and alien (2026-07-06, per-cell medians):
   (the known ±5–10%) now dominates the interface difference entirely.
 
 Conclusion: the honest benchmark config is the handle adapter; the manual
-tier buys nothing except in signal-mint microbenchmarks.
+tier buys nothing except in signal-create microbenchmarks.
 
 ## Tried and rejected: inline 1:1 edges (chain edges)
 

@@ -62,7 +62,7 @@
  * both. Resizable ArrayBuffers were re-measured as the alternative
  * (identity-stable M, no rebuild): ~1.9-2.3x on hot paths ALWAYS, so
  * migration + clones remains the right trade. Exhausting the headroom quarter INSIDE one operation (a single
- * effect/computed body minting that many nodes mid-run) still throws: no
+ * effect/computed body creating that many nodes mid-run) still throws: no
  * live frame may hold a retired arena. Buffers are allocated LAZILY:
  * importing the library costs nothing. Rejected growth alternatives
  * (measured, do not relitigate): segment tables, resizable ArrayBuffers,
@@ -76,7 +76,7 @@
  * generation counter in the record makes stale disposers no-ops). Signal and
  * computed records are reclaimed through a required FinalizationRegistry:
  * when the last reference to a handle is collected, the registry callback
- * pushes the record onto the free list (signals register at mint; computeds
+ * pushes the record onto the free list (signals register at create; computeds
  * register at first evaluation, with the handle-owned getter as the weak
  * target). system.reset() reclaims an entire generation wholesale.
  *
@@ -148,7 +148,7 @@ export const enum NodeSlot {
 	DepsTail = 2,
 	Subs = 3,
 	SubsTail = 4,
-	/** Generation counter: bumped on free; capture at mint to defuse stale ids. */
+	/** Generation counter: bumped on free; capture at create to defuse stale ids. */
 	Gen = 5,
 	/**
 	 * Slots 6-7 hold ONE float64: the node's version snapshot (the host's
@@ -236,7 +236,7 @@ export const enum Flag {
 	HostStarted = 8192,
 	/**
 	 * Bits 16-27 belong to the HOST: custom kinds plant their dispatch tags
-	 * here at mint (custom(hostBits)); the engine never touches them and
+	 * here at create (custom(hostBits)); the engine never touches them and
 	 * preserves them across every state rewrite (see Sticky).
 	 */
 	HostShift = 16,
@@ -286,7 +286,7 @@ function noop(): void {}
  * algorithms compiled over exactly that memory. The whole object is replaced
  * when the arena grows (ids and link ids survive verbatim; these views and
  * closures do not) — re-capture it in the `allocated` callback, and never
- * cache any of it in a local across a call that can allocate. mint/free
+ * cache any of it in a local across a call that can allocate. create/free
  * forward from a retired arena; nothing else here does.
  */
 export interface ReactiveArena {
@@ -391,7 +391,7 @@ export interface ReactiveSystem {
 	 */
 	reset(): void;
 	/**
-	 * Mint a host-kind node. `hostBits` (masked to HOST_MASK) are your
+	 * Create a host-kind node. `hostBits` (masked to HOST_MASK) are your
 	 * AUTOMATIC memory management: allocate a node record whose lifetime is
 	 * tied to `owner` — the record frees itself when `owner` is garbage
 	 * collected, so pass the object whose reachability should keep the node
@@ -400,14 +400,14 @@ export interface ReactiveSystem {
 	 * in arena.allocNode.
 	 *
 	 * There is deliberately no owner -> id lookup here: keeping one costs a
-	 * WeakMap write and a tokened registry entry per mint (measured ~10x on
+	 * WeakMap write and a tokened registry entry per create (measured ~10x on
 	 * creation-heavy workloads). Hold the id (disposers close over it), or
 	 * keep your own map.
 	 */
 	createNode(owner: WeakKey, hostBits?: number): SignalId;
 	/**
-	 * Tie an ALREADY-MINTED node's lifetime to `owner`, as createNode does
-	 * at mint (same deferred registration). For hosts whose owner object
+	 * Tie an ALREADY-CREATED node's lifetime to `owner`, as createNode does
+	 * at create (same deferred registration). For hosts whose owner object
 	 * needs the id to exist first (a callable closing over it): allocNode,
 	 * build the owner, adopt.
 	 */
@@ -415,7 +415,7 @@ export interface ReactiveSystem {
 	/**
 	 * MANUAL memory management with the growth boundary check: like
 	 * arena.allocNode, but grows the arena first when it is running out of
-	 * space (the safe default for mint paths). No owner, no watch — pair
+	 * space (the safe default for creation paths). No owner, no watch — pair
 	 * with disposeNode/freeNode, or the record lives until reset().
 	 */
 	allocNode(hostBits?: number): SignalId;
@@ -430,7 +430,7 @@ export interface ReactiveSystem {
 	disposeNode(id: SignalId, gen?: SignalGen): void;
 	/**
 	 * The node's current generation (memory[id + NodeSlot.Gen]): capture at
-	 * mint and compare before acting on a stored id — a mismatch means the
+	 * create and compare before acting on a stored id — a mismatch means the
 	 * record was freed (and possibly reused) in the meantime.
 	 */
 	generationOf(id: SignalId): SignalGen;
@@ -594,7 +594,7 @@ function cloneWorks(): boolean {
 			linkFreeHead: 0,
 		}, dummy);
 		dummy.inner = probe;
-		// Exercise mint, flags, edges, staleness resolution: any unresolved
+		// Exercise create, flags, edges, staleness resolution: any unresolved
 		// identifier in the cloned source throws here, not later.
 		const a = probe.allocNode(1 << 16 | 1); // host tag + Mutable
 		const b = probe.allocNode(2 << 16 | 1);
@@ -732,20 +732,20 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 	// for the old one keep it alive until they drain, and their record ids
 	// refer to the pre-reset arena — running them would reclaim whatever new
 	// node now occupies that id.
-	function mintRegistry(): FinalizationRegistry<number> {
-		const minted: FinalizationRegistry<number> = new FinalizationRegistry((id) => {
-			if (shared.registry === minted) {
+	function makeRegistry(): FinalizationRegistry<number> {
+		const created: FinalizationRegistry<number> = new FinalizationRegistry((id) => {
+			if (shared.registry === created) {
 				shared.inner!.orphan(id);
 			}
 		});
-		return minted;
+		return created;
 	}
 
 	function materialize(): Engine {
 		if (typeof FinalizationRegistry !== 'function') {
 			throw new Error('dalien-signals requires FinalizationRegistry (ES2021): dropped signal/computed handles reclaim their records through it');
 		}
-		shared.registry = mintRegistry();
+		shared.registry = makeRegistry();
 		const engine = instantiateEngine(configuredRecords, undefined, {
 			recNext: 8,
 			nodeFreeHead: 0,
@@ -769,19 +769,19 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 	// the caps, keeping memory bounded without taxing the common op.
 	let maintenanceScheduled = false;
 	// Deferred owner registrations as (owner, id) pairs: a registry cell is
-	// weak-GC machinery the collector traces, and creating one per mint
-	// inside a mint burst measured worse than queueing (cellx-style
+	// weak-GC machinery the collector traces, and creating one per create
+	// inside a creation burst measured worse than queueing (cellx-style
 	// create-heavy cells regressed ~35%). Owners are held strongly until
 	// the maintenance microtask registers them, so none can be collected
 	// before its registration lands.
 	let pendingRegister: unknown[] = [];
 
 	// The deferral is bounded: past this many queued pairs the queue drains
-	// inline. Unbounded, a 100k-mint burst holds every owner STRONGLY until
+	// inline. Unbounded, a 100k-creation burst holds every owner STRONGLY until
 	// the next microtask — a GC inside the burst (or right after it, as
 	// benchmark harnesses do) traces and promotes the lot, and none of it
 	// can be collected however dead it is. Bounded, at most ~8k owners are
-	// pinned, and the register cost amortizes to the same per-mint price.
+	// pinned, and the register cost amortizes to the same per-creation price.
 	// Measured on milomg createSignals: 18.5ms unbounded -> 7.7ms bounded
 	// (fused main: 9.1ms).
 	const REGISTER_DRAIN_THRESHOLD = 16384;
@@ -799,7 +799,7 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 	// verbatim), build the next engine generation over the new `const M` —
 	// handing the hot counters across via prev.state() — and retire the old
 	// engine, whose public entry points forward to the current one. Handles
-	// minted before the growth keep working at one extra hop. Only runs at
+	// created before the growth keep working at one extra hop. Only runs at
 	// operation boundaries (the engine is not busy): no live frame holds the
 	// old arena, so nothing can write through it afterwards.
 	const allocatedCallbacks: Array<(arena: ReactiveArena) => void> = [];
@@ -899,7 +899,7 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 			// Bulk arena teardown: rewind the record arena and drop the whole
 			// FinalizationRegistry, so a dead generation is reclaimed by the
 			// GC as a few large objects instead of one weak cell per handle.
-			// Every handle minted before the reset is INVALID afterwards —
+			// Every handle created before the reset is INVALID afterwards —
 			// calling one is undefined behavior (it reads whatever new node
 			// occupies its record). The engine closures (and their warmed-up
 			// JIT state) are reused; only the arena contents restart.
@@ -921,7 +921,7 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 			engine.resetState(); // arena fill + counters + shared queue drains
 			shared.boundaryPending = false;
 			shared.growPending = false; // capacity stays at its grown size
-			shared.registry = mintRegistry();
+			shared.registry = makeRegistry();
 			// Pre-reset owners must not register against the new generation.
 			pendingRegister.length = 0;
 		},
@@ -1031,7 +1031,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		checkStack = bigger;
 	}
 
-	// A retired engine's mint/free entry points forward to shared.inner (the
+	// A retired engine's create/free entry points forward to shared.inner (the
 	// current generation): allocation calls in flight across a growth keep
 	// working at one extra hop. Set at most once, at an operation boundary.
 	// Zeroing the old arena makes stale reads scream instead of lying.
@@ -1081,7 +1081,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			return M[SysSlot.EnterDepth] !== 0;
 		}
 
-		// May grow — retiring THIS engine — so mint paths re-check `retired`
+		// May grow — retiring THIS engine — so creation paths re-check `retired`
 		// right after calling it.
 		function maybeBoundary(): void {
 			if (M[SysSlot.EnterDepth] !== 0) {
@@ -1114,7 +1114,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			// records hold zeroed snapshots, which can never equal them.
 		}
 
-		// ---- minting and freeing (see ReactiveSystemOptions.update) -----------
+		// ---- creating and freeing (see ReactiveSystemOptions.update) -----------
 
 		function newCustom(hostBits: number): SignalId {
 			if (retired) {

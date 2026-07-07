@@ -227,7 +227,7 @@ export function makeMiniLib(options?: Omit<ReactiveSystemOptions, 'update' | 'no
 			}
 			return st.value;
 		};
-		// Minted Dirty: the first read takes the update path.
+		// Created Dirty: the first read takes the update path.
 		const id = sys.createNode(oper, COMP | Flag.Mutable | Flag.Dirty);
 		nodes[id >> Arena.NodeIndexShift] = st;
 		return oper;
