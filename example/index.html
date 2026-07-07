@@ -3,7 +3,7 @@
 	<head>
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
-		<title>dalien-signals — signals, explained live</title>
+		<title>dalien-signals — an interactive introduction</title>
 		<link rel="stylesheet" href="/src/style.css" />
 	</head>
 	<body>
@@ -23,17 +23,17 @@
 			</header>
 
 			<section>
-				<h2>Feel it first</h2>
+				<h2>A large graph, updating sparsely</h2>
 				<p>
 					The field below is one reactive graph: the top row of pixels is
 					<code>signal</code>s, and every pixel under it is a
 					<code>computed</code> blending the three cells above. About twenty
 					thousand nodes. The drifting emitters write a handful of signals
-					per frame — then everything downstream updates by itself.
-					<strong>Drag across the field to paint your own.</strong> The pale
-					shimmer marks the cells that actually recomputed: a change flows
-					down a widening cone of dependents, and the rest of the graph
-					isn't touched at all.
+					per frame, and everything downstream updates by itself. Drag
+					across the field to write signals directly. The pale shimmer
+					marks the cells that actually recomputed: a change flows down a
+					widening cone of dependents, and the rest of the graph is not
+					touched at all.
 				</p>
 				<canvas id="grid"></canvas>
 				<section id="hud">
@@ -54,15 +54,15 @@
 					<span id="note"></span>
 				</section>
 				<p>
-					Two things worth trying. <em>Equality cutoff</em>: each cell
-					rounds its output to a coarse step, so as a ripple fades, cells
-					start producing the <em>same</em> value they had before — and the
-					cascade stops right there. Toggle it off and watch the shimmer
-					cones grow taller. <em>Invalidate everything</em> writes one
-					signal that every cell reads, forcing all twenty thousand nodes to
-					recompute in a single frame — the timer shows what a full-graph
-					pass costs, which is the price this library is designed to almost
-					never pay.
+					Two of the controls illustrate specific mechanisms.
+					<em>Equality cutoff</em>: each cell rounds its output to a coarse
+					step, so as a ripple fades, cells begin producing the
+					<em>same</em> value they held before, and the cascade stops at
+					that point. Disabling it makes the recompute cones visibly
+					taller. <em>Invalidate everything</em> writes one signal that
+					every cell reads, forcing all twenty thousand nodes to recompute
+					in a single frame; the timer reports the cost of a full-graph
+					pass — the cost the design exists to avoid.
 				</p>
 			</section>
 
@@ -74,8 +74,8 @@
 					read, with an argument to write. A <code>computed</code> derives a
 					cached value from whatever signals and computeds its function
 					reads. An <code>effect</code> runs a function now, and again
-					whenever a value it read changes — that's where rendering, logging,
-					and other side effects live.
+					whenever a value it read changes; rendering, logging, and other
+					side effects belong there.
 				</p>
 				<pre><code>import { signal, computed, effect } from "dalien-signals";
 
@@ -87,14 +87,14 @@ effect(() =&gt; console.log(doubled(), isEven()));
 count(2); // logs: 4 true</code></pre>
 				<div id="w-counter"></div>
 				<p>
-					Notice what the run counter does when you step from 1 to 3: the
-					bottom effect reads both computeds, but it re-runs only when one
-					of them produces a <em>new</em> value. <code>doubled</code>
-					changed, <code>even?</code> came out <code>no</code> again — the
-					same answer as before — so nothing that depends only on
-					<code>even?</code> was disturbed. That's equality cutoff, the same
-					rule that stops the ripples in the field above. And nobody
-					declared any of these relationships: reading inside a computed or
+					Stepping from 1 to 3 shows the update rule precisely: the run
+					counter's effect reads both computeds, but it re-runs only when
+					one of them produces a <em>new</em> value. <code>doubled</code>
+					changed; <code>even?</code> evaluated to <code>no</code> again,
+					the same answer as before, so nothing that depends only on
+					<code>even?</code> was disturbed. This is equality cutoff — the
+					same rule that stops the ripples in the field above. Note that no
+					relationship was declared anywhere: reading inside a computed or
 					effect <em>is</em> the subscription.
 				</p>
 			</section>
@@ -102,9 +102,9 @@ count(2); // logs: 4 true</code></pre>
 			<section>
 				<h2>How a write becomes an update</h2>
 				<p>
-					dalien-signals is a <em>push-pull</em> engine. A write doesn't
-					recompute anything by itself — it publishes doubt, cheaply, and
-					the real work happens later, on demand:
+					dalien-signals is a <em>push-pull</em> engine. A write does not
+					recompute anything by itself; it records what may have changed,
+					cheaply, and the work happens later, on demand:
 				</p>
 				<ol class="algo">
 					<li>
@@ -134,13 +134,13 @@ count(2); // logs: 4 true</code></pre>
 					</li>
 				</ol>
 				<p>
-					Step through it yourself. This little shop — two signals feeding a
-					subtotal, a total, and one effect — narrates each operation and
-					draws its graph live. Try the batch: two writes, one effect run.
-					Try writing the same value: nothing happens at all. Dispose the
-					effect, and watch the computeds lose their subscribers and drop
-					their own dependency edges — an unwatched computed doesn't spend
-					memory on bookkeeping nobody will ever ask about.
+					The model below — two signals feeding a subtotal, a total, and
+					one effect — narrates each operation and draws its graph live.
+					The batch button issues two writes that produce a single effect
+					run; writing an unchanged value produces no work at all.
+					Disposing the effect removes the computeds' last subscribers, and
+					they drop their own dependency edges in turn: an unwatched
+					computed keeps no bookkeeping that nothing will ask about.
 				</p>
 				<div id="w-stepper"></div>
 			</section>
@@ -148,8 +148,8 @@ count(2); // logs: 4 true</code></pre>
 			<section>
 				<h2>A node is eight integers</h2>
 				<p>
-					Here's the part that makes dalien-signals unusual. Most signal
-					libraries allocate an object per node and wire them together with
+					This is where dalien-signals departs from most implementations.
+					Signal libraries typically allocate an object per node, wired with
 					object references; the garbage collector then traces that web on
 					every collection. dalien-signals stores the whole graph in
 					<em>one</em> <code>Int32Array</code> — an arena — carved into
@@ -178,16 +178,17 @@ count(2); // logs: 4 true</code></pre>
 			</section>
 
 			<section>
-				<h2>Finale: a spreadsheet is a dependency graph</h2>
+				<h2>A spreadsheet is a dependency graph</h2>
 				<p>
-					A spreadsheet is the oldest reactive system in computing, so let's
-					end with one. Each cell is a signal (what you typed) plus a
+					A spreadsheet is the oldest reactive system in computing. In the
+					one below, each cell is a signal (the typed text) plus a
 					computed (what it evaluates to). Formulas start with
 					<code>=</code> and are plain JavaScript with one extra function:
 					<code>GET('A:1')</code> reads another cell. Because the formula
 					runs inside the cell's computed, every <code>GET</code> records a
-					real dependency edge in the arena — edit a formula and watch link
-					records appear and age out in the memory view on the right.
+					real dependency edge in the arena. Editing a formula rewires
+					those edges; the memory view below shows link records appearing
+					and aging out as it happens.
 				</p>
 				<div id="w-sheet"></div>
 			</section>
@@ -195,12 +196,12 @@ count(2); // logs: 4 true</code></pre>
 			<footer>
 				<p>
 					The engine on this page is the production build, unmodified.
-					Read the
-					<a href="https://github.com/justjake/dalien-signals">source and full README</a>,
-					or the
-					<a href="https://github.com/justjake/dalien-signals/blob/dalien-signals/BENCHMARKS.md">benchmark methodology</a>.
-					This page's own HUD, buttons, and widgets are driven by signals
-					and effects too — view source.
+					The
+					<a href="https://github.com/justjake/dalien-signals">source and full README</a>
+					and the
+					<a href="https://github.com/justjake/dalien-signals/blob/dalien-signals/BENCHMARKS.md">benchmark methodology</a>
+					cover the details. The page's own HUD, controls, and widgets are
+					themselves driven by signals and effects.
 				</p>
 			</footer>
 		</main>
