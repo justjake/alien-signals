@@ -574,6 +574,7 @@ function cloneWorks(): boolean {
 		const compile = new Function(engineSourceText + '0') as () => typeof createEngine;
 		const dummy: EngineShared = {
 			pendingFree: [],
+			pendingFreeEnd: 0,
 			hostState: [],
 			inner: undefined,
 			registry: undefined,
@@ -654,6 +655,10 @@ interface EngineState {
  */
 interface EngineShared {
 	pendingFree: number[];
+	// Live extent of pendingFree: entries at [0, pendingFreeEnd) are pending.
+	// The array is never truncated — truncating drops capacity and the next
+	// mass teardown pays the regrowth allocations.
+	pendingFreeEnd: number;
 	hostState: unknown[];
 	inner: Engine | undefined;
 	registry: FinalizationRegistry<number> | undefined;
@@ -711,6 +716,7 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 	// registry's callbacks self-disarm once replaced by reset().
 	const shared: EngineShared = {
 		pendingFree: [],
+		pendingFreeEnd: 0,
 		hostState: [],
 		inner: undefined,
 		registry: undefined,
@@ -858,7 +864,7 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 		// always materialized by the time this runs. Host effect queues hold
 		// (id, gen) pairs, so sweeping cannot misdeliver: a recycled id fails
 		// the host's gen check.
-		if (shared.pendingFree.length !== 0) {
+		if (shared.pendingFreeEnd !== 0) {
 			shared.inner!.sweepPendingFree();
 		}
 	}
@@ -963,7 +969,7 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 				allocatedRecords: (engine.state().recNext - 8) / 8,
 				freeNodeRecords,
 				freeLinkRecords,
-				pendingFreeRecords: shared.pendingFree.length,
+				pendingFreeRecords: shared.pendingFreeEnd,
 				pendingRegistrations: 0,
 			};
 		},
@@ -1048,9 +1054,6 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 	// an O(n log n) sort to restore ascending-order reuse (see
 	// sweepPendingFree). Defined here so the codegen-cloned scope stays closed.
 	const MASS_TEARDOWN_RECORDS = 4096;
-	function byRecordAscending(a: number, b: number): number {
-		return a - b;
-	}
 	// Seam callbacks are fixed at system creation (options are the only way
 	// to set them), so each generation captures them as construction consts:
 	// walk call sites become direct, foldable, inlinable calls instead of
@@ -1097,7 +1100,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			if (shared.growPending) {
 				shared.grow();
 			}
-			if (shared.boundaryPending && pendingFree.length > 8192) {
+			if (shared.boundaryPending && shared.pendingFreeEnd > 8192) {
 				shared.boundaryWork();
 			}
 		}
@@ -1117,6 +1120,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			nodeFreeHead = 0;
 			linkFreeHead = 0;
 			pendingFree.length = 0;
+			shared.pendingFreeEnd = 0;
 			// The host's globalVersion/cycle counters keep counting: fresh
 			// records hold zeroed snapshots, which can never equal them.
 		}
@@ -1159,7 +1163,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 				unlink(sub);
 				sub = M[id + NodeSlot.Subs];
 			}
-			pendingFree.push(id);
+			pendingFree[shared.pendingFreeEnd++] = id;
 			shared.boundaryPending = true;
 			shared.scheduleMaintenance();
 		}
@@ -1216,23 +1220,35 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 				shared.inner!.sweepPendingFree();
 				return;
 			}
-			// A mass teardown rebuilds both free lists in ascending record
-			// order. Free lists are LIFO, so without this the highest records
-			// come back first and the next build scatters across the arena:
-			// value columns go sparse (dictionary-mode side columns) and
-			// neighbouring nodes lose cache adjacency. Sorting makes reuse
-			// hand out dense, near-sequential records again.
-			// (Measured: rebuilding a 2M-node graph after a full dispose went
-			// from ~30s to build-from-fresh speed with this pass.)
-			if (pendingFree.length > MASS_TEARDOWN_RECORDS) {
-				pendingFree.sort(byRecordAscending);
+			const end = shared.pendingFreeEnd;
+			// A whole-arena teardown rebuilds both free lists in ascending
+			// record order. Free lists are LIFO, so without this the highest
+			// records come back first and the next build scatters across the
+			// arena: value columns go sparse (dictionary-mode side columns)
+			// and neighbouring nodes lose cache adjacency. Sorting restores
+			// dense, near-sequential reuse. (Measured: rebuilding a 2M-node
+			// graph after a full dispose went from ~30s to build-from-fresh
+			// speed.) The trigger is proportional — the freed nodes must be a
+			// sizable fraction of everything allocated — so steady churn of
+			// small graphs never pays the sort or the free-list walk; only
+			// tearing down most of the arena does.
+			if (end > MASS_TEARDOWN_RECORDS && end * 64 >= recNext) {
+				const batch = new Int32Array(end);
+				for (let i = 0; i < end; ++i) {
+					batch[i] = pendingFree[i];
+				}
+				batch.sort();
+				// Push in descending order so pops come off ascending.
+				for (let i = end - 1; i >= 0; --i) {
+					freeNode(batch[i]);
+				}
 				sortLinkFreeList();
+			} else {
+				for (let i = 0; i < end; ++i) {
+					freeNode(pendingFree[i]);
+				}
 			}
-			// Push in descending order so pops come off in ascending order.
-			for (let i = pendingFree.length - 1; i >= 0; --i) {
-				freeNode(pendingFree[i]);
-			}
-			pendingFree.length = 0;
+			shared.pendingFreeEnd = 0;
 		}
 
 		function sortLinkFreeList(): void {
@@ -1378,7 +1394,13 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			}
 			M[id + NodeSlot.Flags] = flags | Flag.HostStarted;
 			const hostWatched = shared.hostWatched;
-			hostState[id >> Arena.NodeIndexShift] = hostWatched !== undefined ? hostWatched(id) : undefined;
+			const idx = id >> Arena.NodeIndexShift;
+			// No holes: a holey array degrades to sparse ArrayStorage on
+			// JavaScriptCore and every later access pays a hash lookup.
+			for (let n = hostState.length; n <= idx; n++) {
+				hostState.push(undefined);
+			}
+			hostState[idx] = hostWatched !== undefined ? hostWatched(id) : undefined;
 		}
 
 		function hostUnwatchedNode(id: number): void {
@@ -1746,7 +1768,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		function reclaimOrphan(id: number): void {
 			M[id + NodeSlot.Flags] = 0;
 			disposeAllDepsInReverse(id);
-			pendingFree.push(id);
+			pendingFree[shared.pendingFreeEnd++] = id;
 			shared.boundaryPending = true;
 			shared.scheduleMaintenance();
 		}

@@ -99,6 +99,10 @@ const owned: (number[] | undefined)[] = [];
 // flush time means the record was freed (and possibly reused) after being
 // queued, so the entry is skipped instead of running a stranger.
 const queued: SignalId[] = [];
+// Generation stamp taken when an id is queued: a mismatch at flush time
+// means the record was freed (and possibly reused) while queued, so the
+// entry is skipped. This keeps freeing O(1) — no queue scan per free.
+const queuedGens: number[] = [];
 const pendingRegions: number[][] = [];
 const hostDeps: HostDeps = {
 	currentVals,
@@ -107,6 +111,7 @@ const hostDeps: HostDeps = {
 	cleanups,
 	owned,
 	queued,
+	queuedGens,
 	pendingRegions,
 	sys: undefined as unknown as HostDeps['sys'], // bound right after creation
 };
@@ -242,6 +247,7 @@ interface HostDeps {
 	cleanups: ((() => void) | void)[];
 	owned: (number[] | undefined)[];
 	queued: SignalId[];
+	queuedGens: number[];
 	pendingRegions: number[][];
 	/** Late-bound: assigned right after createReactiveSystem returns. */
 	sys: { createNode(owner: WeakKey, bits?: number): SignalId; allocNode(bits?: number): SignalId; adoptNode(owner: WeakKey, id: SignalId): void };
@@ -263,7 +269,24 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 	const checkDirty = arena.checkDirty;
 	const shallowPropagate = arena.shallowPropagate;
 	const freeNode = arena.freeNode;
-	const { currentVals, pendingVals, fns, cleanups, owned, queued, pendingRegions } = deps;
+	const { currentVals, pendingVals, fns, cleanups, owned, queued, queuedGens, pendingRegions } = deps;
+	// Side columns must never contain holes. A skipped index (node records
+	// interleave with link records, so column writes stride) leaves a hole,
+	// and JavaScriptCore moves a holey array into its sparse ArrayStorage
+	// form where every indexed access is a hash lookup — measured as the
+	// dominant cost of creation- and teardown-heavy workloads under Bun
+	// (V8 tolerates holes; JSC does not). Growing all five columns together
+	// with explicit undefined fill keeps them flat on both engines, and the
+	// columns stay in lockstep so one length check covers them all.
+	function growColumns(idx: number): void {
+		for (let n = fns.length; n <= idx; n++) {
+			currentVals.push(undefined);
+			pendingVals.push(undefined);
+			fns.push(undefined);
+			cleanups.push(undefined);
+			owned.push(undefined);
+		}
+	}
 
 	let activeSub = boot.activeSub;
 	let cycle = boot.cycle;
@@ -390,6 +413,9 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 			? deps.sys.createNode(owner, Host.Signal | Flag.Mutable)
 			: deps.sys.allocNode(Host.Signal | Flag.Mutable);
 		const idx = id >> Arena.NodeIndexShift;
+		if (idx >= fns.length) {
+			growColumns(idx);
+		}
 		currentVals[idx] = initialValue;
 		pendingVals[idx] = initialValue;
 		if (owner === undefined && currentScope !== 0) {
@@ -432,7 +458,11 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 		const id = owner !== undefined
 			? deps.sys.createNode(owner, Host.Computed | Flag.Mutable | Flag.Dirty)
 			: deps.sys.allocNode(Host.Computed | Flag.Mutable | Flag.Dirty);
-		fns[id >> Arena.NodeIndexShift] = getter as NodeFn;
+		const cidx = id >> Arena.NodeIndexShift;
+		if (cidx >= fns.length) {
+			growColumns(cidx);
+		}
+		fns[cidx] = getter as NodeFn;
 		if (owner === undefined && currentScope !== 0) {
 			owned[currentScope >> Arena.NodeIndexShift]!.push(id, M[id + NodeSlot.Gen]);
 		}
@@ -453,6 +483,9 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 	function effectId(fn: () => void | (() => void)): SignalId {
 		const id = deps.sys.allocNode(Host.Effect | Flag.Watching | Flag.RecursedCheck);
 		const idx = id >> Arena.NodeIndexShift;
+		if (idx >= fns.length) {
+			growColumns(idx);
+		}
 		fns[idx] = fn as NodeFn;
 		const prevSub = activeSub;
 		activeSub = id;
@@ -490,8 +523,12 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 	 */
 	function effectScopeId(fn: () => void): SignalId {
 		const id = deps.sys.allocNode(Host.Scope | Flag.Mutable);
-		fns[id >> Arena.NodeIndexShift] = fn as NodeFn;
-		owned[id >> Arena.NodeIndexShift] = [];
+		const sidx = id >> Arena.NodeIndexShift;
+		if (sidx >= fns.length) {
+			growColumns(sidx);
+		}
+		fns[sidx] = fn as NodeFn;
+		owned[sidx] = [];
 		const prevSub = activeSub;
 		const prevScope = currentScope;
 		activeSub = id;
@@ -587,7 +624,11 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 			M[id + NodeSlot.Flags] = (M[id + NodeSlot.Flags] & Host.Hidden) | Flag.Watching | Flag.RecursedCheck;
 		} else {
 			id = deps.sys.allocNode(Flag.Watching | Flag.RecursedCheck);
-			fns[id >> Arena.NodeIndexShift] = noopEffectBody as NodeFn;
+			const tidx = id >> Arena.NodeIndexShift;
+			if (tidx >= fns.length) {
+				growColumns(tidx);
+			}
+			fns[tidx] = noopEffectBody as NodeFn;
 			if (triggerScratch === 0 && !triggerScratchBusy) {
 				triggerScratch = id;
 				persistent = true;
@@ -645,6 +686,7 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 		let firstInsertedIndex = insertIndex;
 		let e = id;
 		while (true) {
+			queuedGens[insertIndex] = M[e + NodeSlot.Gen];
 			queued[insertIndex++] = e;
 			const subsLink: LinkId = M[e + NodeSlot.Subs];
 			if (!subsLink) {
@@ -660,8 +702,11 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 		queuedLength = insertIndex;
 		while (firstInsertedIndex < --insertIndex) {
 			const leftId = queued[firstInsertedIndex];
-			queued[firstInsertedIndex++] = queued[insertIndex];
+			const leftGen = queuedGens[firstInsertedIndex];
+			queued[firstInsertedIndex] = queued[insertIndex];
+			queuedGens[firstInsertedIndex++] = queuedGens[insertIndex];
 			queued[insertIndex] = leftId;
+			queuedGens[insertIndex] = leftGen;
 		}
 	}
 	// A record went to the free list (explicit free, owner collection, or
@@ -669,18 +714,6 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 	// values and closures stay pinned — and traced by every major GC —
 	// until the record is reused.
 	function freedNode(id: SignalId): void {
-		// A freed record can be recycled after the next sweep. In manual
-		// effect mode the queue outlives writes, so a queued id could
-		// otherwise be reused by an unrelated node before its flush; scrub
-		// it here — the queue is empty outside flush in sync workloads, so
-		// this loop runs only for frees during a manual-mode pending window.
-		if (notifyIndex !== queuedLength) {
-			for (let i = notifyIndex; i < queuedLength; i++) {
-				if (queued[i] === id) {
-					queued[i] = 0;
-				}
-			}
-		}
 		const idx = id >> Arena.NodeIndexShift;
 		// Clear only within each column's populated range. A store past the
 		// end of a large array flips V8's elements kind to dictionary mode
@@ -805,11 +838,11 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 	function flush(): void {
 		try {
 			while (notifyIndex < queuedLength) {
-				const id = queued[notifyIndex];
-				queued[notifyIndex++] = 0;
-				// A zeroed entry was scrubbed (freed while queued); a live id
-				// with no callback was disposed while queued.
-				if (id !== 0) {
+				const i = notifyIndex++;
+				const id = queued[i];
+				// A generation mismatch means the record was freed (and
+				// possibly reused) while queued: skip the stranger.
+				if (M[id + NodeSlot.Gen] === queuedGens[i]) {
 					const fn = fns[id >> Arena.NodeIndexShift];
 					if (fn !== undefined) {
 						run(id, fn);
@@ -821,9 +854,9 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 			// to THEIR dependencies re-notifies them — but the failed flush does
 			// not resume on unrelated writes (upstream parity).
 			while (notifyIndex < queuedLength) {
-				const id = queued[notifyIndex];
-				queued[notifyIndex++] = 0;
-				if (id !== 0 && fns[id >> Arena.NodeIndexShift] !== undefined) {
+				const i = notifyIndex++;
+				const id = queued[i];
+				if (M[id + NodeSlot.Gen] === queuedGens[i] && fns[id >> Arena.NodeIndexShift] !== undefined) {
 					M[id + NodeSlot.Flags] |= Flag.Watching | Flag.Recursed;
 				}
 			}
