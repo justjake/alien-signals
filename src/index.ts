@@ -500,7 +500,6 @@ export function reset(): void {
 	queuedLength = 0;
 	activeSub = 0;
 	currentScope = 0;
-	++resetEpoch;
 	batchDepth = 0;
 	runDepth = 0;
 	triggerScratch = 0;
@@ -747,27 +746,8 @@ export function effect(fn: () => void | (() => void)): SignalId {
  * set(count, 1); // No log; the scope is stopped.
  * ```
  */
-// GC-managed scopes dispose through the HOST teardown (child cascade plus
-// the owned region), so they need a host-side registry — the system's own
-// registry only reclaims the record. `epoch` disarms callbacks that were
-// queued before a reset() (post-reset generations rewind and would
-// false-match).
-let resetEpoch = 0;
-const scopeRegistry = new FinalizationRegistry<{ id: SignalId; gen: SignalGen; epoch: number }>((held) => {
-	if (held.epoch === resetEpoch && M[held.id + NodeSlot.Gen] === held.gen && (M[held.id + NodeSlot.Flags] & Flag.Live) !== 0) {
-		disposeEffect(held.id);
-	}
-});
-
-export function effectScope(fn: () => void, owner?: WeakKey): SignalId {
-	// With an owner, the scope is GC-managed: when the owner is collected,
-	// the scope disposes — cascading to its child effects and (via its
-	// region) the signals/computeds it owns. Structured code that holds a
-	// scope handle object gets automatic teardown with no explicit dispose.
+export function effectScope(fn: () => void): SignalId {
 	const id = system.allocNode(Host.Scope | Flag.Mutable);
-	if (owner !== undefined) {
-		scopeRegistry.register(owner, { id, gen: M[id + NodeSlot.Gen], epoch: resetEpoch });
-	}
 	fns[id >> Arena.NodeIndexShift] = fn as NodeFn;
 	owned[id >> Arena.NodeIndexShift] = [];
 	const prevSub = activeSub;
