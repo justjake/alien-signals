@@ -781,6 +781,11 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 	// the maintenance microtask registers them, so none can be collected
 	// before its registration lands.
 	let pendingRegister: unknown[] = [];
+	// Live extent of pendingRegister. The array keeps its capacity across
+	// drains (truncation forces regrowth allocations on the next creation
+	// burst); the drain clears the slots instead, so drained owners are not
+	// pinned against collection.
+	let pendingRegisterEnd = 0;
 
 	// The deferral is bounded: past this many queued pairs the queue drains
 	// inline. Unbounded, a 100k-creation burst holds every owner STRONGLY until
@@ -794,10 +799,12 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 
 	function drainPendingRegister(): void {
 		const registry = shared.registry!;
-		for (let i = 0; i < pendingRegister.length; i += 2) {
+		const end = pendingRegisterEnd;
+		for (let i = 0; i < end; i += 2) {
 			registry.register(pendingRegister[i] as WeakKey, pendingRegister[i + 1] as SignalId);
 		}
-		pendingRegister.length = 0;
+		pendingRegister.fill(undefined, 0, end);
+		pendingRegisterEnd = 0;
 	}
 
 	// Grow-by-migration: allocate an arena twice the current capacity, copy the
@@ -929,14 +936,16 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 			shared.growPending = false; // capacity stays at its grown size
 			shared.registry = makeRegistry();
 			// Pre-reset owners must not register against the new generation.
-			pendingRegister.length = 0;
+			pendingRegister.fill(undefined, 0, pendingRegisterEnd);
+			pendingRegisterEnd = 0;
 		},
 		createNode(owner: WeakKey, hostBits?: number): SignalId {
 			const engine = shared.inner!;
 			engine.maybeBoundary();
 			const id = engine.allocNode(hostBits ?? 0);
-			pendingRegister.push(owner, id);
-			if (pendingRegister.length >= REGISTER_DRAIN_THRESHOLD) {
+			pendingRegister[pendingRegisterEnd++] = owner;
+			pendingRegister[pendingRegisterEnd++] = id;
+			if (pendingRegisterEnd >= REGISTER_DRAIN_THRESHOLD) {
 				drainPendingRegister();
 			}
 			scheduleMaintenance();
@@ -948,8 +957,9 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 			return engine.allocNode(hostBits ?? 0);
 		},
 		adoptNode(owner: WeakKey, id: SignalId): void {
-			pendingRegister.push(owner, id);
-			if (pendingRegister.length >= REGISTER_DRAIN_THRESHOLD) {
+			pendingRegister[pendingRegisterEnd++] = owner;
+			pendingRegister[pendingRegisterEnd++] = id;
+			if (pendingRegisterEnd >= REGISTER_DRAIN_THRESHOLD) {
 				drainPendingRegister();
 			}
 			scheduleMaintenance();
