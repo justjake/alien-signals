@@ -266,11 +266,13 @@ export function mountSheet(root) {
 		if (typeof text === 'string' && text.startsWith('=')) {
 			try {
 				// The formula body after '=' is evaluated directly as
-				// JavaScript with GET in scope.
+				// JavaScript with GET in scope. Any value is a legal cell
+				// result; numbers are rounded for display, everything else
+				// passes through as-is.
 				const v = new Function('GET', '"use strict"; return (' + text.slice(1) + ');')(GET);
-				return typeof v === 'number' && Number.isFinite(v) ? Math.round(v * 1000) / 1000 : '#ERR';
-			} catch {
-				return '#ERR';
+				return typeof v === 'number' && Number.isFinite(v) ? Math.round(v * 1000) / 1000 : v;
+			} catch (err) {
+				return String(err);
 			}
 		}
 		const n = Number(text);
