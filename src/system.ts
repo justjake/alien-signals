@@ -1262,24 +1262,40 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		}
 
 		function sortLinkFreeList(): void {
+			// ONE pass over the LIFO list marks members in a bitmap and counts
+			// them; free-list order never matters again after this, so sorted
+			// order is recovered by scanning the bitmap ascending and
+			// rethreading — no second pointer-chase walk over the arena and no
+			// comparison sort. The list walk is unavoidably random-access; the
+			// bitmap scan and the rethreading stores both ascend, so hardware
+			// prefetch covers them.
 			let n = 0;
+			const words = new Uint32Array(((recNext >> 3) + 32) >> 5);
 			for (let id = linkFreeHead; id !== 0; id = M[id + LinkSlot.FreeNext]) {
+				const rec = id >> 3;
+				words[rec >> 5] |= 1 << (rec & 31);
 				++n;
 			}
 			if (n <= MASS_TEARDOWN_RECORDS) {
-				return;
+				return; // below the mass threshold: keep LIFO order, drop the bitmap
 			}
-			const list = new Int32Array(n);
-			let i = 0;
-			for (let id = linkFreeHead; id !== 0; id = M[id + LinkSlot.FreeNext]) {
-				list[i++] = id;
-			}
-			list.sort();
 			let head = 0;
-			for (let j = n - 1; j >= 0; --j) {
-				M[list[j] + LinkSlot.FreeNext] = head;
-				head = list[j];
+			let tail = 0; // last rethreaded id; 0 until the first member
+			for (let w = 0; w < words.length; ++w) {
+				let bits = words[w];
+				while (bits !== 0) {
+					const bit = bits & -bits;
+					bits ^= bit;
+					const id = ((w << 5) + (31 - Math.clz32(bit))) << 3;
+					if (tail === 0) {
+						head = id;
+					} else {
+						M[tail + LinkSlot.FreeNext] = id;
+					}
+					tail = id;
+				}
 			}
+			M[tail + LinkSlot.FreeNext] = 0;
 			linkFreeHead = head;
 		}
 
