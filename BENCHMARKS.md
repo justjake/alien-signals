@@ -1,6 +1,36 @@
 # milomg benchmark campaign — findings
 
-## Campaign vs fused main (goal: parity or better, everywhere)
+## Campaign vs fused main — CLOSED (definitive boards, 2026-07-07)
+
+Quiet machine, interleaved rounds, per-cell medians, measured on a
+post-growth cloned generation (the adapter grows at import — this is the
+shipped configuration):
+
+- **Suite: geomean 0.943 — beats the fused engine — with 20/20 cells
+  within 10%** (worst: repeatedObservers 1.09). 13/20 at-or-better;
+  createComputations 0.67, cellx2500 0.80, createSignals 0.84,
+  updateSignals 0.89.
+- **Crossover matrix: geomean 1.003 — statistical parity.** batch 0.989,
+  broad 0.977, deep 1.001, grid 1.004, islands 1.046; every family range
+  straddles 1.0.
+
+The two mechanisms that closed the final 13%: createHost — the hot+warm
+host tier compiled per arena generation in one closure over const
+captures (the compilation-unit shape main's speed rests on) — and the
+generation codegen clone, which keeps that specialization across growth
+(without it, the SECOND instantiation of the factory literal despecializes
+the whole library process-wide — and the benchmark adapter itself grows
+at import, so every earlier scoreboard silently ran despecialized).
+
+Remaining characterized (not closed, documented as the cold path):
+growth under ALREADY-WARM traffic leaves pre-growth callables and seam
+trampolines with two-generation call feedback (~1.3x on recompute
+kernels afterwards). Growing before building — the normal and benchmarked
+pattern — runs at full speed. The designed fix if it ever matters:
+per-generation oper literals + retirement forwarding (main's handle
+model).
+
+## Campaign vs fused main (goal: parity or better, everywhere) — history
 
 The reference is this repo's fused dalien-signals engine (milomg
 0.99–1.07 vs alien; crossover matrix 0.90). Landed levers, each measured
