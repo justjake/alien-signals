@@ -289,13 +289,10 @@ export function mountSheet(root) {
 	}
 	grid += '</table>';
 	root.innerHTML = `
-		<div class="panes">
-			<div>
-				${grid}
-				<p class="hint">type numbers, or JavaScript formulas like <code>=GET('A:1') + 5</code> — every GET is a live dependency edge</p>
-			</div>
-			<div class="records"></div>
-		</div>`;
+		${grid}
+		<p class="hint">type numbers, or JavaScript formulas like <code>=GET('A:1') + 5</code> — every GET is a live dependency edge</p>
+		<h3>the sheet's arena, decoded</h3>
+		<div class="records"></div>`;
 
 	// input => state; one mini-system effect per cell projects value => DOM
 	root.addEventListener('input', (e) => {
