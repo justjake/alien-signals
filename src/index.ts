@@ -113,6 +113,8 @@ const hostDeps: HostDeps = {
 	queued,
 	queuedGens,
 	pendingRegions,
+	pendingRegionsEnd: 0,
+	regionFlushScheduled: false,
 	sys: undefined as unknown as HostDeps['sys'], // bound right after creation
 };
 
@@ -204,7 +206,6 @@ const system = createReactiveSystem({
 		host = instantiateHost(arena, hostDeps, host !== undefined ? host.state() : {
 			activeSub: 0, cycle: 0, globalVersion: 1, batchDepth: 0, runDepth: 0,
 			manualEffects: false, notifyIndex: 0, queuedLength: 0, currentScope: 0, triggerScratch: 0,
-			pendingRegionsEnd: 0,
 		});
 		hostUpdateNode = host.updateNode;
 		hostEnqueueEffect = host.enqueueEffect;
@@ -239,7 +240,6 @@ interface HostBoot {
 	queuedLength: number;
 	currentScope: SignalId;
 	triggerScratch: SignalId;
-	pendingRegionsEnd: number;
 }
 
 interface HostDeps {
@@ -251,6 +251,14 @@ interface HostDeps {
 	queued: SignalId[];
 	queuedGens: number[];
 	pendingRegions: (number[] | undefined)[];
+	// Cross-generation state for the deferred region flush. pendingRegions is
+	// shared by reference across host generations, so its live extent and
+	// the scheduled flag must live on the shared deps object too: a
+	// generation-local copy (or a boot snapshot) desynchronizes after arena
+	// growth — the old generation's microtask drains and clears its stale
+	// extent, then the new generation's flush re-reads the cleared slots.
+	pendingRegionsEnd: number;
+	regionFlushScheduled: boolean;
 	/** Late-bound: assigned right after createReactiveSystem returns. */
 	sys: { createNode(owner: WeakKey, bits?: number): SignalId; allocNode(bits?: number): SignalId; adoptNode(owner: WeakKey, id: SignalId): void };
 }
@@ -303,13 +311,10 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 	// and reused ever after (released by reset, which clears this cache).
 	let triggerScratch: SignalId = boot.triggerScratch;
 	let triggerScratchBusy = false;
-	let regionFlushScheduled = false;
-	// Live extent of pendingRegions: the queue keeps its capacity across
-	// flushes; the flush clears the slots so drained regions are not pinned.
-	let pendingRegionsEnd = boot.pendingRegionsEnd;
+
 
 	function state(): HostBoot {
-		return { activeSub, cycle, globalVersion, batchDepth, runDepth, manualEffects, notifyIndex, queuedLength, currentScope, triggerScratch, pendingRegionsEnd };
+		return { activeSub, cycle, globalVersion, batchDepth, runDepth, manualEffects, notifyIndex, queuedLength, currentScope, triggerScratch };
 	}
 
 	function resetState(): void {
@@ -323,7 +328,8 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 		triggerScratchBusy = false;
 		queued.length = 0;
 		pendingRegions.length = 0;
-		pendingRegionsEnd = 0;
+		deps.pendingRegionsEnd = 0;
+		deps.regionFlushScheduled = false;
 	}
 
 	/**
@@ -595,19 +601,22 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 			// clock (where garbage-collected graphs pay theirs). Gen-guarded:
 			// members freed early, or whose records were reused, no-op.
 			owned[idx] = undefined;
-			pendingRegions[pendingRegionsEnd++] = region;
-			if (!regionFlushScheduled) {
-				regionFlushScheduled = true;
+			pendingRegions[deps.pendingRegionsEnd++] = region;
+			if (!deps.regionFlushScheduled) {
+				deps.regionFlushScheduled = true;
 				queueMicrotask(freePendingRegions);
 			}
 		}
 	}
 	function freePendingRegions(): void {
-		regionFlushScheduled = false;
-		// The bound re-reads pendingRegionsEnd: freeing a scope member can
+		deps.regionFlushScheduled = false;
+		// The bound re-reads the live extent: freeing a scope member can
 		// cascade into disposing a nested scope, which queues its region
-		// mid-loop and is handled in this same pass.
-		for (let r = 0; r < pendingRegionsEnd; r++) {
+		// mid-loop and is handled in this same pass. A flush scheduled by a
+		// pre-growth generation may run after growth replaced the host: the
+		// shared extent keeps it draining everything, and the generation
+		// that follows sees an empty queue.
+		for (let r = 0; r < deps.pendingRegionsEnd; r++) {
 			const region = pendingRegions[r]!;
 			for (let i = 0; i < region.length; i += 2) {
 				const member: SignalId = region[i];
@@ -615,8 +624,8 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 				freeNode(member, region[i + 1]);
 			}
 		}
-		pendingRegions.fill(undefined, 0, pendingRegionsEnd);
-		pendingRegionsEnd = 0;
+		pendingRegions.fill(undefined, 0, deps.pendingRegionsEnd);
+		deps.pendingRegionsEnd = 0;
 	}
 	function noopEffectBody(): void {}
 	/**
