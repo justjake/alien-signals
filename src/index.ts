@@ -940,21 +940,51 @@ export interface EffectStop {
  * count();   // 1
  * ```
  */
+// Kind-specialized read paths for the callable tier, shaped like the fused
+// engine's read()/computedRead(): a SIGNAL read is a flags check, a link,
+// and the value load — the version gate and the read memo exist to make
+// the kind-dispatching raw get() fast, and putting them on every callable
+// read is what made the callable tier measure 10-25% over raw (BENCHMARKS
+// "Write-size crossover matrix"). Verification cost belongs to computeds,
+// paid per re-verification in readComputed's gate, not per read.
+function readSignal(id: SignalId): unknown {
+	const flags = M[id + NodeSlot.Flags];
+	if (flags & Flag.Dirty) {
+		// Commit-on-read: a staged write inside an open batch.
+		if (updateSignal(id, flags)) {
+			const subs: LinkId = M[id + NodeSlot.Subs];
+			if (subs !== 0) {
+				shallowPropagate(subs);
+			}
+		}
+	}
+	if (activeSub !== 0) {
+		link(id, activeSub, cycle);
+	}
+	return currentVals[id >> Arena.NodeIndexShift];
+}
+
+function readComputed(id: SignalId): unknown {
+	// The version gate: a snapshot equal to the current globalVersion
+	// proves nothing observed has been written since this node was last
+	// verified.
+	if (D[(id >> Arena.VersionShift) + Arena.VersionOffset] === globalVersion) {
+		if (activeSub !== 0) {
+			link(id, activeSub, cycle);
+		}
+		return currentVals[id >> Arena.NodeIndexShift];
+	}
+	return getSlow(id);
+}
+
 export function signal<T>(): WriteableSignal<T | undefined>;
 export function signal<T>(initialValue: T): WriteableSignal<T>;
 export function signal<T>(initialValue?: T): WriteableSignal<T | undefined> {
-	// A plain per-node arrow calling the module fast paths. Three
-	// mechanisms were measured on the crossover matrix — this, both arms
-	// manually inlined, and upstream's shared-oper-bound-to-the-node — and
-	// all carry the same wrapper tax over the raw tier (registry adoption
-	// measured exactly zero), so keep the simplest one. Evidence and the
-	// remaining hypothesis (the read path is too big to inline through any
-	// wrapper) are in BENCHMARKS.md.
 	const oper = (...value: [T?]) => {
 		if (value.length) {
 			set(id, value[0] as T);
 		} else {
-			return get(id);
+			return readSignal(id);
 		}
 	};
 	const id = signalId(initialValue, oper);
@@ -974,7 +1004,7 @@ export function signal<T>(initialValue?: T): WriteableSignal<T | undefined> {
  * ```
  */
 export function computed<T>(getter: (previousValue?: T) => T): ReadableSignal<T> {
-	const oper = () => get(id);
+	const oper = () => readComputed(id) as T;
 	const id = computedId(getter, oper);
 	(oper as { id?: SignalIdOf<T> }).id = id;
 	return oper as ReadableSignal<T>;
