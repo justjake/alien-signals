@@ -41,9 +41,35 @@ unstable 1.11. createSignals sits at main-parity (1.01) after the
 bounded-deferral fix. Against upstream alien the same run gives 1.014
 (main: 1.043) — alien-parity with a leak-free default API.
 
-Remaining gap: sustained recompute microkernels — deep-chain probe ~1.08
-vs main, crossover matrix 1.18 geomean (uniform across families and
-sizes). Exhaustively bisected; every nameable mechanism measured at zero:
+### Kernel campaign, round two: the fat was real, just sub-noise per item
+
+Optimized-code dumps (--print-opt-code) broke the stalemate: our hot
+compile units were uniformly 26-48% LARGER than main's (propagate 1868
+vs 1296 bytes on identical source — the fat was what INLINED into them).
+Nulling suspects one at a time hid in the ±7ns probe noise; nulling them
+ALL AT ONCE recovered ~19ns/write — the gap was a SUM of sub-noise
+items. Landed from that:
+
+1. **queuedGens deleted**: the per-effect generation guard (parallel
+   array writes in enqueueEffect — inlined into propagate — plus reads
+   and compares in flush) exists only for ids recycled while queued,
+   which requires a maintenance sweep mid-window (manual mode). The
+   freed seam fires at exactly the recycle-enabling moment and now
+   scrubs the queue instead. propagate: 1868 -> 1492 bytes.
+2. **Read memo deleted entirely**: the callable opers never consult it,
+   the suite holds alien-parity on repeated-read cells without it, and
+   its invalidation stores taxed every write and recompute bracket.
+
+Together: broad family CLOSED to main-parity (0.99-1.00), deep trimmed
+to ~1.07, islands ~1.16 open.
+
+Measured and reverted in round two: read-side D-stamping (main's shape —
+trades 30 stamps for a getSlow round trip per effect read, net worse
+here), store-only EnterDepth via host let (unmeasurable under late-night
+thermal drift; discipline says keep only measured wins), host-side link
+dedup (no change).
+
+Earlier bisection record (round one), all measured at zero individually:
 
 - D stamp, purgeDeps, EnterDepth RMWs, set()'s memo-clear+version bump —
   nulled individually in built artifacts, each <=0.4ns/recompute.
