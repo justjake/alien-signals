@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       '@preact/signals-core':
-        specifier: ^1.14.4
-        version: 1.14.4
+        specifier: 1.14.3
+        version: 1.14.3
       '@reactively/core':
         specifier: ^0.0.8
         version: 0.0.8
@@ -45,8 +45,8 @@ packages:
   '@oxc-project/types@0.138.0':
     resolution: {integrity: sha512-1a7ZKmrRTCoN1XMZ4L0PyyqrMnrNlLyPuOkdSX2MZg7IiIGRUyurNhAm73ptDOraoBcIordsIGKNPKUzy3ZmfA==}
 
-  '@preact/signals-core@1.14.4':
-    resolution: {integrity: sha512-HNB6HYeYKhQbJ1aKl+YRjrS4+QWHLKX6qKoUsfS/m0vqzsVaEBiZiaKbG/e+NKk2ch5ALQr/ihWaMHxiCuuWHA==}
+  '@preact/signals-core@1.14.3':
+    resolution: {integrity: sha512-m0K3vnbSLC5rHs2ZVfeAMvBtT1zIyq4mxx5OlNncSgMj5Iz6W5Rn3kPrDxAC+iIKmiVe0lSl6U37t5ZkEWoVAw==}
 
   '@reactively/core@0.0.8':
     resolution: {integrity: sha512-5uAnNf2gQSm3gM7z6Lx079H1/MuDQQI+5aYfwyDFGR9nHZj8yblLY/6aOJVWp+NcBwXVBKuWQ28qWHD9F1qN1w==}
@@ -342,7 +342,7 @@ snapshots:
 
   '@oxc-project/types@0.138.0': {}
 
-  '@preact/signals-core@1.14.4': {}
+  '@preact/signals-core@1.14.3': {}
 
   '@reactively/core@0.0.8': {}
 
