@@ -31,6 +31,16 @@ bindText('stat-recomputed', () => recomputedCount().toLocaleString());
 bindText('stat-share', share);
 bindText('stat-frame', () => `${frameMs().toFixed(2)} ms`);
 bindText('stat-fps', () => String(fps()));
+// Every node and every edge is one 32-byte record in the arena — the whole
+// graph's storage is arithmetic, not a heap profile.
+const mb = (bytes) => `${(bytes / (1 << 20)).toFixed(1)} MB`;
+bindText('stat-arena', () => mb((graph.nodes + graph.edges) * 32));
+const heap = signal(NaN);
+bindText('stat-heap', () => (Number.isFinite(heap()) ? mb(heap()) : 'n/a'));
+if (performance.memory) {
+	setInterval(() => heap(performance.memory.usedJSHeapSize), 1000);
+	heap(performance.memory.usedJSHeapSize);
+}
 bindText('note', note);
 bindText('btn-cutoff', cutoffLabel);
 bindClass('btn-wave', 'on', wave);
