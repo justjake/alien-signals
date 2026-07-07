@@ -21,16 +21,11 @@ plus this repo's methodology fork:
   in `cleanup()` — the arena equivalent of what GC-managed graphs get
   automatically when a dead graph becomes unreachable).
 
-Those changes live in `milomg-fork.patch`, applied in CI to a clone pinned
-to the SHA in the workflow's `env`. Upstream alien-signals is likewise a
-pinned clone, built from source (its `esm/` is a build artifact). The CI
-recreates the local development layout so the harness's relative `file:`
-dependencies resolve unchanged.
-
-To update the patch after changing the harness fork locally:
-
-```sh
-./benchs/ci/regen-patch.sh   # run from anywhere; resolves its own paths
+Those changes live in the fork repo itself:
+https://github.com/justjake/js-reactivity-benchmark (branch dalien-signals).
+CI clones it at the FORK_SHA pinned in each workflow's env block. To ship
+harness changes: commit and push the fork, then bump FORK_SHA in
+.github/workflows/benchmark.yml and pages.yml.
 ```
 
 ## Reading the numbers

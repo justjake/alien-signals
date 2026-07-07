@@ -227,14 +227,14 @@ async function run(page, url) {
 
 	await check('boot', async () => {
 		await page.goto(url, { waitUntil: 'load' });
-		const note = await awaitBuildNote(page, 'dalien-signals', '320p');
-		await assertBars(page, { 'lib-bar': 'dalien-signals', 'tier-bar': '320p', 'mode-bar': 'wave' });
+		const note = await awaitBuildNote(page, 'dalien-signals', '720p');
+		await assertBars(page, { 'lib-bar': 'dalien-signals', 'tier-bar': '720p', 'mode-bar': 'wave' });
 		return note;
 	});
 
-	await check('canvas paints at 320p', async () => {
+	await check('canvas paints at 720p', async () => {
 		const s = await awaitPaint(page);
-		if (s.width !== 568 || s.height !== 320) die(`canvas is ${s.width}x${s.height}, want 568x320`);
+		if (s.width !== 1280 || s.height !== 720) die(`canvas is ${s.width}x${s.height}, want 1280x720`);
 		return `${s.width}x${s.height}, ${s.lit}/${s.sampled} sampled pixels lit`;
 	});
 
@@ -250,14 +250,14 @@ async function run(page, url) {
 
 	await check('mode radio: single clicks', async () => {
 		await clickButton(page, 'mode-bar', 'storm');
-		await assertBars(page, { 'lib-bar': 'dalien-signals', 'tier-bar': '320p', 'mode-bar': 'storm' });
+		await assertBars(page, { 'lib-bar': 'dalien-signals', 'tier-bar': '720p', 'mode-bar': 'storm' });
 		await clickButton(page, 'mode-bar', 'wave');
-		return assertBars(page, { 'lib-bar': 'dalien-signals', 'tier-bar': '320p', 'mode-bar': 'wave' });
+		return assertBars(page, { 'lib-bar': 'dalien-signals', 'tier-bar': '720p', 'mode-bar': 'wave' });
 	});
 
 	await check('mode radio: rapid clicks', async () => {
 		await rapidClicks(page, 'mode-bar', ['off', 'storm', 'off', 'wave']);
-		return assertBars(page, { 'lib-bar': 'dalien-signals', 'tier-bar': '320p', 'mode-bar': 'wave' });
+		return assertBars(page, { 'lib-bar': 'dalien-signals', 'tier-bar': '720p', 'mode-bar': 'wave' });
 	});
 
 	await check('tier radio: rapid clicks', async () => {

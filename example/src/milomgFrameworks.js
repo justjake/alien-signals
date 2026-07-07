@@ -20,6 +20,7 @@ import { solidFramework } from '../../../../milomg-reactivity-benchmark/packages
 import { solid2Framework } from '../../../../milomg-reactivity-benchmark/packages/core/src/frameworks/solid2.ts';
 import { svelteFramework } from '../../../../milomg-reactivity-benchmark/packages/core/src/frameworks/svelte.ts';
 import { tansuFramework } from '../../../../milomg-reactivity-benchmark/packages/core/src/frameworks/tansu.ts';
+import { tanstackStoreFramework } from '../../../../milomg-reactivity-benchmark/packages/core/src/frameworks/tanstackStore.ts';
 import { tc39SignalsFramework } from '../../../../milomg-reactivity-benchmark/packages/core/src/frameworks/tc39signals.ts';
 import { tldrawStateFramework } from '../../../../milomg-reactivity-benchmark/packages/core/src/frameworks/tldrawState.ts';
 import { xReactivityFramework } from '../../../../milomg-reactivity-benchmark/packages/core/src/frameworks/xReactivity.ts';
@@ -46,6 +47,7 @@ export const FRAMEWORKS = {
 	'solid-2': solid2Framework,
 	'svelte': svelteFramework,
 	'tansu': tansuFramework,
+	'tanstack-store': tanstackStoreFramework,
 	'tc39-signals': tc39SignalsFramework,
 	'tldraw-state': tldrawStateFramework,
 	'x-reactivity': xReactivityFramework,

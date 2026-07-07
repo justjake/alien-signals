@@ -3,10 +3,9 @@
 # Each runtime job uploads a CSV of per-test medians and a rendered PNG chart.
 #
 # Design notes:
-# - The harness is the milomg js-reactivity-benchmark plus this repo's fork
-#   changes (median-of-N estimator, interleaved isolated runner, adapters),
-#   stored as benchs/ci/milomg-fork.patch and applied to a pinned upstream
-#   clone. Regenerate with benchs/ci/regen-patch.sh when the fork changes.
+# - The harness is justjake/js-reactivity-benchmark (the milomg fork:
+#   median-of-N estimator, interleaved isolated runner, adapters), cloned
+#   at the pinned FORK_SHA below. Push the fork, then bump FORK_SHA here.
 # - Frameworks and suites are NEVER sharded across runners: comparing
 #   framework A on one machine with framework B on another is invalid.
 #   ROUNDS are sharded instead: each round job runs a complete interleaved
@@ -48,10 +47,11 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Pinned harness + upstream comparator; bump deliberately, together with
-  # regenerating milomg-fork.patch if the harness pin moves.
-  MILOMG_REPO: https://github.com/milomg/js-reactivity-benchmark
-  MILOMG_SHA: 56eb45e84b3f6fcfa867840725e66b59a9b7467a
+  # Pinned harness + upstream comparator; bump deliberately.
+  # Pinned fork of the milomg harness (suites, adapters, lockfile all
+  # committed there); bump FORK_SHA deliberately when the fork moves.
+  FORK_REPO: https://github.com/justjake/js-reactivity-benchmark
+  FORK_SHA: 38dfb6a11ef9057392cdd49dc09128fab9fc14d0
   ALIEN_REPO: https://github.com/stackblitz/alien-signals
   ALIEN_SHA: c00e63969bf261fc5dce31fae70cb9a90912b06e
   FRAMEWORKS: ${{ inputs.frameworks || '"Dalien Signals" "Alien Signals" "Reactively" "Preact Signals"' }}
@@ -91,9 +91,8 @@ jobs:
 
       - name: Clone pinned harness and comparator
         run: |
-          git clone --no-checkout "$MILOMG_REPO" milomg-reactivity-benchmark
-          git -C milomg-reactivity-benchmark checkout "$MILOMG_SHA"
-          git -C milomg-reactivity-benchmark apply "$GITHUB_WORKSPACE/packages/dalien-signals/benchs/ci/milomg-fork.patch"
+          git clone --no-checkout "$FORK_REPO" milomg-reactivity-benchmark
+          git -C milomg-reactivity-benchmark checkout "$FORK_SHA"
           git clone --no-checkout "$ALIEN_REPO" upstream-alien-signals
           git -C upstream-alien-signals checkout "$ALIEN_SHA"
 

@@ -19,8 +19,10 @@ concurrency:
 env:
   # Same pinned harness as benchmark.yml: the example's benchmark worker
   # imports the fork's suites and adapters from source.
-  MILOMG_REPO: https://github.com/milomg/js-reactivity-benchmark
-  MILOMG_SHA: 56eb45e84b3f6fcfa867840725e66b59a9b7467a
+  # Pinned fork of the milomg harness (suites, adapters, lockfile all
+  # committed there); bump FORK_SHA deliberately when the fork moves.
+  FORK_REPO: https://github.com/justjake/js-reactivity-benchmark
+  FORK_SHA: 38dfb6a11ef9057392cdd49dc09128fab9fc14d0
 
 jobs:
   build:
@@ -33,11 +35,37 @@ jobs:
         with:
           node-version: 24
       - run: npm install -g pnpm
-      - name: Clone pinned harness (suites + adapters for the bench worker)
+      - name: Clone pinned harness fork (suites + adapters for the example)
         run: |
-          git clone --no-checkout "$MILOMG_REPO" milomg-reactivity-benchmark
-          git -C milomg-reactivity-benchmark checkout "$MILOMG_SHA"
-          git -C milomg-reactivity-benchmark apply "$GITHUB_WORKSPACE/packages/dalien-signals/benchs/ci/milomg-fork.patch"
+          git clone --no-checkout "$FORK_REPO" milomg-reactivity-benchmark
+          git -C milomg-reactivity-benchmark checkout "$FORK_SHA"
+          # The example imports the fork's adapter SOURCES, which resolve
+          # dependencies from the fork's own node_modules.
+          pnpm install --dir milomg-reactivity-benchmark --no-frozen-lockfile
+      - name: Stub cosignal packages (private to the parent repo)
+        run: |
+          mkdir -p packages/cosignal/src
+          cat > packages/cosignal/package.json <<'EOF'
+          {
+            "name": "cosignal",
+            "version": "0.0.0-stub",
+            "type": "module",
+            "exports": { ".": "./src/stub.ts", "./logged": "./src/stub.ts" }
+          }
+          EOF
+          cat > packages/cosignal/src/stub.ts <<'EOF'
+          const die = (): never => {
+            throw new Error("cosignal is private to the parent repo and not available on the public site");
+          };
+          export class Atom { constructor(_v?: unknown) { die(); } get state(): never { return die(); } set(_v: unknown): never { return die(); } }
+          export class Computed { constructor(_fn?: unknown) { die(); } get state(): never { return die(); } }
+          export const effect = die;
+          export const effectScope = die;
+          export const startBatch = die;
+          export const endBatch = die;
+          export const untracked = die;
+          export const registerReactBridge = (): void => {};
+          EOF
       - name: Build dalien-signals
         working-directory: packages/dalien-signals
         run: |

@@ -71,7 +71,7 @@ const UNSELECTABLE = new Set(['mol-wire', 'dalien-malloc-free']);
 // mode, file: contexts): stickiness is a nicety, never a boot blocker.
 const STICKY_KEY = 'dalien-example-selection';
 function readStickySelection() {
-	const fallback = { lib: 'dalien-signals', tier: '320p' };
+	const fallback = { lib: 'dalien-signals', tier: '720p' };
 	try {
 		const stored = JSON.parse(localStorage.getItem(STICKY_KEY) ?? '{}');
 		return {
