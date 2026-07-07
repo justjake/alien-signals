@@ -39,7 +39,14 @@ a propagation band at 1.05–1.15.
    object-property chains. Repeated-read cells were capped ~1.5× until the
    one-entry read memo (keyed id+sub+globalVersion+cycle, in foldable
    context slots) recovered them; the same headwind taxes the whole
-   propagation band a few ns per operation with no per-site fix.
+   propagation band a few ns per operation with no per-site fix. (Audited:
+   the engine walks themselves have nothing to hoist — a graph walk is
+   load-fresh, touching each slot once; the redundancy was host- and
+   user-loop-level, and those sites are fixed. A GC-tuning diagnostic —
+   16× young-gen, both frameworks — moved the geomean ratio by ~1%,
+   confirming the band is per-op work, not collector scheduling; only
+   createSignals is GC-machinery-bound, and a large nursery makes its
+   deferred-registration pinning WORSE, +58%.)
 3. The benchmark harness times `cleanup()` inside the measured window for
    sBench-family tests while running `gc()` after it — explicit-teardown
    designs get charged in-window for what GC frameworks pay off-clock.
