@@ -194,6 +194,19 @@ const system = createReactiveSystem({
 			queuedGens[insertIndex] = leftGen;
 		}
 	},
+	// A record went to the free list (explicit free, owner collection, or
+	// sweep): release everything this library holds for the id, or dead
+	// values and closures stay pinned — and traced by every major GC —
+	// until the record is reused.
+	freed: function freedNode(id): void {
+		const idx = id >> Arena.NodeIndexShift;
+		currentVals[idx] = undefined;
+		pendingVals[idx] = undefined;
+		fns[idx] = undefined;
+		cleanups[idx] = undefined;
+		owned[idx] = undefined;
+		memoId = -1;
+	},
 	// Upstream's unwatched, delivered when a node's last subscriber unlinks.
 	unwatched: function unwatchedNode(id): void {
 		const flags = M[id + NodeSlot.Flags];

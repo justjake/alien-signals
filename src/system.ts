@@ -500,6 +500,13 @@ export interface ReactiveSystemOptions {
 	watched?: (id: SignalId) => unknown;
 	unwatched?: (id: SignalId, state: unknown) => void;
 	/**
+	 * A node record was recycled onto the free list (explicit free, owner
+	 * collection, or reclamation sweep): drop everything the host still
+	 * holds for this id — values, callbacks — or dead closures stay pinned
+	 * (and garbage-collector-traced) until the record is reused.
+	 */
+	freed?: (id: SignalId) => void;
+	/**
 	 * Runs when an arena generation comes into being: once inside
 	 * createReactiveSystem (the arena is allocated eagerly), and again after
 	 * every growth. Bind your views of {@link ReactiveSystem.arena} here —
@@ -567,6 +574,7 @@ function cloneWorks(): boolean {
 			hostUpdate: undefined,
 			hostWatched: undefined,
 			hostUnwatched: undefined,
+			hostFreed: undefined,
 			growPending: false,
 			boundaryPending: false,
 			grow: noop,
@@ -646,6 +654,7 @@ interface EngineShared {
 	hostUpdate: ((id: SignalId, flags: number) => boolean) | undefined;
 	hostWatched: ((id: SignalId) => unknown) | undefined;
 	hostUnwatched: ((id: SignalId, state: unknown) => void) | undefined;
+	hostFreed: ((id: SignalId) => void) | undefined;
 	growPending: boolean;
 	boundaryPending: boolean;
 	grow(): void;
@@ -702,6 +711,7 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 		hostUpdate: options?.update,
 		hostWatched: options?.watched,
 		hostUnwatched: options?.unwatched,
+		hostFreed: options?.freed,
 		growPending: false,
 		boundaryPending: false,
 		grow,
@@ -1009,6 +1019,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 	// per-call property loads off `shared`.
 	const hostUpdate = shared.hostUpdate;
 	const hostNotify = shared.hostNotify;
+	const hostFreed = shared.hostFreed;
 	const lifecycleArmed = shared.hostWatched !== undefined || shared.hostUnwatched !== undefined;
 	const hostState = shared.hostState;
 
@@ -1149,6 +1160,9 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		}
 
 		function freeNode(id: number): void {
+			if (hostFreed !== undefined) {
+				hostFreed(id);
+			}
 			D[(id >> Arena.VersionShift) + Arena.VersionOffset] = 0;
 			M[id + NodeSlot.Flags] = 0;
 			M[id + NodeSlot.DepsTail] = 0;
