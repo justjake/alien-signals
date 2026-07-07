@@ -2,3 +2,5 @@ node_modules
 cjs
 esm
 types
+example/dist
+example/node_modules

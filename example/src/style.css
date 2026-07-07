@@ -1,0 +1,67 @@
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+body {
+	margin: 0;
+	background: #0b0d12;
+	color: #e8eaf0;
+	font: 15px/1.5 ui-sans-serif, system-ui, sans-serif;
+}
+main { max-width: 1060px; margin: 0 auto; padding: 24px 20px 48px; }
+header h1 { margin: 0 0 4px; font-size: 22px; letter-spacing: 0.02em; }
+header p { margin: 0 0 16px; color: #9aa1b2; max-width: 62ch; }
+code { color: #7fd4ff; }
+canvas {
+	width: 100%;
+	image-rendering: pixelated;
+	border-radius: 8px;
+	background: #05060a;
+	cursor: crosshair;
+	touch-action: none;
+}
+#hud { display: flex; gap: 28px; flex-wrap: wrap; margin: 14px 0 10px; }
+.stat span { display: block; font-size: 22px; font-variant-numeric: tabular-nums; }
+.stat label { color: #9aa1b2; font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; }
+#controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+#controls button {
+	background: #161a24; color: #e8eaf0; border: 1px solid #2a3040;
+	padding: 7px 14px; border-radius: 6px; font: inherit; cursor: pointer;
+}
+#controls button.on { border-color: #7fd4ff; color: #7fd4ff; }
+#note { color: #9aa1b2; font-variant-numeric: tabular-nums; }
+footer p { color: #9aa1b2; max-width: 70ch; }
+
+h2 { font-size: 18px; margin: 36px 0 6px; }
+h3 { font-size: 14px; margin: 18px 0 6px; color: #c8cede; }
+.slots { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 6px 18px; margin: 14px 0; }
+.slots div { display: flex; gap: 10px; }
+.slots dt { color: #7fd4ff; font-variant-numeric: tabular-nums; white-space: nowrap; margin: 0; }
+.slots dd { color: #9aa1b2; margin: 0; }
+#inspector .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+#inspector .actions button {
+	background: #161a24; color: #e8eaf0; border: 1px solid #2a3040;
+	padding: 6px 12px; border-radius: 6px; font: inherit; cursor: pointer;
+}
+#inspector .panes { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+@media (max-width: 900px) { #inspector .panes { grid-template-columns: 1fr; } }
+.hint { color: #9aa1b2; font-size: 13px; margin: 0 0 8px; }
+#records table { border-collapse: collapse; font: 12px ui-monospace, monospace; width: 100%; }
+#records th, #records td { padding: 3px 7px; text-align: right; border-bottom: 1px solid #1c2130; }
+#records td.decoded { text-align: left; color: #9aa1b2; }
+#records tr.signal th { color: #7fd4ff; }
+#records tr.computed th { color: #b48bff; }
+#records tr.effect th { color: #ffd479; }
+#records tr.link th { color: #6fdc9c; }
+#records tr.freed { opacity: 0.45; }
+#records tr.selected { outline: 1px solid #7fd4ff; }
+#records td.changed { background: #4a3a12; color: #ffd479; }
+#graphview { width: 100%; background: #05060a; border-radius: 8px; }
+#graphview .node rect { fill: #161a24; stroke: #2a3040; }
+#graphview .node.signal rect { stroke: #7fd4ff; }
+#graphview .node.computed rect { stroke: #b48bff; }
+#graphview .node.effect rect { stroke: #ffd479; }
+#graphview text { fill: #e8eaf0; font: 12px ui-sans-serif, system-ui; text-anchor: middle; }
+#graphview .chips { fill: #9aa1b2; font-size: 9px; }
+#graphview .edges path { fill: none; stroke: #3a4358; stroke-width: 1.5; marker-end: none; }
+#graphview .edges text { fill: #5b667e; font-size: 9px; }
+#log { color: #9aa1b2; font-size: 13px; padding-left: 20px; }
+#log li { margin: 2px 0; }

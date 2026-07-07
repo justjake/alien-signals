@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>dalien-signals — feel the graph</title>
+		<link rel="stylesheet" href="/src/style.css" />
+	</head>
+	<body>
+		<main>
+			<header>
+				<h1>dalien-signals</h1>
+				<p>
+					Every pixel below is a <code>computed</code> blending the three
+					cells above it; the top row is <code>signal</code>s. Paint the top
+					row and watch the dependency cone — and only the cone — recompute.
+				</p>
+			</header>
+			<canvas id="grid"></canvas>
+			<section id="hud">
+				<div class="stat"><span id="stat-nodes">–</span><label>nodes in graph</label></div>
+				<div class="stat"><span id="stat-edges">–</span><label>dependency edges</label></div>
+				<div class="stat"><span id="stat-recomputed">–</span><label>recomputed this frame</label></div>
+				<div class="stat"><span id="stat-share">–</span><label>of the graph</label></div>
+				<div class="stat"><span id="stat-frame">–</span><label>frame compute</label></div>
+				<div class="stat"><span id="stat-fps">–</span><label>fps</label></div>
+			</section>
+			<section id="controls">
+				<button id="btn-wave" class="on">wave</button>
+				<button id="btn-storm">storm</button>
+				<button id="btn-cutoff">equality cutoff: on</button>
+				<button id="btn-invalidate">invalidate everything</button>
+				<span id="note"></span>
+			</section>
+			<section id="anatomy">
+				<h2>A node is eight integers</h2>
+				<p>
+					There are no node objects. The whole graph lives in one
+					<code>Int32Array</code> — the arena — carved into 32-byte
+					records of eight <code>int32</code> slots. A “signal” is a
+					record id: the index of its first slot.
+				</p>
+				<dl class="slots">
+					<div><dt>0 · Flags</dt><dd>kind tag + state bits: Mutable, Watching, Dirty, Pending, …</dd></div>
+					<div><dt>1 · Deps</dt><dd>head of the dependency list — points at a link record</dd></div>
+					<div><dt>2 · DepsTail</dt><dd>the re-track cursor into that list</dd></div>
+					<div><dt>3 · Subs</dt><dd>head of the subscriber list — also a link record</dd></div>
+					<div><dt>4 · SubsTail</dt><dd>tail of the subscriber list</dd></div>
+					<div><dt>5 · Gen</dt><dd>generation counter, so stale ids of freed records miss</dd></div>
+					<div><dt>6+7 · Version</dt><dd>one float64 (read through a shared-buffer view): “verified as of global version N”</dd></div>
+				</dl>
+				<p>
+					Edges are records too: a <em>link</em> record’s slots name a
+					dependency, a subscriber, and the four neighbors that thread it
+					into both of their lists. Reading a signal inside a computed
+					writes one of these records; that is the entire subscription
+					mechanism.
+				</p>
+			</section>
+			<section id="inspector-section">
+				<h2>Watch the integers move</h2>
+				<p>
+					A live graph — two signals, two computeds, one effect — over a
+					real arena. The table is the actual memory; the diagram is drawn
+					by following the pointers in it. Amber cells changed on the last
+					action.
+				</p>
+				<div id="inspector"></div>
+			</section>
+			<footer>
+				<p>
+					Painting writes a handful of signals; the change cascades down a
+					widening cone of computeds. With equality cutoff on, cells that
+					settle to the same value stop the cascade — the cone visibly
+					narrows. “Invalidate everything” writes a signal every cell reads,
+					recomputing the entire graph in one frame; the timer shows what
+					that costs.
+				</p>
+			</footer>
+		</main>
+		<script type="module" src="/src/main.js"></script>
+	</body>
+</html>
