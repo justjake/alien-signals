@@ -28,6 +28,14 @@ canvas {
 }
 #controls button.on { border-color: #7fd4ff; color: #7fd4ff; }
 #note { color: #9aa1b2; font-variant-numeric: tabular-nums; }
+#activity {
+	margin: 10px 0 2px;
+	font: 12px/1.7 ui-monospace, monospace;
+	font-variant-numeric: tabular-nums;
+	color: #5b667e;
+}
+#activity-live { color: #9aa1b2; }
+#activity .err { color: #ff8f8f; }
 footer p { color: #9aa1b2; max-width: 70ch; }
 
 h2 { font-size: 18px; margin: 36px 0 6px; }

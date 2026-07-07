@@ -1,9 +1,11 @@
 // The demo's own UI runs on dalien-signals: every piece of page state is a
 // signal, every DOM mutation lives in an effect. Handlers write state;
 // effects project state into the document.
-import { signal, computed, effect, growCapacity, startBatch, endBatch } from 'dalien-signals';
-import { buildGraph, BAND } from './graph.js';
+import { signal, computed, effect, growCapacity, setEffectMode, startBatch, endBatch } from 'dalien-signals';
+import { buildGraph, makeWaveDriver, BAND } from './graph.js';
+import { paintPixel, makeRowMix } from './palette.js';
 import { makeRuntime } from './adapters.js';
+import { FRAMEWORKS } from './milomgFrameworks.js';
 import { mountCounter, mountStepper, mountSheet } from './widgets.js';
 import { mountBench } from './bench.js';
 
@@ -14,6 +16,14 @@ import { mountBench } from './bench.js';
 // address space (512 MB here); pages commit only as records are touched.
 growCapacity(1 << 24);
 
+// The imported benchmark adapters for dalien switch the engine's effect
+// queue to manual mode at module load (their withBatch flushes it
+// explicitly). This page's own UI relies on the default: a write outside
+// a batch runs queued effects synchronously. Restore that before any page
+// state exists; the dalien adapters still work in sync mode — their
+// explicit flush just finds an empty queue.
+setEffectMode('sync');
+
 // One signal or computed per pixel at the named resolution, plus one
 // render effect per pixel on top: at 1080p the arena holds ~4.1 million
 // live nodes.
@@ -22,20 +32,61 @@ const TIERS = {
 	'480p': [854, 480],
 	'720p': [1280, 720],
 	'1080p': [1920, 1080],
+	'4k': [3840, 2160],
 };
-// Records per pixel: the cell node plus ~6 dependency links, and the
-// render-effect node plus its one link — about 9 records. The arena
-// doubles itself once it passes 3/4 full, so a tier needs 4/3 of its
-// record count reserved to never rebuild mid-run. The boot reservation
-// covers every tier through 720p (0.9 MP, ~8.3M records); 1080p (2.1 MP,
-// ~18.5M records) grows once, to 1 GB, when selected.
+// Records per pixel: the cell node plus its dependency links (3 in deep
+// bands, 4 in wide), and the render-effect node plus its one link —
+// about 7 records. The arena doubles itself once it passes 3/4 full, so
+// a tier needs 4/3 of its record count reserved to never rebuild
+// mid-run. The boot reservation covers every tier through 720p (0.9 MP,
+// ~5.9M records); 1080p (2.1 MP, ~13.4M records) grows once, to 1 GB,
+// when selected, and 4k (8.3 MP, ~54M records) to 4 GB. A machine that
+// refuses a reservation fails the build, which surfaces as a red line in
+// the activity log.
 const TIER_RECORDS = {
 	'1080p': 1 << 25,
+	'4k': 1 << 27,
 };
 
+// Importable but not selectable in the field demo:
+//
+// mol-wire cannot drive this page: its adapter's effect atoms are lazy —
+// a $mol_wire_atom body runs on first pull, and only already-run atoms
+// are subscribed and rescheduled — and nothing in the field ever pulls a
+// render effect, so the canvas stays dark (verified: builds at 320p,
+// zero pixels ever paint). The benchmark worker can still run the
+// adapter, whose suites do pull.
+//
+// dalien-malloc-free is the same dalien engine behind a function-tier
+// wrapper; the selector's dalien-signals entry already runs that engine
+// through its native id tier, which is the interface this demo is built
+// around. One entry per engine keeps the bar honest; the benchmark
+// worker still exercises both adapters.
+const UNSELECTABLE = new Set(['mol-wire', 'dalien-malloc-free']);
+
+// ---- sticky selection -----------------------------------------------------------
+// The chosen library and tier survive a reload. Reads validate against
+// the current roster — stale keys from an older deploy fall back to the
+// defaults — and storage access is allowed to fail silently (private
+// mode, file: contexts): stickiness is a nicety, never a boot blocker.
+const STICKY_KEY = 'dalien-example-selection';
+function readStickySelection() {
+	const fallback = { lib: 'dalien-signals', tier: '320p' };
+	try {
+		const stored = JSON.parse(localStorage.getItem(STICKY_KEY) ?? '{}');
+		return {
+			lib: FRAMEWORKS[stored.lib] && !UNSELECTABLE.has(stored.lib) ? stored.lib : fallback.lib,
+			tier: TIERS[stored.tier] ? stored.tier : fallback.tier,
+		};
+	} catch {
+		return fallback;
+	}
+}
+
 // ---- page state ---------------------------------------------------------------
-const libName = signal('dalien-signals');
-const tierName = signal('320p');
+const sticky = readStickySelection();
+const libName = signal(sticky.lib);
+const tierName = signal(sticky.tier);
 const mode = signal('wave'); // 'off' | 'wave' | 'storm'
 const cutoffOn = signal(true);
 const building = signal(false);
@@ -45,8 +96,41 @@ const avgFrameMs = signal(0);
 const fps = signal(0);
 const note = signal('');
 // The whole render bundle — runtime, graph, size-matched buffers — is one
-// signal, rebuilt when the library or tier changes.
-const view = signal(makeView());
+// signal, rebuilt when the library or tier changes. A sticky selection
+// can boot straight into a heavy tier; if this machine refuses it (the
+// reservations are gigabyte-scale at 4k), fall back to the defaults so
+// the page still comes up, and surface the error once the log exists.
+const bootSetupT0 = performance.now();
+let bootBundle;
+let bootError;
+try {
+	bootBundle = makeView();
+} catch (err) {
+	bootError = err;
+	startBatch();
+	try {
+		libName('dalien-signals');
+		tierName('320p');
+	} finally {
+		endBatch();
+	}
+	bootBundle = makeView();
+}
+const view = signal(bootBundle);
+const bootSetupMs = performance.now() - bootSetupT0;
+
+// Activity log, newest at the bottom. The frozen history is one signal
+// rendered wholesale — lines are appended only on rebuilds — while the
+// live average line is bound to its own element below the list, so its
+// per-frame updates touch one text node instead of re-rendering the list.
+// An entry is a string, or { text, error: true } for failure lines, which
+// render in red and carry the whole error.
+const LOG_LIMIT = 9; // frozen lines; the live line under them makes ~10 entries
+const logLines = signal([]);
+const runningLib = signal(libName()); // the library whose frames are running (≠ libName mid-rebuild)
+const logAppend = (...lines) => logLines(
+	[...logLines(), ...lines.map((line) => (typeof line === 'string' ? { text: line } : line))].slice(-LOG_LIMIT),
+);
 
 const share = computed(() => `${((recomputedCount() / view().graph.nodes) * 100).toFixed(1)}%`);
 const cutoffLabel = computed(() => `equality cutoff: ${cutoffOn() ? 'on' : 'off'}`);
@@ -59,11 +143,12 @@ function makeView() {
 	const name = libName();
 	const tier = tierName();
 	const [w, h] = TIERS[tier];
-	if (name === 'dalien-signals' && TIER_RECORDS[tier]) {
+	// Both dalien-backed selections — the native id tier and the benchmark
+	// adapter's malloc/free tier — allocate from the same shared arena.
+	if (name.startsWith('dalien') && TIER_RECORDS[tier]) {
 		growCapacity(TIER_RECORDS[tier]); // address space is cheap; pages are lazy
 	}
-	const rt = makeRuntime(name);
-	const graph = buildGraph(w, h, rt);
+	const rt = makeRuntime(name, FRAMEWORKS[name]);
 	const count = w * h;
 	const image = new ImageData(w, h);
 	const data = image.data;
@@ -75,51 +160,55 @@ function makeView() {
 	// appended twice.
 	const flash = new Float32Array(count);
 	const flashList = new Int32Array(count);
-	const get = rt.get;
-	const ids = graph.ids;
-	// Settle the graph before wiring watchers: an untracked pass evaluates
-	// every cell in dependency order, so effect creation links into a
-	// finished graph and does uniform work per pixel, instead of driving
-	// cold cascades of arbitrary depth from inside each effect body.
-	// Measured on dalien at 1080p: 4x off the first build when render
-	// effects covered 64-pixel tiles (7.5s -> 2.0s); with per-pixel
-	// effects the totals are close (2.8s with, 2.4s without, Node), and
-	// the pass stays for the bounded per-effect creation cost.
-	for (let i = 0; i < ids.length; i++) {
-		get(ids[i]);
-	}
-	const bundle = { rt, graph, w, h, image, vals, flash, flashList, flashEnd: 0 };
-	// One render effect per pixel: the finest possible subscription, so
-	// each library's own scheduler decides exactly which pixels repaint.
-	// An effect reruns only when its cell produced a new value (every
-	// library here cuts propagation on equality), so the body repaints
-	// unconditionally — running at all is the proof of change.
-	// The factory keeps each closure's own context to the one pixel index;
-	// the shared buffers are captured once, in the enclosing scope.
-	const renderPixel = (i) => () => {
-		const v0 = get(ids[i]);
-		vals[i] = v0;
-		if (flash[i] === 0) flashList[bundle.flashEnd++] = i;
-		flash[i] = 1;
-		paintPixel(data, i, v0, 1);
-	};
-	for (let i = 0; i < count; i++) {
-		rt.effect(renderPixel(i));
-	}
+	// per-row palette family (deep vs wide, crossfaded at band seams)
+	const rowMix = makeRowMix(h);
+	const bundle = { rt, graph: undefined, w, h, image, vals, flash, flashList, flashEnd: 0, rowMix };
+	// Everything the graph owns — signals, computeds, render effects — is
+	// created inside the runtime's build scope, so dispose() can hand the
+	// whole graph back through each framework's own ownership mechanism
+	// (effect scope, root).
+	rt.build(() => {
+		const graph = buildGraph(w, h, rt);
+		bundle.graph = graph;
+		const get = rt.get;
+		const ids = graph.ids;
+		// Settle the graph before wiring watchers: a plain read pass
+		// evaluates every cell in dependency order, so effect creation
+		// links into a finished graph and does uniform work per pixel,
+		// instead of driving cold cascades of arbitrary depth from inside
+		// each effect body. Measured on dalien at 1080p: 4x off the first
+		// build when render effects covered 64-pixel tiles (7.5s -> 2.0s);
+		// with per-pixel effects the totals are close (2.8s with, 2.4s
+		// without, Node), and the pass stays for the bounded per-effect
+		// creation cost.
+		for (let i = 0; i < ids.length; i++) {
+			get(ids[i]);
+		}
+		// One render effect per pixel: the finest possible subscription, so
+		// each library's own scheduler decides exactly which pixels repaint.
+		// An effect reruns only when its cell produced a new value (every
+		// library here cuts propagation on equality), so the body repaints
+		// unconditionally — running at all is the proof of change.
+		// The factory keeps each closure's own context to the one pixel
+		// index and its row's palette family; the shared buffers are
+		// captured once, in the enclosing scope.
+		const renderPixel = (i, mix) => () => {
+			const v0 = get(ids[i]);
+			vals[i] = v0;
+			if (flash[i] === 0) flashList[bundle.flashEnd++] = i;
+			flash[i] = 1;
+			paintPixel(data, i, v0, 1, mix);
+		};
+		for (let y = 0, i = 0; y < h; y++) {
+			const mix = rowMix[y];
+			for (let x = 0; x < w; x++, i++) {
+				rt.effect(renderPixel(i, mix));
+			}
+		}
+	});
+	// the wave mode's adaptive write controller, sized to this graph
+	bundle.driver = makeWaveDriver(bundle.graph);
 	return bundle;
-}
-
-// navy -> cyan -> gold ramp with late-rising red; glow is drawn over the
-// base color, never accumulated into it, so a fading highlight lands back
-// on the exact base.
-function paintPixel(data, i, v0, glow) {
-	const v = v0 < 0 ? 0 : v0 > 1 ? 1 : v0;
-	const warm = v > 0.55 ? (v - 0.55) * 2.2 : 0;
-	const p = i * 4;
-	data[p] = warm * warm * 255 + v * 30;
-	data[p + 1] = v ** 1.6 * 235 + glow * 70;
-	data[p + 2] = (0.16 + v * (1.25 - v)) * 235 + glow * 90;
-	data[p + 3] = 255;
 }
 
 // ---- state => document ----------------------------------------------------------
@@ -133,7 +222,10 @@ bindText('stat-frame', () => `${frameMs().toFixed(2)} ms`);
 bindText('stat-avg', () => `${avgFrameMs().toFixed(2)} ms`);
 bindText('stat-fps', () => String(fps()));
 const mb = (bytes) => `${(bytes / (1 << 20)).toFixed(1)} MB`;
-// the graph's nodes and edges, plus one render effect (node + link) per pixel
+// dalien's arena footprint for this graph: nodes, dependency edges, and
+// one render effect (node + link) per pixel, 32 bytes each. Other
+// libraries build the same graph from ordinary heap objects — their cost
+// shows in the js heap stat instead.
 bindText('stat-arena', () => {
 	const v = view();
 	return mb((v.graph.nodes + v.graph.edges + 2 * v.w * v.h) * 32);
@@ -146,6 +238,35 @@ if (performance.memory) {
 }
 bindText('note', note);
 bindText('btn-cutoff', cutoffLabel);
+
+// The frozen log lines rebuild as a whole — at most 9 short rows, on
+// rebuild-frequency events — while the live line updates every frame.
+effect(() => {
+	const list = $('activity-log');
+	list.textContent = '';
+	for (const line of logLines()) {
+		const div = document.createElement('div');
+		div.textContent = line.text;
+		if (line.error) div.className = 'err';
+		list.append(div);
+	}
+});
+bindText('activity-live', () => `${runningLib()}: avg frame time ${avgFrameMs().toFixed(1)} ms`);
+if (bootError) {
+	logAppend({ text: `${sticky.lib} @ ${sticky.tier}: build failed on boot — ${String(bootError)}`, error: true });
+}
+logAppend(`${libName()}: graph setup ${bootSetupMs.toFixed(0)} ms`);
+
+// state => persistence: one effect mirrors the selection pair into
+// storage whenever either changes; a write failure is silently ignored.
+effect(() => {
+	const value = JSON.stringify({ lib: libName(), tier: tierName() });
+	try {
+		localStorage.setItem(STICKY_KEY, value);
+	} catch {
+		// storage unavailable — the selection just won't stick
+	}
+});
 
 // radio-style button groups: exactly one active per group
 function radioGroup(barId, read, write) {
@@ -165,6 +286,18 @@ function radioGroup(barId, read, write) {
 		for (const b of buttons) b.classList.toggle('on', v === b.dataset.v);
 	});
 }
+// The library bar is generated from the frameworks map, so the selector
+// can never drift from the set of imported adapters (UNSELECTABLE keys
+// excluded, see above). data-v carries the key makeRuntime receives; the
+// label is the adapter's display name. Buttons must exist before
+// radioGroup snapshots the group.
+for (const [key, framework] of Object.entries(FRAMEWORKS)) {
+	if (UNSELECTABLE.has(key)) continue;
+	const b = document.createElement('button');
+	b.dataset.v = key;
+	b.textContent = framework.name;
+	$('lib-bar').append(b);
+}
 radioGroup('lib-bar', libName, libName);
 radioGroup('tier-bar', tierName, tierName);
 radioGroup('mode-bar', mode, mode);
@@ -183,6 +316,32 @@ $('btn-invalidate').addEventListener('click', () => {
 		v.rt.set(v.graph.epoch, v.rt.get(v.graph.epoch) + 1);
 	});
 });
+
+// Rolling window of frame-compute times. A ring buffer with a running sum
+// keeps the window's storage alive across frames and rebuilds — push/shift
+// moves every element each frame, and `length = 0` drops the backing store
+// just to reallocate it — and makes the average O(1). Declared before the
+// rebuild section below: finishRebuild resets the window and runs during
+// module init, so the bindings must already be initialized.
+const FRAME_WINDOW = 120;
+const frameTimes = new Float64Array(FRAME_WINDOW);
+let frameTimeCount = 0;
+let frameTimeIndex = 0;
+let frameTimeSum = 0;
+function recordFrameTime(ms) {
+	if (frameTimeCount === FRAME_WINDOW) frameTimeSum -= frameTimes[frameTimeIndex];
+	else frameTimeCount++;
+	frameTimes[frameTimeIndex] = ms;
+	frameTimeIndex = (frameTimeIndex + 1) % FRAME_WINDOW;
+	frameTimeSum += ms;
+	avgFrameMs(frameTimeSum / frameTimeCount);
+}
+function resetFrameTimes() {
+	frameTimeCount = 0;
+	frameTimeIndex = 0;
+	frameTimeSum = 0;
+	avgFrameMs(0); // no samples from the new graph yet
+}
 
 // rebuild is a projection of (library, tier)
 //
@@ -210,30 +369,55 @@ effect(() => {
 	// the second, keeping the page honest about multi-second builds.
 	requestAnimationFrame(() => requestAnimationFrame(() => {
 		if (seq !== buildSeq) return; // superseded by a newer selection
+		// Narrate the swap in the activity log before it happens: freeze
+		// the outgoing live average at its final value and name the change.
+		// A retry after a failed build has no outgoing graph to speak of
+		// (builtName was cleared), so it swaps silently.
+		if (builtName !== undefined) {
+			logAppend(
+				`${builtName}: avg frame time ${avgFrameMs().toFixed(1)} ms`,
+				...(name !== builtName ? [`framework changed to ${name}`] : []),
+				...(tier !== builtTier ? [`graph size changed to ${tier}`] : []),
+			);
+		}
 		// Free the outgoing graph before building the next one: its ids
 		// return to the arena, so the new build reuses those records
 		// instead of holding two graphs' worth of memory at the peak.
+		const teardownT0 = performance.now();
 		view().rt.dispose();
+		if (builtName !== undefined) {
+			logAppend(`${builtName}: graph teardown ${(performance.now() - teardownT0).toFixed(0)} ms`);
+		}
 		let next;
+		const setupT0 = performance.now();
 		try {
 			next = makeView();
 		} catch (err) {
+			// The note stays concise; the log line carries the whole error.
 			note(`build failed for ${name} @ ${tier} — ${err?.message ?? err}`);
+			logAppend({ text: `${name} @ ${tier}: build failed — ${String(err)}`, error: true });
 			// The old graph is already freed, so put the selection back and
 			// clear the built pair: the rebuild effect sees the reverted
-			// selection as new work and rebuilds it from scratch.
-			const prevName = builtName;
-			const prevTier = builtTier;
-			builtName = builtTier = undefined;
-			startBatch();
-			try {
-				libName(prevName);
-				tierName(prevTier);
-			} finally {
-				endBatch();
+			// selection as new work and rebuilds it from scratch. If this
+			// WAS that retry (no built pair to fall back to), stop here —
+			// `building` stays true, which keeps the frame loop and pointer
+			// input off the disposed view until the user picks a selection
+			// that builds.
+			if (builtName !== undefined) {
+				const prevName = builtName;
+				const prevTier = builtTier;
+				builtName = builtTier = undefined;
+				startBatch();
+				try {
+					libName(prevName);
+					tierName(prevTier);
+				} finally {
+					endBatch();
+				}
 			}
 			return;
 		}
+		logAppend(`${name}: graph setup ${(performance.now() - setupT0).toFixed(0)} ms`);
 		builtName = name;
 		builtTier = tier;
 		view(next);
@@ -248,6 +432,7 @@ function finishRebuild(name, tier) {
 	canvas.width = v.w;
 	canvas.height = v.h;
 	resetFrameTimes();
+	runningLib(name); // the live log line starts averaging under the new name
 	building(false);
 	note(`${name} @ ${tier}: ${v.graph.nodes.toLocaleString()} nodes built in ${v.graph.buildMs.toFixed(1)} ms`);
 }
@@ -299,37 +484,8 @@ function timeFullPass(write) {
 // them; the frame loop issues writes inside one batch per frame, then
 // decays the glow of recently changed pixels.
 
-// Rolling window of frame-compute times. A ring buffer with a running sum
-// keeps the window's storage alive across frames and rebuilds — push/shift
-// moves every element each frame, and `length = 0` drops the backing store
-// just to reallocate it — and makes the average O(1).
-const FRAME_WINDOW = 120;
-const frameTimes = new Float64Array(FRAME_WINDOW);
-let frameTimeCount = 0;
-let frameTimeIndex = 0;
-let frameTimeSum = 0;
-function recordFrameTime(ms) {
-	if (frameTimeCount === FRAME_WINDOW) frameTimeSum -= frameTimes[frameTimeIndex];
-	else frameTimeCount++;
-	frameTimes[frameTimeIndex] = ms;
-	frameTimeIndex = (frameTimeIndex + 1) % FRAME_WINDOW;
-	frameTimeSum += ms;
-	avgFrameMs(frameTimeSum / frameTimeCount);
-}
-function resetFrameTimes() {
-	frameTimeCount = 0;
-	frameTimeIndex = 0;
-	frameTimeSum = 0;
-}
-
 let frames = 0;
 let fpsWindow = performance.now();
-let phase = 0;
-const emitters = [
-	{ speed: 0.021, span: 0.9, width: 2, gain: 1.0 },
-	{ speed: -0.033, span: 0.55, width: 1, gain: 0.8 },
-	{ speed: 0.013, span: 0.75, width: 3, gain: 0.65 },
-];
 
 function frame() {
 	if (!building()) {
@@ -337,26 +493,15 @@ function frame() {
 		const g = v.graph;
 		const rt = v.rt;
 		g.stats.recomputes = 0;
+		g.stats.deepRecomputes = 0;
+		g.stats.wideRecomputes = 0;
 
 		const m = mode();
 		const bands = g.bandSources;
 		const t0 = performance.now();
 		rt.batch(() => {
 			if (m === 'wave') {
-				phase += 1;
-				// one band per frame keeps frame cost bounded at every tier
-				const band = bands[phase % bands.length];
-				for (const em of emitters) {
-					const centre = (Math.sin(phase * em.speed) * em.span * 0.5 + 0.5) * v.w;
-					const ww = Math.max(em.width, v.w >> 8);
-					for (let dx = -ww; dx <= ww; dx++) {
-						const i = (Math.round(centre) + dx + v.w) % v.w;
-						rt.set(band.cells[i], em.gain * Math.max(0, 1 - Math.abs(dx) / (ww + 1)));
-					}
-				}
-				if (phase % 90 === 0) {
-					rt.set(band.cells[Math.floor(Math.random() * v.w)], 1);
-				}
+				v.driver.step(rt);
 			} else if (m === 'storm') {
 				const drops = Math.max(4, v.w >> 7);
 				for (let k = 0; k < drops; k++) {
@@ -366,6 +511,8 @@ function frame() {
 			}
 		});
 		const ms = performance.now() - t0;
+		// the controller's cone estimates only make sense for its own writes
+		if (m === 'wave') v.driver.observe();
 		frameMs(ms);
 		recordFrameTime(ms);
 		recomputedCount(g.stats.recomputes);
@@ -374,20 +521,24 @@ function frame() {
 		// prefix of flashList — compacting the list in place as entries
 		// fade out, so its cost tracks recent change, not field size.
 		if (v.flashEnd > 0) {
-			const { image, flash, flashList, vals } = v;
+			const { image, flash, flashList, vals, rowMix, w } = v;
 			const data = image.data;
 			const end = v.flashEnd;
 			let live = 0;
 			for (let k = 0; k < end; k++) {
 				const i = flashList[k];
-				const f = flash[i] * 0.78;
+				const mix = rowMix[(i / w) | 0];
+				// fast decay (~9 frames to dark): the glow list holds every
+				// recently changed pixel, and the adaptive writes make that
+				// hundreds of thousands of entries at the big sizes
+				const f = flash[i] * 0.66;
 				if (f > 0.02) {
 					flash[i] = f;
 					flashList[live++] = i;
-					paintPixel(data, i, vals[i], f);
+					paintPixel(data, i, vals[i], f, mix);
 				} else {
 					flash[i] = 0; // 0 also means "not in the list"
-					paintPixel(data, i, vals[i], 0);
+					paintPixel(data, i, vals[i], 0, mix);
 				}
 			}
 			v.flashEnd = live;

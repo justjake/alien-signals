@@ -7,8 +7,51 @@
 // Usage: node --max-old-space-size=8192 smoke.mjs [library] [WxH] [frames]
 //   e.g. node smoke.mjs dalien-signals 1920x1080 120
 import { growCapacity } from 'dalien-signals';
-import { buildGraph, BAND } from './src/graph.js';
+import * as alien from 'alien-signals';
+import { buildGraph, makeWaveDriver, TARGET_SHARE } from './src/graph.js';
+import { paintPixel, makeRowMix } from './src/palette.js';
 import { makeRuntime } from './src/adapters.js';
+
+// Node-runnable mirror of the fork's alienSignals adapter: the fork's
+// adapters are TypeScript with extensionless relative imports, which bare
+// Node cannot load, so the same ReactiveFramework shape is rebuilt here on
+// the example's own alien-signals install (same package the fork adapter
+// aliases to under Vite). Kept field-for-field equivalent: cells are the
+// library's own callables, effects parent to an effectScope opened by
+// withBuild, cleanup disposes the scope.
+let alienScope = null;
+const alienFramework = {
+	name: 'Alien Signals',
+	createSignal: (v) => alien.signal(v),
+	readSignal: (s) => s(),
+	writeSignal: (s, v) => {
+		s(v);
+	},
+	createComputed: (fn) => alien.computed(fn),
+	readComputed: (c) => c(),
+	// the field's render callbacks return undefined, so fn passes through
+	// without a wrapper (alien-signals >= 3.2 treats a returned value as a
+	// cleanup function), matching the fork adapter
+	effect: (fn) => {
+		alien.effect(fn);
+	},
+	withBatch: (fn) => {
+		alien.startBatch();
+		fn();
+		alien.endBatch();
+	},
+	withBuild: (fn) => {
+		let out;
+		alienScope = alien.effectScope(() => {
+			out = fn();
+		});
+		return out;
+	},
+	cleanup: () => {
+		alienScope?.();
+		alienScope = null;
+	},
+};
 
 const lib = process.argv[2] ?? 'dalien-signals';
 const [w, h] = (process.argv[3] ?? '1920x1080').split('x').map(Number);
@@ -18,102 +61,88 @@ const now = () => performance.now();
 
 console.log(`${lib} @ ${w}x${h} (${count.toLocaleString()} pixels), ${frames} frames`);
 
-// Mirror main.js TIER_RECORDS: ~9 records per pixel with 4/3 headroom
-// under the arena's 3/4-full growth threshold, rounded up to a power of
-// two.
+// Mirror main.js: 512 MB (1 << 24 records) reserved at boot, more for the
+// 1080p tier — ~7 records per pixel with 4/3 headroom under the arena's
+// 3/4-full growth threshold, rounded up to a power of two.
 let capacity = 0;
 if (lib === 'dalien-signals') {
-	capacity = 1 << 21;
-	while (capacity < count * 12) capacity *= 2;
+	capacity = 1 << 24;
+	while (capacity < count * 11) capacity *= 2;
 	growCapacity(capacity);
 	console.log(`growCapacity(${capacity.toLocaleString()}) — ${(capacity * 32 / 2 ** 20).toFixed(0)} MB reserved`);
 }
 
 // ---- build: graph, settle pass, render effects (same order as makeView) ----
-let t = now();
-const rt = makeRuntime(lib);
-const graph = buildGraph(w, h, rt);
-const graphMs = now() - t;
-
-const get = rt.get;
-const ids = graph.ids;
-
-t = now();
-for (let i = 0; i < ids.length; i++) get(ids[i]);
-const settleMs = now() - t;
+// As in makeView, everything the graph owns is created inside the
+// runtime's build scope so dispose() could reclaim it all; the phases are
+// timed individually inside the one build callback.
+const rt = makeRuntime(lib, lib === 'alien-signals' ? alienFramework : undefined);
 
 const data = new Uint8ClampedArray(count * 4);
 const vals = new Float32Array(count);
 const flash = new Float32Array(count);
 const flashList = new Int32Array(count);
+const rowMix = makeRowMix(h);
 const bundle = { flashEnd: 0 };
 
-// copied from main.js paintPixel
-function paintPixel(data, i, v0, glow) {
-	const v = v0 < 0 ? 0 : v0 > 1 ? 1 : v0;
-	const warm = v > 0.55 ? (v - 0.55) * 2.2 : 0;
-	const p = i * 4;
-	data[p] = warm * warm * 255 + v * 30;
-	data[p + 1] = v ** 1.6 * 235 + glow * 70;
-	data[p + 2] = (0.16 + v * (1.25 - v)) * 235 + glow * 90;
-	data[p + 3] = 255;
-}
+let graph, graphMs, settleMs, effectsMs;
+rt.build(() => {
+	let t = now();
+	graph = buildGraph(w, h, rt);
+	graphMs = now() - t;
 
-t = now();
-const renderPixel = (i) => () => {
-	const v0 = get(ids[i]);
-	vals[i] = v0;
-	if (flash[i] === 0) flashList[bundle.flashEnd++] = i;
-	flash[i] = 1;
-	paintPixel(data, i, v0, 1);
-};
-for (let i = 0; i < count; i++) {
-	rt.effect(renderPixel(i));
-}
-const effectsMs = now() - t;
+	const get = rt.get;
+	const ids = graph.ids;
 
-// Exact record count for the dalien arena: cell nodes + quantize + epoch,
-// six dependency links per non-source cell, and one node + one link per
+	t = now();
+	for (let i = 0; i < ids.length; i++) get(ids[i]);
+	settleMs = now() - t;
+
+	t = now();
+	const renderPixel = (i, mix) => () => {
+		const v0 = get(ids[i]);
+		vals[i] = v0;
+		if (flash[i] === 0) flashList[bundle.flashEnd++] = i;
+		flash[i] = 1;
+		paintPixel(data, i, v0, 1, mix);
+	};
+	for (let y = 0, i = 0; y < h; y++) {
+		const mix = rowMix[y];
+		for (let x = 0; x < w; x++, i++) {
+			rt.effect(renderPixel(i, mix));
+		}
+	}
+	effectsMs = now() - t;
+});
+
+// Exact record count for the dalien arena: the graph's nodes (a cell per
+// pixel + quantize + epoch) and dependency links (counted per cell during
+// the build: 3 in deep bands, 4 in wide), plus one node + one link per
 // render effect. Growth triggers at 3/4 of capacity; the build must stay
 // under that line or a frame mid-run pays for an arena migration.
 if (lib === 'dalien-signals') {
-	const bandCount = Math.ceil(h / BAND);
-	const records = (count + 2) + 6 * (count - w * bandCount) + 2 * count;
+	const records = graph.nodes + graph.edges + 2 * count;
 	const growthLine = (capacity * 3) / 4;
 	console.log(`records ${records.toLocaleString()} vs growth line ${growthLine.toLocaleString()} — ${records < growthLine ? 'no growth' : 'GROWTH WOULD TRIGGER'}`);
 }
 
-// ---- frames: wave emitters, one band per frame (same shape as main.js) ----
-const emitters = [
-	{ speed: 0.021, span: 0.9, width: 2, gain: 1.0 },
-	{ speed: -0.033, span: 0.55, width: 1, gain: 0.8 },
-	{ speed: 0.013, span: 0.75, width: 3, gain: 0.65 },
-];
-const bands = graph.bandSources;
-let phase = 0;
+// ---- frames: the page's own adaptive wave driver — deep column profiles
+// and wide hub pulses, write counts sized by the measured cones ----
+const driver = makeWaveDriver(graph);
 const batchMs = new Float64Array(frames);
 const glowPassMs = new Float64Array(frames);
 const recomputed = new Float64Array(frames);
 
 for (let f = 0; f < frames; f++) {
 	graph.stats.recomputes = 0;
+	graph.stats.deepRecomputes = 0;
+	graph.stats.wideRecomputes = 0;
 	const t0 = now();
 	rt.batch(() => {
-		phase += 1;
-		const band = bands[phase % bands.length];
-		for (const em of emitters) {
-			const centre = (Math.sin(phase * em.speed) * em.span * 0.5 + 0.5) * w;
-			const ww = Math.max(em.width, w >> 8);
-			for (let dx = -ww; dx <= ww; dx++) {
-				const i = (Math.round(centre) + dx + w) % w;
-				rt.set(band.cells[i], em.gain * Math.max(0, 1 - Math.abs(dx) / (ww + 1)));
-			}
-		}
-		if (phase % 90 === 0) {
-			rt.set(band.cells[Math.floor(Math.random() * w)], 1);
-		}
+		driver.step(rt);
 	});
 	batchMs[f] = now() - t0;
+	driver.observe();
 	recomputed[f] = graph.stats.recomputes;
 
 	// the browser frame loop's glow decay, timed separately from the batch
@@ -122,14 +151,15 @@ for (let f = 0; f < frames; f++) {
 	let live = 0;
 	for (let k = 0; k < end; k++) {
 		const i = flashList[k];
-		const g = flash[i] * 0.78;
+		const mix = rowMix[(i / w) | 0];
+		const g = flash[i] * 0.66;
 		if (g > 0.02) {
 			flash[i] = g;
 			flashList[live++] = i;
-			paintPixel(data, i, vals[i], g);
+			paintPixel(data, i, vals[i], g, mix);
 		} else {
 			flash[i] = 0;
-			paintPixel(data, i, vals[i], 0);
+			paintPixel(data, i, vals[i], 0, mix);
 		}
 	}
 	bundle.flashEnd = live;
@@ -144,8 +174,10 @@ function stats(arr, from = 0) {
 }
 
 const half = frames >> 1;
+const sustainedShare = recomputed.slice(half).reduce((a, b) => a + b, 0) / (frames - half) / graph.nodes;
 console.log(`build: graph ${graphMs.toFixed(0)} ms, settle ${settleMs.toFixed(0)} ms, effects ${effectsMs.toFixed(0)} ms, total ${(graphMs + settleMs + effectsMs).toFixed(0)} ms`);
 console.log(`recomputed cells/frame: ${stats(recomputed)}`);
+console.log(`recompute share (last ${frames - half}, sustained): ${(sustainedShare * 100).toFixed(1)}% of ${graph.nodes.toLocaleString()} nodes (target ${(TARGET_SHARE * 100).toFixed(0)}%)`);
 console.log(`write batch ms (all ${frames}):        ${stats(batchMs)}`);
 console.log(`write batch ms (last ${frames - half}, sustained): ${stats(batchMs, half)}`);
 console.log(`glow decay ms (last ${frames - half}, sustained):  ${stats(glowPassMs, half)}`);

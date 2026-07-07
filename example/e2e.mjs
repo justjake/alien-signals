@@ -18,15 +18,21 @@ import { chromium } from 'playwright';
 
 const exampleDir = path.dirname(fileURLToPath(import.meta.url));
 
-// Expected shapes mirror src/graph.js: nodes = cells + quantize + epoch;
-// every cell outside a band's source row is a computed, and a full-field
-// pass (epoch bump, quantize toggle) recomputes each computed exactly once.
+// Expected shapes mirror src/graph.js: nodes = cells + quantize + epoch.
+// Deep bands (even indexes) keep one signal per source-row pixel; wide
+// bands (odd indexes) keep hubCount(w) hub signals. Every other cell is a
+// computed, and a full-field pass (epoch bump, quantize toggle) recomputes
+// each computed exactly once.
 const BAND = 64;
+const HUB_SPACING = 32;
+const hubCount = (w) => Math.max(2, Math.round(w / HUB_SPACING) + 1);
 const TIERS = { '320p': [568, 320], '480p': [854, 480], '720p': [1280, 720] };
 const tierNodes = (tier) => TIERS[tier][0] * TIERS[tier][1] + 2;
 const tierComputeds = (tier) => {
 	const [w, h] = TIERS[tier];
-	return w * h - w * Math.ceil(h / BAND);
+	const bands = Math.ceil(h / BAND);
+	const signals = w * Math.ceil(bands / 2) + hubCount(w) * Math.floor(bands / 2);
+	return w * h - signals;
 };
 
 const BARS = ['lib-bar', 'tier-bar', 'mode-bar'];
@@ -84,6 +90,13 @@ async function startPreview() {
 
 const noteText = (page) => page.evaluate(() => document.getElementById('note').textContent);
 const statText = (page, id) => page.evaluate((statId) => document.getElementById(statId).textContent, id);
+
+// The activity log: frozen history lines plus the always-updating live
+// average line under them.
+const readActivity = (page) => page.evaluate(() => ({
+	lines: [...document.querySelectorAll('#activity-log div')].map((div) => div.textContent),
+	live: document.getElementById('activity-live').textContent,
+}));
 
 // Each bar dumped as its buttons' data-v values, the active one marked `value*`.
 function readBars(page) {
@@ -225,6 +238,16 @@ async function run(page, url) {
 		return `${s.width}x${s.height}, ${s.lit}/${s.sampled} sampled pixels lit`;
 	});
 
+	await check('activity log: boot setup line and live average', async () => {
+		const log = await readActivity(page);
+		const setup = log.lines.find((line) => /^dalien-signals: graph setup \d+ ms$/.test(line));
+		if (!setup) die(`no boot setup line; log is [${log.lines.join(' | ')}]`);
+		if (!/^dalien-signals: avg frame time \d+(\.\d+)? ms$/.test(log.live)) {
+			die(`live line is "${log.live}", want a dalien-signals average`);
+		}
+		return `${setup}; live "${log.live}"`;
+	});
+
 	await check('mode radio: single clicks', async () => {
 		await clickButton(page, 'mode-bar', 'storm');
 		await assertBars(page, { 'lib-bar': 'dalien-signals', 'tier-bar': '320p', 'mode-bar': 'storm' });
@@ -306,6 +329,42 @@ async function run(page, url) {
 			await sleep(POLL_MS);
 		}
 		return `checksum ${before.checksum} -> ${after.checksum}, ${recomputed} recomputed last frame`;
+	});
+
+	await check('activity log narrates the framework switch', async () => {
+		const log = await readActivity(page);
+		// The switch to alien-signals was the last rebuild, so its narration
+		// is the log's tail: frozen average, change line, teardown, setup.
+		const tail = log.lines.slice(-4);
+		const want = [
+			/^dalien-signals: avg frame time \d+(\.\d+)? ms$/,
+			/^framework changed to alien-signals$/,
+			/^dalien-signals: graph teardown (\d+) ms$/,
+			/^alien-signals: graph setup (\d+) ms$/,
+		];
+		for (let k = 0; k < want.length; k++) {
+			if (!want[k].test(tail[k] ?? '')) {
+				die(`log tail line ${k} is "${tail[k]}", want ${want[k]} — log is [${log.lines.join(' | ')}]`);
+			}
+		}
+		const setupMs = digits(tail[3].match(want[3])[1]);
+		if (setupMs < 1 || setupMs > BUILD_TIMEOUT_MS) die(`setup time ${setupMs} ms is not plausible`);
+		const liveMatch = log.live.match(/^alien-signals: avg frame time (\d+(\.\d+)?) ms$/);
+		if (!liveMatch) die(`live line is "${log.live}", want an alien-signals average`);
+		if (!(Number(liveMatch[1]) > 0)) die(`live average is ${liveMatch[1]} ms after 500 ms of animation`);
+		// Many rebuilds have happened by now; the history must be capped at
+		// its limit, with the live line making ~10 visible entries.
+		if (log.lines.length !== 9) die(`log holds ${log.lines.length} frozen lines, want the 9-line cap`);
+		return `${tail.join(' | ')}; live "${log.live}"`;
+	});
+
+	await check('sticky selection survives reload', async () => {
+		await clickButton(page, 'tier-bar', '720p');
+		await awaitBuildNote(page, 'alien-signals', '720p');
+		await page.reload({ waitUntil: 'load' });
+		const note = await awaitBuildNote(page, 'alien-signals', '720p');
+		const dumps = await assertBars(page, { 'lib-bar': 'alien-signals', 'tier-bar': '720p', 'mode-bar': 'wave' });
+		return `${note} — ${dumps}`;
 	});
 
 	return results;
