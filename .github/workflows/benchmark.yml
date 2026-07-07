@@ -51,7 +51,7 @@ env:
   # Pinned fork of the milomg harness (suites, adapters, lockfile all
   # committed there); bump FORK_SHA deliberately when the fork moves.
   FORK_REPO: https://github.com/justjake/js-reactivity-benchmark
-  FORK_SHA: 38dfb6a11ef9057392cdd49dc09128fab9fc14d0
+  FORK_SHA: 49dae07763f4277966462fef9e482ba3c1980d66
   ALIEN_REPO: https://github.com/stackblitz/alien-signals
   ALIEN_SHA: c00e63969bf261fc5dce31fae70cb9a90912b06e
   FRAMEWORKS: ${{ inputs.frameworks || '"Dalien Signals" "Alien Signals" "Reactively" "Preact Signals"' }}

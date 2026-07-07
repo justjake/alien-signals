@@ -6,9 +6,11 @@
 // the benchmarks all run identical library builds, locally and in CI.
 import { defineConfig } from 'vite';
 import { fileURLToPath } from 'node:url';
-
 const here = (p) => fileURLToPath(new URL(p, import.meta.url));
-const fork = (p) => here(`../../../milomg-reactivity-benchmark/node_modules/.pnpm/${p}`);
+// Paths through the fork core's own package links (pnpm symlinks): they
+// resolve wherever the store physically lives, on any machine. A
+// hard-coded .pnpm store path only works on the machine that produced it.
+const fork = (p) => here(`../../../milomg-reactivity-benchmark/packages/core/node_modules/${p}`);
 
 export default defineConfig({
 	// Two versions of @solidjs/signals are in play: the x-reactivity adapter
@@ -37,11 +39,11 @@ export default defineConfig({
 			// at the store entries directly; each entry keeps its own
 			// dependencies as sibling links, so transitive imports (rxjs,
 			// @tldraw/utils) still resolve.
-			{ find: /^anod$/, replacement: fork('anod@0.9.1/node_modules/anod/dist/index.js') },
-			{ find: /^@tldraw\/state$/, replacement: fork('@tldraw+state@5.2.2/node_modules/@tldraw/state/dist-esm/index.mjs') },
+			{ find: /^anod$/, replacement: fork('anod/dist/index.js') },
+			{ find: /^@tldraw\/state$/, replacement: fork('@tldraw/state/dist-esm/index.mjs') },
 			// the solid2 adapter imports this build by a relative path that
 			// only exists in the store
-			{ find: /^(\.\.\/)+node_modules\/solid-js-2\/dist\/solid\.js$/, replacement: fork('solid-js@2.0.0-beta.15/node_modules/solid-js/dist/solid.js') },
+			{ find: /^(\.\.\/)+node_modules\/solid-js-2\/dist\/solid\.js$/, replacement: fork('solid-js-2/dist/solid.js') },
 		],
 	},
 });
