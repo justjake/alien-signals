@@ -22,17 +22,20 @@
 			</header>
 
 			<section>
-				<h2>Demo: a 46,000-node graph</h2>
+				<h2>Demo: one node per pixel</h2>
 				<p>
-					The top row of pixels is <code>signal</code>s; every pixel below
-					is a <code>computed</code> reading its three parents plus one
-					<em>hub</em> — a popular cell several rows up that dozens of
-					others also read. Subscriber counts vary by an order of
-					magnitude, and it shows: writes that stay on ordinary cells
+					The field is built in 64-row bands. Each band starts from its
+					own row of <code>signal</code>s — even bands flow downward, odd
+					bands upward — and every other pixel is a <code>computed</code>
+					reading three parents plus one <em>hub</em>, a nearby cell that
+					a whole column group also reads. Subscriber counts vary by an
+					order of magnitude, and it shows: writes on ordinary cells
 					cascade in narrow cones, writes that reach a hub flash across
-					whole regions. The emitters write a few signals per frame; drag
+					their region. The emitters write a few signals per frame; drag
 					to write directly (right button writes darkness). The library
-					bar rebuilds the same graph on other signal implementations.
+					and size bars rebuild the same graph on other signal
+					implementations and at other resolutions — up to a node per
+					pixel of a 4k or 8k frame, if the machine grants the memory.
 				</p>
 				<canvas id="grid"></canvas>
 				<section id="hud">
@@ -54,6 +57,7 @@
 						<button data-v="@reactively/core">reactively</button>
 					</span>
 					<span class="libpick" id="tier-bar" role="group" aria-label="graph size">
+						<button data-v="320p">320p</button>
 						<button data-v="480p">480p</button>
 						<button data-v="720p">720p</button>
 						<button data-v="1080p">1080p</button>
