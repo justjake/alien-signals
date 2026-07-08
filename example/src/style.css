@@ -147,7 +147,7 @@ section > p { max-width: 72ch; color: #b7bdcc; }
 #lib-bar {
 	flex: 1 0 100%;
 	display: grid;
-	grid-template-columns: auto repeat(4, minmax(0, 1fr));
+	grid-template-columns: auto repeat(3, minmax(0, 1fr));
 	grid-template-rows: repeat(var(--lib-rows, 4), auto);
 	gap: 4px;
 	border: 0;
@@ -171,15 +171,26 @@ section > p { max-width: 72ch; color: #b7bdcc; }
 	text-overflow: ellipsis;
 }
 #lib-bar .lib-stats {
-	display: block;
-	font: 9px/1.7 ui-monospace, SFMono-Regular, Menlo, monospace;
+	display: flex;
+	gap: 14px;
+	font: 10px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
 	font-variant-numeric: tabular-nums;
-	color: #5b667e;
+	color: #9aa1b2;
 	white-space: nowrap;
 	overflow: hidden;
 }
 /* the active button's background is bright cyan — keep the subtitle legible */
-#controls #lib-bar button.on .lib-stats { color: #0b0d12; opacity: 0.7; }
+#lib-bar .lib-stats .seg { display: inline-flex; align-items: baseline; gap: 4px; text-transform: uppercase; letter-spacing: 0.05em; }
+#lib-bar .lib-stats .seg b { font-weight: 600; font-size: 15px; letter-spacing: 0; text-transform: none; }
+/* the flagship row: dalien's cell carries the accent even when idle */
+#lib-bar button[data-v="dalien-signals"] { border-color: #7fd4ff; }
+#lib-bar button[data-v="dalien-signals"] .lib-name { color: #7fd4ff; font-weight: 600; }
+#controls #lib-bar button.on[data-v="dalien-signals"] .lib-name { color: #0b0d12; }
+#lib-bar .lib-stats .seg.build b { color: #7fd4ff; }
+#lib-bar .lib-stats .seg.frame b { color: #ffd479; }
+#lib-bar .lib-stats .seg.down b { color: #b48bff; }
+#controls #lib-bar button.on .lib-stats { color: #0b0d12; }
+#controls #lib-bar button.on .lib-stats .seg b { color: #0b0d12; }
 /* triple-id selector: the shared cell rule above is #controls #lib-bar button */
 #controls #lib-bar #btn-tour { grid-row: 1 / -1; font-size: 16px; padding: 4px 10px; text-align: center; }
 @media (max-width: 720px) {

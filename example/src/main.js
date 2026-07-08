@@ -471,23 +471,37 @@ for (const [key, framework] of Object.entries(FRAMEWORKS)) {
 // implicit grid rows ignore `grid-row: 1 / -1`.
 $('lib-bar').style.setProperty(
 	'--lib-rows',
-	Math.ceil($('lib-bar').querySelectorAll('button[data-v]').length / 4),
+	Math.ceil($('lib-bar').querySelectorAll('button[data-v]').length / 3),
 );
-// Subtitle projection: setup · avg frame · teardown from the library's
-// most recent visit, an em dash per still-unmeasured segment. The visible
-// line is positional to fit the cell; the title spells the labels out.
+// Subtitle projection: three labeled, color-coded segments — build (setup
+// wall), frame (visit's average compute), down (teardown wall) — an em
+// dash per still-unmeasured segment. Each segment is its own span so the
+// color carries the meaning; the title repeats it in full words.
 // data-avg-ms carries the unrounded average so a fresh snapshot is
 // observable even when the rounded text comes out identical.
 const fmtDur = (ms) => (ms === undefined ? '—' : ms < 999.5 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`);
-const fmtFrameAvg = (ms) => (ms === undefined ? '—' : `${ms.toFixed(1)}ms/f`);
+const fmtFrameAvg = (ms) => (ms === undefined ? '—' : `${ms.toFixed(1)}ms`);
 {
-	const lines = [...$('lib-bar').querySelectorAll('button[data-v] .lib-stats')];
+	const lines = [...$('lib-bar').querySelectorAll('button[data-v] .lib-stats')].map((line) => {
+		const seg = (cls, label) => {
+			const el = document.createElement('span');
+			el.className = `seg ${cls}`;
+			el.append(label + '\u00a0');
+			const value = document.createElement('b');
+			el.append(value);
+			line.append(el);
+			return value;
+		};
+		return { line, build: seg('build', 'build'), frame: seg('frame', 'frame'), down: seg('down', 'down') };
+	});
 	effect(() => {
 		const stats = libStats();
-		for (const line of lines) {
+		for (const { line, build, frame, down } of lines) {
 			const s = stats.get(line.parentElement.dataset.v);
-			line.textContent = `${fmtDur(s?.setupMs)}·${fmtFrameAvg(s?.frameAvgMs)}·${fmtDur(s?.teardownMs)}`;
-			line.title = `setup ${fmtDur(s?.setupMs)} · avg frame ${fmtFrameAvg(s?.frameAvgMs)} · teardown ${fmtDur(s?.teardownMs)}`;
+			build.textContent = fmtDur(s?.setupMs);
+			frame.textContent = fmtFrameAvg(s?.frameAvgMs);
+			down.textContent = fmtDur(s?.teardownMs);
+			line.title = `build (graph setup) ${fmtDur(s?.setupMs)} · avg frame compute ${fmtFrameAvg(s?.frameAvgMs)} · teardown ${fmtDur(s?.teardownMs)}`;
 			if (s?.frameAvgMs !== undefined) line.dataset.avgMs = String(s.frameAvgMs);
 		}
 	});
