@@ -12,7 +12,50 @@ const here = (p) => fileURLToPath(new URL(p, import.meta.url));
 // hard-coded .pnpm store path only works on the machine that produced it.
 const fork = (p) => here(`../../../milomg-reactivity-benchmark/packages/core/node_modules/${p}`);
 
+// The page's code samples are static text, so coloring them is a build
+// concern: transformIndexHtml swaps each <pre><code class="language-x">
+// block for shiki's span-per-token HTML while the page is served (dev) or
+// emitted (build). The browser gets finished markup — no highlighter
+// bundle to download, no post-load repaint to shift the layout.
+function shikiHighlight() {
+	// index.html authors the samples as escaped HTML; shiki wants source
+	// text and does its own escaping on the way back out.
+	const unescape = (html) => html
+		.replace(/&lt;/g, '<')
+		.replace(/&gt;/g, '>')
+		.replace(/&quot;/g, '"')
+		.replace(/&#39;/g, "'")
+		.replace(/&amp;/g, '&'); // last, so "&amp;lt;" cannot double-decode
+	return {
+		name: 'shiki-highlight',
+		async transformIndexHtml(html) {
+			// Imported per transform, not at config load: every vite command
+			// evaluates this file, but only HTML serving needs a highlighter.
+			// shiki caches its engine internally, so repeat transforms in a
+			// long-lived dev server pay the wasm setup once.
+			const { codeToHtml } = await import('shiki');
+			const blocks = [...html.matchAll(/<pre><code class="language-([\w-]+)">([\s\S]*?)<\/code><\/pre>/g)];
+			for (const [block, lang, escaped] of blocks) {
+				const highlighted = await codeToHtml(unescape(escaped), {
+					lang,
+					// tokyo-night's cyan (#7dcfff) and purple (#bb9af7) sit next
+					// to the page accents (#7fd4ff / #b48bff). Its background is
+					// swapped for the stylesheet's pre background so the block
+					// keeps the page's shade of dark instead of adding a second.
+					theme: 'tokyo-night',
+					colorReplacements: { '#1a1b26': '#10131c' },
+				});
+				// Replacement via callback: sample code contains `$` sequences
+				// that String.replace would otherwise interpret.
+				html = html.replace(block, () => highlighted);
+			}
+			return html;
+		},
+	};
+}
+
 export default defineConfig({
+	plugins: [shikiHighlight()],
 	// Two versions of @solidjs/signals are in play: the x-reactivity adapter
 	// uses 0.10.2, while solid-js 2 beta ships against its own matching
 	// beta (0.10.2 lacks exports the beta build imports, e.g.
