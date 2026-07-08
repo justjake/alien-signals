@@ -157,7 +157,7 @@ section > p { max-width: 72ch; color: #b7bdcc; }
 #controls #lib-bar button {
 	border: 1px solid #2a3040;
 	border-radius: 6px;
-	padding: 4px 7px;
+	padding: 7px 10px;
 	text-align: left;
 	min-width: 0;
 	display: grid;
@@ -165,7 +165,8 @@ section > p { max-width: 72ch; color: #b7bdcc; }
 }
 #lib-bar .lib-name {
 	display: block;
-	font-size: 12.5px;
+	font-size: 16px;
+	line-height: 1.5;
 	white-space: nowrap;
 	overflow: hidden;
 	text-overflow: ellipsis;
@@ -186,9 +187,11 @@ section > p { max-width: 72ch; color: #b7bdcc; }
 #lib-bar button[data-v="dalien-signals"] { border-color: #7fd4ff; }
 #lib-bar button[data-v="dalien-signals"] .lib-name { color: #7fd4ff; font-weight: 600; }
 #controls #lib-bar button.on[data-v="dalien-signals"] .lib-name { color: #0b0d12; }
-#lib-bar .lib-stats .seg.build b { color: #7fd4ff; }
-#lib-bar .lib-stats .seg.frame b { color: #ffd479; }
-#lib-bar .lib-stats .seg.down b { color: #b48bff; }
+#lib-bar .lib-stats .seg.mount b { color: #7fd4ff; }
+#lib-bar .lib-stats .seg.fps b { color: #ffd479; }
+#lib-bar .lib-stats .seg.unmount b { color: #b48bff; }
+#lib-bar .lib-name .lib-rank { float: right; font: 12px/2 ui-monospace, SFMono-Regular, Menlo, monospace; color: #9aa1b2; font-weight: 400; }
+#controls #lib-bar button.on .lib-rank { color: #0b0d12; }
 #controls #lib-bar button.on .lib-stats { color: #0b0d12; }
 #controls #lib-bar button.on .lib-stats .seg b { color: #0b0d12; }
 /* triple-id selector: the shared cell rule above is #controls #lib-bar button */

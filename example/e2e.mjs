@@ -152,7 +152,8 @@ async function assertTourGlyph(page, want, why) {
 const libSubtitle = (page, key) => page.evaluate((k) => {
 	const line = document.querySelector(`#lib-bar button[data-v="${k}"] .lib-stats`);
 	const seg = (cls) => line.querySelector(`.seg.${cls} b`)?.textContent ?? '';
-	return { build: seg('build'), frame: seg('frame'), down: seg('down'), avgMs: line.dataset.avgMs ?? null };
+	const rank = document.querySelector(`#lib-bar button[data-v="${k}"] .lib-rank`)?.textContent ?? '';
+	return { mount: seg('mount'), fps: seg('fps'), unmount: seg('unmount'), rank, avgMs: line.dataset.avgMs ?? null };
 }, key);
 // duration segment -> milliseconds ("890ms" or "2.3s"; "—" comes out NaN)
 const durMs = (seg) => (seg.endsWith('ms') ? Number(seg.slice(0, -2))
@@ -413,13 +414,14 @@ async function run(page, url) {
 		// just slept), and torn down (left during the tour) — every segment
 		// should carry a plausible number.
 		const sub = await libSubtitle(page, 'alien-signals');
-		const setup = durMs(sub.build);
-		const frame = sub.frame.endsWith('ms') ? Number(sub.frame.slice(0, -2)) : NaN;
-		const teardown = durMs(sub.down);
-		if (!(setup > 0 && setup < BUILD_TIMEOUT_MS)) die(`build segment "${sub.build}" is not a plausible duration`);
-		if (!(frame > 0 && frame < 1_000)) die(`frame segment "${sub.frame}" is not a plausible per-frame average`);
-		if (!(teardown >= 0 && teardown < BUILD_TIMEOUT_MS)) die(`down segment "${sub.down}" is not a plausible duration`);
-		return `build ${sub.build} · frame ${sub.frame} · down ${sub.down}`;
+		const setup = durMs(sub.mount);
+		const frame = Number(sub.fps);
+		const teardown = durMs(sub.unmount);
+		if (!(setup > 0 && setup < BUILD_TIMEOUT_MS)) die(`mount segment "${sub.mount}" is not a plausible duration`);
+		if (!(frame > 0 && frame <= 1_000)) die(`fps segment "${sub.fps}" is not a plausible rate`);
+		if (!(teardown >= 0 && teardown < BUILD_TIMEOUT_MS)) die(`unmount segment "${sub.unmount}" is not a plausible duration`);
+		if (!/^#\d+( · \d+% slower)?$/.test(sub.rank)) die(`rank badge "${sub.rank}" missing or malformed`);
+		return `mount ${sub.mount} · fps ${sub.fps} · unmount ${sub.unmount} · rank "${sub.rank}"`;
 	});
 
 	await check('tour: a second dwell refreshes the stats', async () => {

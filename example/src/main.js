@@ -219,10 +219,10 @@ function startDwell(name) {
 	dwellTimer = setTimeout(endDwell, TOUR_DWELL_MS);
 }
 function endDwell() {
-	// ~5s of frames since this library's build finished: the rolling frame
+	// ~5s of samples since this library's build finished: the rolling fps
 	// average was reset at that build, so it is exactly this visit's reading.
-	const avg = frameAvg.average();
-	if (Number.isFinite(avg)) recordLibStats(dwellLib, { frameAvgMs: avg });
+	const avg = fpsAvg.average();
+	if (Number.isFinite(avg)) recordLibStats(dwellLib, { fps: avg });
 	if (cycling()) {
 		const next = nextTourStop(dwellLib);
 		if (next !== undefined) {
@@ -473,14 +473,15 @@ $('lib-bar').style.setProperty(
 	'--lib-rows',
 	Math.ceil($('lib-bar').querySelectorAll('button[data-v]').length / 3),
 );
-// Subtitle projection: three labeled, color-coded segments — build (setup
-// wall), frame (visit's average compute), down (teardown wall) — an em
-// dash per still-unmeasured segment. Each segment is its own span so the
-// color carries the meaning; the title repeats it in full words.
-// data-avg-ms carries the unrounded average so a fresh snapshot is
-// observable even when the rounded text comes out identical.
+// Readout projection: three labeled, color-coded segments — mount (graph
+// setup wall), fps (the visit's average), unmount (teardown wall) — an em
+// dash per still-unmeasured segment. The name line carries a rank badge:
+// position by fps and percent slower than first place, recomputed over
+// every measured library whenever any stat lands.
+// data-avg-ms carries the unrounded fps so a fresh snapshot is observable
+// even when the rounded text comes out identical.
 const fmtDur = (ms) => (ms === undefined ? '—' : ms < 999.5 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`);
-const fmtFrameAvg = (ms) => (ms === undefined ? '—' : `${ms.toFixed(1)}ms`);
+const fmtFps = (v) => (v === undefined ? '—' : String(Math.round(v)));
 {
 	const lines = [...$('lib-bar').querySelectorAll('button[data-v] .lib-stats')].map((line) => {
 		const seg = (cls, label) => {
@@ -492,17 +493,30 @@ const fmtFrameAvg = (ms) => (ms === undefined ? '—' : `${ms.toFixed(1)}ms`);
 			line.append(el);
 			return value;
 		};
-		return { line, build: seg('build', 'build'), frame: seg('frame', 'frame'), down: seg('down', 'down') };
+		const rank = document.createElement('span');
+		rank.className = 'lib-rank';
+		line.parentElement.querySelector('.lib-name').append(rank);
+		return { line, rank, mount: seg('mount', 'mount'), fps: seg('fps', 'fps'), unmount: seg('unmount', 'unmount') };
 	});
 	effect(() => {
 		const stats = libStats();
-		for (const { line, build, frame, down } of lines) {
-			const s = stats.get(line.parentElement.dataset.v);
-			build.textContent = fmtDur(s?.setupMs);
-			frame.textContent = fmtFrameAvg(s?.frameAvgMs);
-			down.textContent = fmtDur(s?.teardownMs);
-			line.title = `build (graph setup) ${fmtDur(s?.setupMs)} · avg frame compute ${fmtFrameAvg(s?.frameAvgMs)} · teardown ${fmtDur(s?.teardownMs)}`;
-			if (s?.frameAvgMs !== undefined) line.dataset.avgMs = String(s.frameAvgMs);
+		const ranked = [...stats.entries()]
+			.filter(([, s]) => s.fps !== undefined)
+			.sort((a, b) => b[1].fps - a[1].fps);
+		const best = ranked[0]?.[1].fps;
+		const rankOf = new Map(ranked.map(([key, s], i) => [key, { place: i + 1, slower: (1 - s.fps / best) * 100 }]));
+		for (const { line, rank, mount, fps, unmount } of lines) {
+			const key = line.parentElement.dataset.v;
+			const s = stats.get(key);
+			mount.textContent = fmtDur(s?.setupMs);
+			fps.textContent = fmtFps(s?.fps);
+			unmount.textContent = fmtDur(s?.teardownMs);
+			const r = rankOf.get(key);
+			rank.textContent = r === undefined ? ''
+				: r.place === 1 ? '#1'
+				: `#${r.place} · ${Math.round(r.slower)}% slower`;
+			line.title = `mount (graph setup) ${fmtDur(s?.setupMs)} · avg fps ${fmtFps(s?.fps)} · unmount (teardown) ${fmtDur(s?.teardownMs)}${r ? ` · rank ${r.place} by fps` : ''}`;
+			if (s?.fps !== undefined) line.dataset.avgMs = String(s.fps);
 		}
 	});
 }
