@@ -18,7 +18,13 @@
 					a fast <a href="https://github.com/tc39/proposal-signals">signals</a>
 					reactivity library. A <em>signal</em> is a value that remembers
 					who read it: when it changes, everything computed from it — and
-					nothing else — updates. There is no subscription step and no
+					nothing else — updates. Many UI frameworks use signals as their
+					native reactive primitive:
+					<a href="https://docs.solidjs.com/concepts/signals">Solid</a>,
+					<a href="https://vuejs.org/guide/essentials/reactivity-fundamentals.html">Vue</a>,
+					<a href="https://svelte.dev/docs/svelte/$state">Svelte 5</a>,
+					<a href="https://guides.emberjs.com/release/in-depth-topics/autotracking-in-depth/">Ember</a>.
+					There is no subscription step and no
 					re-rendering pass; the dependency graph assembles itself while
 					code runs. dalien-signals stores that graph in a single
 					<code>Int32Array</code> memory arena, like a contiguous array of
@@ -119,9 +125,9 @@
 					changing values. It provides three main primitives:
 				</p>
 				<ul class="algo">
-					<li>A <code>signal</code> stores a value. Call it with no argument to read it, or with an argument to write it.</li>
-					<li>A <code>computed</code> derives and caches a value from signals or other computeds.</li>
-					<li>An <code>effect</code> runs a function now, then again when a value it read changes.</li>
+					<li>A <code>signal</code> stores a value. Call it with no argument to read it, or with an argument to write it — like <code>useState</code> in React.</li>
+					<li>A <code>computed</code> derives and caches a value from signals or other computeds — like <code>useMemo</code>, or a selector in Redux.</li>
+					<li>An <code>effect</code> runs a function now, then again when a value it read changes — like <code>useEffect</code>.</li>
 				</ul>
 				<p>
 					Dependencies are automatic. While a computed or effect runs,
@@ -131,21 +137,33 @@
 				</p>
 				<pre><code class="language-ts">import { computed, effect, signal } from "dalien-signals";
 
-const count   = signal(1);
+const count = signal(0);
+count(2); // set state
+
 const doubled = computed(() =&gt; count() * 2);
 const isEven  = computed(() =&gt; count() % 2 === 0);
+doubled(); // 4, cached until count changes
 
-effect(() =&gt; console.log(doubled(), isEven())); // 2 false
-count(2); // 4 true</code></pre>
+const stop = effect(() =&gt; {
+  const original = document.title;
+  document.title = `doubled = ${doubled()}`;
+  return () =&gt; {
+    document.title = original;
+  };
+});
+count(100); // the effect reruns: "doubled = 200"
+stop(); // stop the effect; cleanup restores the title</code></pre>
 				<div id="w-counter"></div>
 				<p>
-					When <code>count</code> changes, the effect is reached through
-					both computeds but queued only once — and it re-runs only when
-					one of them produces a <em>new</em> value. Stepping the widget
-					from 1 to 3: <code>doubled</code> changed, but
-					<code>even?</code> was <code>no</code> before and after, so
-					nothing downstream of it was disturbed. This is equality
-					cutoff, the same rule that stops the field's ripples.
+					When <code>count</code> changes, the effect is queued and pulls
+					<code>doubled</code> up to date; <code>isEven</code> recomputes
+					only the next time it is read. The widget's <em>effect runs</em>
+					cell counts an effect that reads both computeds: it is queued
+					once per change and re-runs only when one of them produces a
+					<em>new</em> value. Stepping from 1 to 3: <code>doubled</code>
+					changed, but <code>even?</code> was <code>no</code> before and
+					after — equality cutoff, the same rule that stops the field's
+					ripples.
 				</p>
 			</section>
 
