@@ -53,7 +53,10 @@ const alienFramework = {
 	},
 };
 
-const lib = process.argv[2] ?? 'dalien-signals';
+const lib = process.argv[2] ?? 'dalien-malloc-free';
+// Both dalien names run the native id tier here: smoke has no bridge
+// adapters, and the arena sizing applies to either.
+const isDalien = lib.startsWith('dalien');
 const [w, h] = (process.argv[3] ?? '1920x1080').split('x').map(Number);
 const frames = Number(process.argv[4] ?? 120);
 const count = w * h;
@@ -65,7 +68,7 @@ console.log(`${lib} @ ${w}x${h} (${count.toLocaleString()} pixels), ${frames} fr
 // 1080p tier — ~7 records per pixel with 4/3 headroom under the arena's
 // 3/4-full growth threshold, rounded up to a power of two.
 let capacity = 0;
-if (lib === 'dalien-signals') {
+if (isDalien) {
 	capacity = 1 << 24;
 	while (capacity < count * 11) capacity *= 2;
 	growCapacity(capacity);
@@ -76,7 +79,7 @@ if (lib === 'dalien-signals') {
 // As in makeView, everything the graph owns is created inside the
 // runtime's build scope so dispose() could reclaim it all; the phases are
 // timed individually inside the one build callback.
-const rt = makeRuntime(lib, lib === 'alien-signals' ? alienFramework : undefined);
+const rt = makeRuntime(isDalien ? 'dalien-malloc-free' : lib, lib === 'alien-signals' ? alienFramework : undefined);
 
 const data = new Uint8ClampedArray(count * 4);
 const vals = new Float32Array(count);
@@ -120,7 +123,7 @@ rt.build(() => {
 // the build: 3 in deep bands, 4 in wide), plus one node + one link per
 // render effect. Growth triggers at 3/4 of capacity; the build must stay
 // under that line or a frame mid-run pays for an arena migration.
-if (lib === 'dalien-signals') {
+if (isDalien) {
 	const records = graph.nodes + graph.edges + 2 * count;
 	const growthLine = (capacity * 3) / 4;
 	console.log(`records ${records.toLocaleString()} vs growth line ${growthLine.toLocaleString()} — ${records < growthLine ? 'no growth' : 'GROWTH WOULD TRIGGER'}`);

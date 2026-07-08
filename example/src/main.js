@@ -57,12 +57,11 @@ const TIER_RECORDS = {
 // zero pixels ever paint). The benchmark worker can still run the
 // adapter, whose suites do pull.
 //
-// dalien-malloc-free is the same dalien engine behind a function-tier
-// wrapper; the selector's dalien-signals entry already runs that engine
-// through its native id tier, which is the interface this demo is built
-// around. One entry per engine keeps the bar honest; the benchmark
-// worker still exercises both adapters.
-const UNSELECTABLE = new Set(['mol-wire', 'dalien-malloc-free']);
+// Two dalien entries compare its tiers on the same field: dalien-signals
+// is the callable tier through the same generic bridge every library
+// uses; dalien-malloc-free is the native integer-id tier with zero
+// adapter overhead (bare ids, module get/set, per-id dispose).
+const UNSELECTABLE = new Set(['mol-wire']);
 
 // ---- sticky selection -----------------------------------------------------------
 // The chosen library and tier survive a reload. Reads validate against
@@ -163,12 +162,6 @@ function resetAverages() {
 		heapAvg.record(bytes);
 	}
 }
-// The activity log's average lines keep a numeric reading through the
-// empty window right after a rebuild, so every line parses the same way.
-const liveAvgMs = () => {
-	const avg = frameAvg.average();
-	return Number.isFinite(avg) ? avg : 0;
-};
 
 // ---- library tour -----------------------------------------------------------------
 // The bar visits every selectable library on a ~5s dwell clock. A dwell
@@ -267,14 +260,12 @@ const bootSetupMs = performance.now() - bootSetupT0;
 // rendered wholesale — lines are appended only on rebuilds — while the
 // live average line is bound to its own element below the list, so its
 // per-frame updates touch one text node instead of re-rendering the list.
-// An entry is a string, or { text, error: true } for failure lines, which
-// render in red and carry the whole error.
-const LOG_LIMIT = 9; // frozen lines; the live line under them makes ~10 entries
-const logLines = signal([]);
-const runningLib = signal(libName()); // the library whose frames are running (≠ libName mid-rebuild)
-const logAppend = (...lines) => logLines(
-	[...logLines(), ...lines.map((line) => (typeof line === 'string' ? { text: line } : line))].slice(-LOG_LIMIT),
-);
+// Failures keep a visible home after the narration log's removal: the
+// last few errors render in red under the controls; the container hides
+// when there is nothing to report.
+const ERROR_LIMIT = 5;
+const errorLines = signal([]);
+const reportError = (text) => errorLines([...errorLines(), text].slice(-ERROR_LIMIT));
 
 
 const $ = (id) => document.getElementById(id);
@@ -401,23 +392,19 @@ if (performance.memory) {
 }
 bindText('note', note);
 
-// The frozen log lines rebuild as a whole — at most 9 short rows, on
-// rebuild-frequency events — while the live line updates every frame.
 effect(() => {
-	const list = $('activity-log');
+	const list = $('errors');
 	list.textContent = '';
-	for (const line of logLines()) {
+	list.style.display = errorLines().length === 0 ? 'none' : '';
+	for (const text of errorLines()) {
 		const div = document.createElement('div');
-		div.textContent = line.text;
-		if (line.error) div.className = 'err';
+		div.textContent = text;
 		list.append(div);
 	}
 });
-bindText('activity-live', () => `${runningLib()}: avg frame time ${liveAvgMs().toFixed(1)} ms`);
 if (bootError) {
-	logAppend({ text: `${sticky.lib} @ ${sticky.tier}: build failed on boot — ${String(bootError)}`, error: true });
+	reportError(`${sticky.lib} @ ${sticky.tier}: build failed on boot — ${String(bootError)}`);
 }
-logAppend(`${libName()}: graph setup ${bootSetupMs.toFixed(0)} ms`);
 recordLibStats(libName(), { setupMs: bootSetupMs });
 
 // state => persistence: one effect mirrors the selection into storage
@@ -517,9 +504,22 @@ const fmtFps = (v) => (v === undefined ? '—' : String(Math.round(v)));
 			.sort((a, b) => b[1].fps - a[1].fps);
 		const best = ranked[0]?.[1].fps;
 		const rankOf = new Map(ranked.map(([key, s], i) => [key, { place: i + 1, slower: (1 - s.fps / best) * 100 }]));
+		// Closeness to dalien-signals, as a subtle wash: parity or faster is
+		// a full-strength cyan; the tint cools and fades as fps falls away,
+		// vanishing past 60% off. Unmeasured cells stay untinted.
+		const mainFps = stats.get('dalien-signals')?.fps;
+		const tintFor = (fps) => {
+			if (mainFps === undefined || fps === undefined) return '';
+			const off = Math.max(0, 1 - fps / mainFps); // 0 = at parity or faster
+			const strength = Math.max(0, 1 - off / 0.6);
+			if (strength === 0) return '';
+			const alpha = (0.04 + 0.16 * strength).toFixed(3);
+			return `linear-gradient(135deg, rgba(127, 212, 255, ${alpha}), rgba(127, 212, 255, 0) 65%), #10131c`;
+		};
 		for (const { line, rank, mount, fps, unmount } of lines) {
 			const key = line.parentElement.dataset.v;
 			const s = stats.get(key);
+			line.parentElement.style.setProperty('--tint', tintFor(s?.fps));
 			mount.textContent = fmtDur(s?.setupMs);
 			fps.textContent = fmtFps(s?.fps);
 			unmount.textContent = fmtDur(s?.teardownMs);
@@ -579,21 +579,10 @@ effect(() => {
 	// the second, keeping the page honest about multi-second builds.
 	requestAnimationFrame(() => requestAnimationFrame(() => {
 		if (seq !== buildSeq) return; // superseded by a newer selection
-		// Narrate the swap in the activity log before it happens: freeze
-		// the outgoing live average at its final value and name the change.
-		// A retry after a failed build has no outgoing graph to speak of
-		// (builtName was cleared), so it swaps silently.
-		if (builtName !== undefined) {
-			logAppend(
-				`${builtName}: avg frame time ${liveAvgMs().toFixed(1)} ms`,
-				...(name !== builtName ? [`framework changed to ${name}`] : []),
-				...(tier !== builtTier ? [`graph size changed to ${tier}`] : []),
-			);
-			if (tier !== builtTier) {
-				// Visit stats are per-resolution: a 320p mount time or fps says
-				// nothing about 720p. New size, clean slate, fresh ranking.
-				libStats(new Map());
-			}
+		if (builtName !== undefined && tier !== builtTier) {
+			// Visit stats are per-resolution: a 320p mount time or fps says
+			// nothing about 720p. New size, clean slate, fresh ranking.
+			libStats(new Map());
 		}
 		// Free the outgoing graph before building the next one: its ids
 		// return to the arena, so the new build reuses those records
@@ -604,7 +593,6 @@ effect(() => {
 			// Teardown is only knowable on the way out — write it back onto
 			// the outgoing library's subtitle.
 			const teardownMs = performance.now() - teardownT0;
-			logAppend(`${builtName}: graph teardown ${teardownMs.toFixed(0)} ms`);
 			recordLibStats(builtName, { teardownMs });
 		}
 		let next;
@@ -614,7 +602,7 @@ effect(() => {
 		} catch (err) {
 			// The note stays concise; the log line carries the whole error.
 			note(`build failed for ${name} @ ${tier} — ${err?.message ?? err}`);
-			logAppend({ text: `${name} @ ${tier}: build failed — ${String(err)}`, error: true });
+			reportError(`${name} @ ${tier}: build failed — ${String(err)}`);
 			// A failure during the tour must not wedge the rotation: skip
 			// this library for the rest of the session and advance to the
 			// next stop immediately. The old graph is already freed, so the
@@ -651,7 +639,6 @@ effect(() => {
 			return;
 		}
 		const setupMs = performance.now() - setupT0;
-		logAppend(`${name}: graph setup ${setupMs.toFixed(0)} ms`);
 		recordLibStats(name, { setupMs });
 		builtName = name;
 		builtTier = tier;
@@ -667,7 +654,6 @@ function finishRebuild(name, tier) {
 	canvas.width = v.w;
 	canvas.height = v.h;
 	resetAverages();
-	runningLib(name); // the live log line starts averaging under the new name
 	building(false);
 	note(`${name} @ ${tier}: ${v.graph.nodes.toLocaleString()} nodes built in ${v.graph.buildMs.toFixed(1)} ms`);
 	startDwell(name); // this visit's ~5s clock starts once the graph is running

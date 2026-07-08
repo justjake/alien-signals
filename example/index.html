@@ -1,125 +1,153 @@
 <!doctype html>
 <html lang="en">
-	<head>
-		<meta charset="utf-8" />
-		<meta name="viewport" content="width=device-width, initial-scale=1" />
-		<link rel="icon" href="data:," />
-		<title>dalien-signals — an interactive introduction</title>
-		<link rel="stylesheet" href="/src/style.css" />
-	</head>
-	<body>
-		<main>
-			<header class="readme-intro">
-				<!-- readme:intro -->
-				<p class="lede">
-					Every demo below — including this page's own HUD and controls —
-					runs the production build.
-				</p>
-			</header>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" href="data:," />
+    <title>dalien-signals — an interactive introduction</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <main>
+      <header class="readme-intro">
+        <!-- readme:intro -->
+        <p>
+          <em>All UI on this page is vanilla JS with dalien-signals.</em>
+        </p>
+      </header>
 
-			<section>
-				<h2>Demo: one node per pixel</h2>
-				<p>
-					Every pixel is a node in one dependency graph: a
-					<code>signal</code> or <code>computed</code> for its value,
-					plus its own render <code>effect</code>, so the library's
-					scheduler — not a rendering pass — decides exactly which
-					pixels repaint. The field alternates 64-row bands of two
-					shapes that stress opposite ends of a signals implementation.
-					Drag to write (right button writes darkness); the library and
-					size bars rebuild the same graph on each implementation, up to
-					a 4k frame's 8.3 million pixels.
-				</p>
-				<ul class="algo">
-					<li><b>deep bands</b> (blue→cyan): each pixel reads one parent in the row above — a source write re-validates a chain one pixel wide, 64 levels deep.</li>
-					<li><b>wide bands</b> (violet→amber): every ~32nd source pixel is a hub read by thousands of cells — one hub write is a broad wave, one level deep.</li>
-					<li><b>equality cutoff</b>: propagation stops wherever a cell recomputes to the value it already held, so fading ripples end early.</li>
-				</ul>
-				<div id="stage">
-					<canvas id="grid"></canvas>
-					<div id="stage-footer">
-						<span class="libpick" id="tier-bar" role="group" aria-label="graph size">
-							<button data-v="320p">320p</button>
-							<button data-v="480p">480p</button>
-							<button data-v="720p">720p</button>
-							<button data-v="1080p">1080p</button>
-							<button data-v="4k">4k</button>
-						</span>
-						<span class="libpick" id="mode-bar" role="group" aria-label="mode">
-							<button data-v="off">off</button>
-							<button data-v="wave">wave</button>
-							<button data-v="storm">storm</button>
-						</span>
-					</div>
-				</div>
-				<section id="hud">
-					<!-- Per-frame and per-sample stats show "<current> / avg <average>"
+      <section>
+        <h2>Stress test: one signal per pixel</h2>
+        <p>
+          Every pixel is a <code>signal</code> or <code>computed</code>, plus an
+          <code>effect</code> to paint it. The canvas alternates 64-row bands of
+          two shapes of dependency that stress opposite ends of a signals
+          implementation.
+        </p>
+        <ul class="algo">
+          <li>
+            <b>deep bands</b> (blue→cyan): each pixel reads one parent in the
+            row above — a source write re-validates a chain one pixel wide, 64
+            levels deep.
+          </li>
+          <li>
+            <b>wide bands</b> (violet→amber): every ~32nd source pixel is a hub
+            read by thousands of cells — one hub write is a broad wave, one
+            level deep.
+          </li>
+        </ul>
+        <div id="stage">
+          <canvas id="grid"></canvas>
+          <div id="stage-footer">
+            <span
+              class="libpick"
+              id="tier-bar"
+              role="group"
+              aria-label="graph size"
+            >
+              <button data-v="320p">320p</button>
+              <button data-v="480p">480p</button>
+              <button data-v="720p">720p</button>
+              <button data-v="1080p">1080p</button>
+              <button data-v="4k">4k ☠️</button>
+            </span>
+            <span class="libpick" id="mode-bar" role="group" aria-label="mode">
+              <button data-v="off">off</button>
+              <button data-v="wave">wave</button>
+              <button data-v="storm">storm</button>
+            </span>
+          </div>
+        </div>
+        <section id="hud">
+          <!-- Per-frame and per-sample stats show "<current> / avg <average>"
 					     in one tile: the .now and .avg nodes are bound separately in
 					     main.js. Per-graph constants (nodes, edges, arena) have no
 					     average and keep a single text node. -->
-					<div class="stat"><span id="stat-nodes">–</span><label>nodes in graph</label></div>
-					<div class="stat"><span id="stat-edges">–</span><label>dependency edges</label></div>
-					<div class="stat"><span id="stat-recomputed"><span class="now">–</span><span class="avg"></span></span><label>recomputed this frame</label></div>
-					<div class="stat"><span id="stat-share"><span class="now">–</span><span class="avg"></span></span><label>of the graph</label></div>
-					<div class="stat"><span id="stat-frame"><span class="now">–</span><span class="avg"></span></span><label>frame compute</label></div>
-					<div class="stat"><span id="stat-fps"><span class="now">–</span><span class="avg"></span></span><label>fps</label></div>
-					<div class="stat"><span id="stat-arena">–</span><label>arena size (dalien)</label></div>
-					<div class="stat"><span id="stat-heap"><span class="now">–</span><span class="avg"></span></span><label>js heap</label></div>
-				</section>
-				<section id="controls">
-					<!-- Library buttons are generated by main.js from the frameworks
+          <div class="stat">
+            <span id="stat-nodes">–</span><label>nodes in graph</label>
+          </div>
+          <div class="stat">
+            <span id="stat-edges">–</span><label>dependency edges</label>
+          </div>
+          <div class="stat">
+            <span id="stat-recomputed"
+              ><span class="now">–</span><span class="avg"></span></span
+            ><label>recomputed this frame</label>
+          </div>
+          <div class="stat">
+            <span id="stat-share"
+              ><span class="now">–</span><span class="avg"></span></span
+            ><label>of the graph</label>
+          </div>
+          <div class="stat">
+            <span id="stat-frame"
+              ><span class="now">–</span><span class="avg"></span></span
+            ><label>frame compute</label>
+          </div>
+          <div class="stat">
+            <span id="stat-fps"
+              ><span class="now">–</span><span class="avg"></span></span
+            ><label>fps</label>
+          </div>
+          <div class="stat">
+            <span id="stat-arena">–</span><label>arena size (dalien)</label>
+          </div>
+          <div class="stat">
+            <span id="stat-heap"
+              ><span class="now">–</span><span class="avg"></span></span
+            ><label>js heap</label>
+          </div>
+        </section>
+        <section id="controls">
+          <!-- Library buttons are generated by main.js from the frameworks
 					     map; the leading toggle plays/pauses the ~5s library tour
 					     (glyph and title are signal-driven). -->
-					<span class="libpick" id="lib-bar" role="group" aria-label="library">
-						<button id="btn-tour" type="button"></button>
-					</span>
-					<span id="note"></span>
-				</section>
-				<section id="activity" aria-label="activity log">
-					<div id="activity-log"></div>
-					<div id="activity-live"></div>
-				</section>
-				<p>
-					<em>Frame compute</em> times each frame's write batch — mark
-					the cones of dependents, recompute them, run the queued render
-					effects. An adaptive controller sizes the batch to recompute
-					~10% of the graph each frame, so the load scales with the
-					graph; at the big sizes that is more work than a 60fps frame
-					allows, and the frame-time stats report the real cost. The
-					activity log above narrates runs and rebuilds.
-				</p>
-				<ul class="algo">
-					<li><b>write sizing</b>: damped estimates of each band family's cone (recomputes per write) split the budget between deep columns and hub pulses.</li>
-					<li><b>library tour</b>: the bar visits each library for ~5 s and writes its setup · average frame · teardown times under its name; clicking a library (or ⏸) pauses the rotation, ⏵ resumes it.</li>
-					<li><b>log lines</b>: live average frame compute, then teardown and setup (build + settle + effect creation) times on every switch; failures land in red.</li>
-					<li><b>memory</b>: arena size is dalien's whole graph at 32 bytes a record; other libraries build heap objects, visible in js heap instead.</li>
-				</ul>
-				<p>
-					Every cell rounds its output to a coarse step, so fading
-					ripples recompute to the value they already held and
-					propagation stops there — the equality cutoff at work across
-					the whole field.
-				</p>
-			</section>
+          <span class="libpick" id="lib-bar" role="group" aria-label="library">
+            <button id="btn-tour" type="button"></button>
+          </span>
+          <span id="note"></span>
+        </section>
+        <section id="errors" aria-label="errors" style="display: none"></section>
+        <p>
+          <em>Frame compute</em> times each frame's write batch — mark the cones
+          of dependents, recompute them, run the queued render effects. An
+          adaptive controller sizes the batch to recompute ~10% of the graph
+          each frame, so the load scales with the graph.
+        </p>
+        <p>
+          Every cell rounds its output to a coarse step, so fading ripples
+          recompute to the value they already held and propagation stops there —
+          the equality cutoff at work across the whole field.
+        </p>
+      </section>
 
-			<section>
-				<h2>The three primitives</h2>
-				<p>
-					dalien-signals keeps calculations and callbacks in sync with
-					changing values. It provides three main primitives:
-				</p>
-				<ul class="algo">
-					<li>A <code>signal</code> stores a value. Call it with no argument to read it, or with an argument to write it — like <code>useState</code> in React.</li>
-					<li>A <code>computed</code> derives and caches a value from signals or other computeds — like <code>useMemo</code>, or a selector in Redux.</li>
-					<li>An <code>effect</code> runs a function now, then again when a value it read changes — like <code>useEffect</code>.</li>
-				</ul>
-				<p>
-					Dependencies are automatic. While a computed or effect runs,
-					the library records every signal and computed it reads —
-					reading inside a computed or effect <em>is</em> the
-					subscription.
-				</p>
-				<pre><code class="language-ts">import { computed, effect, signal } from "dalien-signals";
+      <section>
+        <h2>The three primitives</h2>
+        <p>
+          dalien-signals keeps calculations and callbacks in sync with changing
+          values. It provides three main primitives:
+        </p>
+        <ul class="algo">
+          <li>
+            A <code>signal</code> stores a value. Call it with no argument to
+            read it, or with an argument to write it — like
+            <code>useState</code> in React.
+          </li>
+          <li>
+            A <code>computed</code> derives and caches a value from signals or
+            other computeds — like <code>useMemo</code>, or a selector in Redux.
+          </li>
+          <li>
+            An <code>effect</code> runs a function now, then again when a value
+            it read changes — like <code>useEffect</code>.
+          </li>
+        </ul>
+        <p>
+          Dependencies are automatic. While a computed or effect runs, the
+          library records every signal and computed it reads — reading inside a
+          computed or effect <em>is</em> the subscription.
+        </p>
+        <pre><code class="language-ts">import { computed, effect, signal } from "dalien-signals";
 
 const count = signal(0);
 count(2); // set state
@@ -137,147 +165,174 @@ const stop = effect(() =&gt; {
 });
 count(100); // the effect reruns: "doubled = 200"
 stop(); // stop the effect; cleanup restores the title</code></pre>
-				<div id="w-counter"></div>
-				<p>
-					When <code>count</code> changes, the effect is queued and pulls
-					<code>doubled</code> up to date; <code>isEven</code> recomputes
-					only the next time it is read. The widget's <em>effect runs</em>
-					cell counts an effect that reads both computeds: it is queued
-					once per change and re-runs only when one of them produces a
-					<em>new</em> value. Stepping from 1 to 3: <code>doubled</code>
-					changed, but <code>even?</code> was <code>no</code> before and
-					after — equality cutoff, the same rule that stops the field's
-					ripples.
-				</p>
-			</section>
+        <div id="w-counter"></div>
+        <p>
+          When <code>count</code> changes, the effect is queued and pulls
+          <code>doubled</code> up to date; <code>isEven</code> recomputes only
+          the next time it is read. The widget's <em>effect runs</em>
+          cell counts an effect that reads both computeds: it is queued once per
+          change and re-runs only when one of them produces a
+          <em>new</em> value. Stepping from 1 to 3:
+          <code>doubled</code> changed, but <code>even?</code> was
+          <code>no</code> before and after — equality cutoff, the same rule that
+          stops the field's ripples.
+        </p>
+      </section>
 
-			<section>
-				<h2>How a write becomes an update</h2>
-				<p>
-					Recalculating every downstream node on each write would waste
-					work. Recalculating dependents immediately could also run an
-					effect more than once, or before all of its inputs are current.
-					dalien-signals instead uses a <em>push-pull</em> algorithm: a
-					write does not recompute anything by itself; it records what may
-					have changed, cheaply, and the work happens later, on demand.
-				</p>
-				<ol class="algo">
-					<li>
-						<b>Push staleness.</b> Writing a signal marks it
-						<code>Dirty</code> and walks its subscriber lists, marking each
-						downstream computed and effect <code>Pending</code> — "something
-						under you may have changed." No user callback runs during this
-						graph walk; it's a few integer writes per node.
-					</li>
-					<li>
-						<b>Queue effects.</b> Any effect the walk reaches goes into a
-						queue, once, no matter how many paths led to it.
-					</li>
-					<li>
-						<b>Pull and verify.</b> Before a computed returns its value, it
-						checks its dependencies and recalculates if necessary. A queued
-						effect reruns and pulls each computed it reads up to date. A
-						<code>Pending</code> chain resolves top-down; if a node's inputs
-						all came out equal, its value has not changed, and the update
-						stops along that path.
-					</li>
-					<li>
-						<b>Stamp the verdict.</b> Every committed write increments one
-						global version counter. When a computed finishes verifying, it
-						stores that version; a later read compares the two numbers, and
-						if they match, the value is provably current — the read returns
-						in a couple of loads without walking anything.
-					</li>
-				</ol>
-				<p>
-					Below, two signals feed a subtotal, a total, and one effect; each
-					button narrates the operation it performs. A batch coalesces two
-					writes into one effect run; an unchanged write produces no work;
-					disposing the effect makes the computeds drop their own edges —
-					an unwatched computed keeps no bookkeeping.
-				</p>
-				<div id="w-stepper"></div>
-			</section>
+      <section>
+        <h2>How a write becomes an update</h2>
+        <p>
+          Recalculating every downstream node on each write would waste work.
+          Recalculating dependents immediately could also run an effect more
+          than once, or before all of its inputs are current. dalien-signals
+          instead uses a <em>push-pull</em> algorithm: a write does not
+          recompute anything by itself; it records what may have changed,
+          cheaply, and the work happens later, on demand.
+        </p>
+        <ol class="algo">
+          <li>
+            <b>Push staleness.</b> Writing a signal marks it
+            <code>Dirty</code> and walks its subscriber lists, marking each
+            downstream computed and effect <code>Pending</code> — "something
+            under you may have changed." No user callback runs during this graph
+            walk; it's a few integer writes per node.
+          </li>
+          <li>
+            <b>Queue effects.</b> Any effect the walk reaches goes into a queue,
+            once, no matter how many paths led to it.
+          </li>
+          <li>
+            <b>Pull and verify.</b> Before a computed returns its value, it
+            checks its dependencies and recalculates if necessary. A queued
+            effect reruns and pulls each computed it reads up to date. A
+            <code>Pending</code> chain resolves top-down; if a node's inputs all
+            came out equal, its value has not changed, and the update stops
+            along that path.
+          </li>
+          <li>
+            <b>Stamp the verdict.</b> Every committed write increments one
+            global version counter. When a computed finishes verifying, it
+            stores that version; a later read compares the two numbers, and if
+            they match, the value is provably current — the read returns in a
+            couple of loads without walking anything.
+          </li>
+        </ol>
+        <p>
+          Below, two signals feed a subtotal, a total, and one effect; each
+          button narrates the operation it performs. A batch coalesces two
+          writes into one effect run; an unchanged write produces no work;
+          disposing the effect makes the computeds drop their own edges — an
+          unwatched computed keeps no bookkeeping.
+        </p>
+        <div id="w-stepper"></div>
+      </section>
 
-			<section>
-				<h2>Memory layout: eight integers per node</h2>
-				<p>
-					Signal libraries typically allocate an object per node, wired
-					with references the garbage collector traces on every
-					collection. dalien-signals stores the whole graph in one
-					<code>Int32Array</code> — an arena of 32-byte records, eight
-					<code>int32</code> slots each. A node is the index where its
-					record starts:
-				</p>
-				<dl class="slots">
-					<div><dt>0 · Flags</dt><dd>kind tag + state bits: Mutable, Watching, Dirty, Pending, …</dd></div>
-					<div><dt>1 · Deps</dt><dd>head of the dependency list — points at a link record</dd></div>
-					<div><dt>2 · DepsTail</dt><dd>the re-track cursor into that list</dd></div>
-					<div><dt>3 · Subs</dt><dd>head of the subscriber list — also a link record</dd></div>
-					<div><dt>4 · SubsTail</dt><dd>tail of the subscriber list</dd></div>
-					<div><dt>5 · Gen</dt><dd>generation counter, so stale ids of freed records miss</dd></div>
-					<div><dt>6+7 · Version</dt><dd>one float64 (via a shared-buffer view): "verified as of global version N"</dd></div>
-				</dl>
-				<p>
-					Edges are records in the same array: a <em>link</em> record names
-					a dependency, a subscriber, and the four neighbors threading it
-					into both lists. Walking a list means following integers from
-					slot to slot — nothing for the collector to trace, and adjacent
-					records share cache lines. A free list chains unused records
-					together, so disposed nodes and edges are recycled in place;
-					values, getters, and callbacks live in ordinary side arrays
-					indexed by the same id. The memory tables on this page are
-					that array decoded row by row; amber cells changed on the last
-					action.
-				</p>
-				<p>
-					The default arena reserves 64 MB of address space — 2,097,152
-					records of 32 bytes. Large zero-filled buffers are demand-paged:
-					allocation reserves virtual address space, but resident physical
-					memory grows only as pages are touched. <code>growCapacity()</code>
-					raises the reservation for bigger graphs — the size bar above
-					calls it before building each field — and the arena also grows
-					itself when it fills.
-				</p>
-			</section>
+      <section>
+        <h2>Memory layout: eight integers per node</h2>
+        <p>
+          Signal libraries typically allocate an object per node, wired with
+          references the garbage collector traces on every collection.
+          dalien-signals stores the whole graph in one
+          <code>Int32Array</code> — an arena of 32-byte records, eight
+          <code>int32</code> slots each. A node is the index where its record
+          starts:
+        </p>
+        <dl class="slots">
+          <div>
+            <dt>0 · Flags</dt>
+            <dd>kind tag + state bits: Mutable, Watching, Dirty, Pending, …</dd>
+          </div>
+          <div>
+            <dt>1 · Deps</dt>
+            <dd>head of the dependency list — points at a link record</dd>
+          </div>
+          <div>
+            <dt>2 · DepsTail</dt>
+            <dd>the re-track cursor into that list</dd>
+          </div>
+          <div>
+            <dt>3 · Subs</dt>
+            <dd>head of the subscriber list — also a link record</dd>
+          </div>
+          <div>
+            <dt>4 · SubsTail</dt>
+            <dd>tail of the subscriber list</dd>
+          </div>
+          <div>
+            <dt>5 · Gen</dt>
+            <dd>generation counter, so stale ids of freed records miss</dd>
+          </div>
+          <div>
+            <dt>6+7 · Version</dt>
+            <dd>
+              one float64 (via a shared-buffer view): "verified as of global
+              version N"
+            </dd>
+          </div>
+        </dl>
+        <p>
+          Edges are records in the same array: a <em>link</em> record names a
+          dependency, a subscriber, and the four neighbors threading it into
+          both lists. Walking a list means following integers from slot to slot
+          — nothing for the collector to trace, and adjacent records share cache
+          lines. A free list chains unused records together, so disposed nodes
+          and edges are recycled in place; values, getters, and callbacks live
+          in ordinary side arrays indexed by the same id. The memory tables on
+          this page are that array decoded row by row; amber cells changed on
+          the last action.
+        </p>
+        <p>
+          The default arena reserves 64 MB of address space — 2,097,152 records
+          of 32 bytes. Large zero-filled buffers are demand-paged: allocation
+          reserves virtual address space, but resident physical memory grows
+          only as pages are touched. <code>growCapacity()</code>
+          raises the reservation for bigger graphs — the size bar above calls it
+          before building each field — and the arena also grows itself when it
+          fills.
+        </p>
+      </section>
 
-			<section>
-				<h2>Example: Spreadsheet</h2>
-				<p>
-					Each cell is a signal (the typed text) plus a computed (its
-					value). Formulas start with <code>=</code> and are plain
-					JavaScript; <code>GET('A:1')</code> reads another cell. The
-					formula runs inside the cell's computed, so every
-					<code>GET</code> records a real dependency edge — edit a formula
-					and the memory view shows link records appearing and aging out.
-				</p>
-				<div id="w-sheet"></div>
-			</section>
+      <section>
+        <h2>Example: Spreadsheet</h2>
+        <p>
+          Each cell is a signal (the typed text) plus a computed (its value).
+          Formulas start with <code>=</code> and are plain JavaScript;
+          <code>GET('A:1')</code> reads another cell. The formula runs inside
+          the cell's computed, so every <code>GET</code> records a real
+          dependency edge — edit a formula and the memory view shows link
+          records appearing and aging out.
+        </p>
+        <div id="w-sheet"></div>
+      </section>
 
-			<section>
-				<h2>Benchmarks, in this tab</h2>
-				<p>
-					The milomg js-reactivity-benchmark suites — sbench, kairo,
-					cellx, dynamic — run against four of the selector's
-					libraries — dalien, alien, preact, and reactively — using
-					the benchmark's own adapters. Each (suite, library) cell
-					runs in a fresh Worker, so no library inherits JIT state, arena
-					contents, or main-thread contention. One round each — expect a
-					few minutes; published numbers come from CI (interleaved
-					rounds, isolated processes, medians).
-				</p>
-				<div id="w-bench"></div>
-			</section>
+      <section>
+        <h2>Benchmarks, in this tab</h2>
+        <p>
+          The milomg js-reactivity-benchmark suites — sbench, kairo, cellx,
+          dynamic — run against four of the selector's libraries — dalien,
+          alien, preact, and reactively — using the benchmark's own adapters.
+          Each (suite, library) cell runs in a fresh Worker, so no library
+          inherits JIT state, arena contents, or main-thread contention. One
+          round each — expect a few minutes; published numbers come from CI
+          (interleaved rounds, isolated processes, medians).
+        </p>
+        <div id="w-bench"></div>
+      </section>
 
-			<footer>
-				<p>
-					<a href="https://github.com/justjake/dalien-signals">Source and README</a> ·
-					<a href="https://github.com/justjake/dalien-signals/blob/dalien-signals/BENCHMARKS.md">benchmark methodology</a>.
-					The page's own HUD, controls, and widgets are driven by signals
-					and effects.
-				</p>
-			</footer>
-		</main>
-		<script type="module" src="/src/main.js"></script>
-	</body>
+      <footer>
+        <p>
+          <a href="https://github.com/justjake/dalien-signals"
+            >Source and README</a
+          >
+          ·
+          <a
+            href="https://github.com/justjake/dalien-signals/blob/dalien-signals/BENCHMARKS.md"
+            >benchmark methodology</a
+          >. The page's own HUD, controls, and widgets are driven by signals and
+          effects.
+        </p>
+      </footer>
+    </main>
+    <script type="module" src="/src/main.js"></script>
+  </body>
 </html>

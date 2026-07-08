@@ -93,13 +93,6 @@ async function startPreview() {
 const noteText = (page) => page.evaluate(() => document.getElementById('note').textContent);
 const statText = (page, id) => page.evaluate((statId) => document.getElementById(statId).textContent, id);
 
-// The activity log: frozen history lines plus the always-updating live
-// average line under them.
-const readActivity = (page) => page.evaluate(() => ({
-	lines: [...document.querySelectorAll('#activity-log div')].map((div) => div.textContent),
-	live: document.getElementById('activity-live').textContent,
-}));
-
 // Each bar dumped as its buttons' data-v values, the active one marked `value*`.
 function readBars(page) {
 	return page.evaluate((barIds) => barIds.map((id) => {
@@ -279,16 +272,6 @@ async function run(page, url) {
 		}
 	});
 
-	await check('activity log: boot setup line and live average', async () => {
-		const log = await readActivity(page);
-		const setup = log.lines.find((line) => /^dalien-signals: graph setup \d+ ms$/.test(line));
-		if (!setup) die(`no boot setup line; log is [${log.lines.join(' | ')}]`);
-		if (!/^dalien-signals: avg frame time \d+(\.\d+)? ms$/.test(log.live)) {
-			die(`live line is "${log.live}", want a dalien-signals average`);
-		}
-		return `${setup}; live "${log.live}"`;
-	});
-
 	await check('mode radio: single clicks', async () => {
 		await clickButton(page, 'mode-bar', 'storm');
 		await assertBars(page, { 'lib-bar': 'dalien-signals', 'tier-bar': '720p', 'mode-bar': 'storm' });
@@ -415,34 +398,6 @@ async function run(page, url) {
 			await sleep(POLL_MS);
 		}
 		return `checksum ${before.checksum} -> ${after.checksum}, ${recomputed} recomputed last frame`;
-	});
-
-	await check('activity log narrates the framework switch', async () => {
-		const log = await readActivity(page);
-		// The tour-pausing click on alien-signals (arriving from the tour's
-		// @preact/signals-core stop) was the last rebuild, so its narration
-		// is the log's tail: frozen average, change line, teardown, setup.
-		const tail = log.lines.slice(-4);
-		const want = [
-			/^@preact\/signals-core: avg frame time \d+(\.\d+)? ms$/,
-			/^framework changed to alien-signals$/,
-			/^@preact\/signals-core: graph teardown (\d+) ms$/,
-			/^alien-signals: graph setup (\d+) ms$/,
-		];
-		for (let k = 0; k < want.length; k++) {
-			if (!want[k].test(tail[k] ?? '')) {
-				die(`log tail line ${k} is "${tail[k]}", want ${want[k]} — log is [${log.lines.join(' | ')}]`);
-			}
-		}
-		const setupMs = digits(tail[3].match(want[3])[1]);
-		if (setupMs < 1 || setupMs > BUILD_TIMEOUT_MS) die(`setup time ${setupMs} ms is not plausible`);
-		const liveMatch = log.live.match(/^alien-signals: avg frame time (\d+(\.\d+)?) ms$/);
-		if (!liveMatch) die(`live line is "${log.live}", want an alien-signals average`);
-		if (!(Number(liveMatch[1]) > 0)) die(`live average is ${liveMatch[1]} ms after 500 ms of animation`);
-		// Many rebuilds have happened by now; the history must be capped at
-		// its limit, with the live line making ~10 visible entries.
-		if (log.lines.length !== 9) die(`log holds ${log.lines.length} frozen lines, want the 9-line cap`);
-		return `${tail.join(' | ')}; live "${log.live}"`;
 	});
 
 	await check('sticky selection survives reload; tour boots playing', async () => {

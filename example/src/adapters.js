@@ -6,11 +6,13 @@
 //   build(fn)            dispose()
 //
 // makeRuntime(lib, framework) has exactly two paths:
-//   - 'dalien-signals' runs on dalien's native integer-id tier. The field
-//     allocates one node per pixel, so per-cell wrapper objects and GC
-//     registration dominate build time and memory at scale; the id tier
-//     has neither, and per-id dispose() is an API the generic framework
-//     interface cannot express.
+//   - 'dalien-malloc-free' runs on dalien's native integer-id tier, with
+//     zero adapter overhead: cells are bare ids, reads and writes are the
+//     module's own get/set, and per-id dispose() is an API the generic
+//     framework interface cannot express. 'dalien-signals' takes the
+//     generic bridge like every other library (callable tier through the
+//     benchmark adapter), so the two bar entries compare the tiers
+//     honestly on the same field.
 //   - every other library goes through one generic bridge over a
 //     benchmark-adapter object (the milomg fork's ReactiveFramework shape:
 //     static methods createSignal/readSignal/writeSignal/createComputed/
@@ -23,7 +25,7 @@
 import * as dalien from 'dalien-signals';
 
 export function makeRuntime(lib, framework) {
-	if (lib === 'dalien-signals') {
+	if (lib === 'dalien-malloc-free') {
 		// Ids have explicit lifetimes: track every allocation and free each
 		// one in dispose(). No build scope is needed — per-id dispose is
 		// already total — so build(fn) just runs fn.
