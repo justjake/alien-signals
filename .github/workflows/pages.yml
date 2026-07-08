@@ -22,7 +22,7 @@ env:
   # Pinned fork of the milomg harness (suites, adapters, lockfile all
   # committed there); bump FORK_SHA deliberately when the fork moves.
   FORK_REPO: https://github.com/justjake/js-reactivity-benchmark
-  FORK_SHA: 49dae07763f4277966462fef9e482ba3c1980d66
+  FORK_SHA: 8c423dd12676fcba5776e79f7bf0431f42dfaf05
   # The fork's core links ../upstream-alien-signals (the comparator build).
   ALIEN_REPO: https://github.com/stackblitz/alien-signals
   ALIEN_SHA: c00e63969bf261fc5dce31fae70cb9a90912b06e
@@ -38,20 +38,26 @@ jobs:
         with:
           node-version: 24
       - run: npm install -g pnpm
-      - name: Stub cosignal packages (private to the parent repo)
+      - name: Stub the cosignal family packages (private to the parent repo)
         run: |
-          mkdir -p packages/cosignal/src
-          cat > packages/cosignal/package.json <<'EOF'
+          # One stub per private package the fork's adapters import: cosignals
+          # (the parent renamed cosignal -> cosignals) plus the two alt
+          # variants. Each stub satisfies module resolution at build time and
+          # throws on use, so selecting one on the public site fails into the
+          # example's red error strip and the tour advances past it.
+          for pkg in cosignals cosignals-alt-a cosignals-alt-b; do
+            mkdir -p "packages/$pkg/src"
+            cat > "packages/$pkg/package.json" <<EOF
           {
-            "name": "cosignal",
+            "name": "$pkg",
             "version": "0.0.0-stub",
             "type": "module",
-            "exports": { ".": "./src/stub.ts", "./logged": "./src/stub.ts" }
+            "exports": { ".": "./src/stub.ts" }
           }
           EOF
-          cat > packages/cosignal/src/stub.ts <<'EOF'
+            cat > "packages/$pkg/src/stub.ts" <<EOF
           const die = (): never => {
-            throw new Error("cosignal is private to the parent repo and not available on the public site");
+            throw new Error("$pkg is private to the parent repo and not available on the public site");
           };
           export class Atom { constructor(_v?: unknown) { die(); } get state(): never { return die(); } set(_v: unknown): never { return die(); } }
           export class Computed { constructor(_fn?: unknown) { die(); } get state(): never { return die(); } }
@@ -60,8 +66,11 @@ jobs:
           export const startBatch = die;
           export const endBatch = die;
           export const untracked = die;
-          export const registerReactBridge = (): void => {};
+          // Called at adapter module load (cosignals-alt-b pre-sizes its
+          // engine on import), so it must be callable without building.
+          export const __resetEngineForTests = (_options?: unknown): void => {};
           EOF
+          done
       - name: Clone pinned harness fork (suites + adapters for the example)
         run: |
           git clone --no-checkout "$FORK_REPO" milomg-reactivity-benchmark

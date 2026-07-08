@@ -10,6 +10,8 @@ import { alienFramework } from '../../../../milomg-reactivity-benchmark/packages
 import { angularFramework } from '../../../../milomg-reactivity-benchmark/packages/core/src/frameworks/angularSignals2.ts';
 import { anodFramework } from '../../../../milomg-reactivity-benchmark/packages/core/src/frameworks/anod.ts';
 import { cosignalFramework } from '../../../../milomg-reactivity-benchmark/packages/core/src/frameworks/cosignal.ts';
+import { cosignalAltAFramework } from '../../../../milomg-reactivity-benchmark/packages/core/src/frameworks/cosignalAltA.ts';
+import { cosignalAltBFramework } from '../../../../milomg-reactivity-benchmark/packages/core/src/frameworks/cosignalAltB.ts';
 import { dalienMallocFreeFramework } from '../../../../milomg-reactivity-benchmark/packages/core/src/frameworks/dalienMallocFree.ts';
 import { dalienFramework } from '../../../../milomg-reactivity-benchmark/packages/core/src/frameworks/dalienSignals.ts';
 import { molWireFramework } from '../../../../milomg-reactivity-benchmark/packages/core/src/frameworks/molWire.ts';
@@ -41,6 +43,12 @@ export const FRAMEWORKS = {
 	'angular-signals': angularFramework,
 	'anod': anodFramework,
 	'cosignal': cosignalFramework,
+	// The cosignal alt variants live in the same private parent repo as
+	// cosignal: real engines locally, throwing stubs on the public site,
+	// where selecting them fails into the red error strip and the tour
+	// advances past them.
+	'cosignal-alt-a': cosignalAltAFramework,
+	'cosignal-alt-b': cosignalAltBFramework,
 	'mol-wire': molWireFramework,
 	'pota': potaFramework,
 	'solid': solidFramework,
