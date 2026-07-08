@@ -589,6 +589,11 @@ effect(() => {
 				...(name !== builtName ? [`framework changed to ${name}`] : []),
 				...(tier !== builtTier ? [`graph size changed to ${tier}`] : []),
 			);
+			if (tier !== builtTier) {
+				// Visit stats are per-resolution: a 320p mount time or fps says
+				// nothing about 720p. New size, clean slate, fresh ranking.
+				libStats(new Map());
+			}
 		}
 		// Free the outgoing graph before building the next one: its ids
 		// return to the arena, so the new build reuses those records
