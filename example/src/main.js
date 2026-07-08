@@ -504,17 +504,22 @@ const fmtFps = (v) => (v === undefined ? '—' : String(Math.round(v)));
 			.sort((a, b) => b[1].fps - a[1].fps);
 		const best = ranked[0]?.[1].fps;
 		const rankOf = new Map(ranked.map(([key, s], i) => [key, { place: i + 1, slower: (1 - s.fps / best) * 100 }]));
-		// Closeness to dalien-signals, as a subtle wash: parity or faster is
-		// a full-strength cyan; the tint cools and fades as fps falls away,
-		// vanishing past 60% off. Unmeasured cells stay untinted.
+		// Speed vs dalien-signals, as a subtle wash: parity or faster is
+		// cyan, and the hue slides toward orange as fps falls away —
+		// saturating at 60% off, where a cell is unmistakably orange.
+		// Opacity leans slightly toward the fast end so parity pops.
+		// Unmeasured cells stay untinted.
 		const mainFps = stats.get('dalien-signals')?.fps;
+		const CYAN = [127, 212, 255];
+		const ORANGE = [255, 146, 60];
 		const tintFor = (fps) => {
 			if (mainFps === undefined || fps === undefined) return '';
 			const off = Math.max(0, 1 - fps / mainFps); // 0 = at parity or faster
-			const strength = Math.max(0, 1 - off / 0.6);
-			if (strength === 0) return '';
-			const alpha = (0.04 + 0.16 * strength).toFixed(3);
-			return `linear-gradient(135deg, rgba(127, 212, 255, ${alpha}), rgba(127, 212, 255, 0) 65%), #10131c`;
+			const t = Math.min(1, off / 0.6);
+			const mix = CYAN.map((c, i) => Math.round(c + (ORANGE[i] - c) * t));
+			const alpha = (0.2 - 0.06 * t).toFixed(3);
+			const rgb = mix.join(', ');
+			return `linear-gradient(135deg, rgba(${rgb}, ${alpha}), rgba(${rgb}, 0) 65%), #10131c`;
 		};
 		for (const { line, rank, mount, fps, unmount } of lines) {
 			const key = line.parentElement.dataset.v;
