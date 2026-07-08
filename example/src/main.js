@@ -193,21 +193,24 @@ function recordLibStats(name, patch) {
 	next.set(name, { ...next.get(name), ...patch });
 	libStats(next);
 }
-// The tour's stops are the bar's buttons in bar order, minus tc39-signals:
-// the polyfill's Watcher.unwatch scans every watched producer per call, so
-// disposing the field's render effects is quadratic — ~55s of frozen tab
-// when leaving it at 320p, far worse at 720p. Selecting it by hand still
-// works and still records its stats; the tour just never drives through
-// it. A library whose build fails during the tour joins tourFailed so the
-// rotation advances past it instead of wedging on the failure.
-const TOUR_SKIP = new Set(['tc39-signals']);
+// Libraries marked slow carry a badge and are excluded from the auto tour
+// at 720p and above, where their mount or unmount stalls the rotation for
+// tens of seconds (tc39's Watcher.unwatch is quadratic in watched
+// producers; tansu and svelte pay heavy per-node teardown). Selecting one
+// by hand always works and still records its stats. A library whose build
+// fails during the tour joins tourFailed so the rotation advances past it
+// instead of wedging on the failure.
+const SLOW_LIBS = new Set(['tansu', 'svelte', 'tc39-signals']);
+const SLOW_TIER_MIN = Object.keys(TIERS).indexOf('720p');
+const tierTooBigForSlow = () => Object.keys(TIERS).indexOf(tierName()) >= SLOW_TIER_MIN;
 const tourFailed = new Set();
 const TOUR_ORDER = Object.keys(FRAMEWORKS).filter((key) => !UNSELECTABLE.has(key));
 function nextTourStop(from) {
 	const at = TOUR_ORDER.indexOf(from);
 	for (let step = 1; step <= TOUR_ORDER.length; step++) {
 		const key = TOUR_ORDER[(at + step) % TOUR_ORDER.length];
-		if (!TOUR_SKIP.has(key) && !tourFailed.has(key)) return key;
+		if (SLOW_LIBS.has(key) && tierTooBigForSlow()) continue;
+		if (!tourFailed.has(key)) return key;
 	}
 	return undefined; // every stop skipped or failed — nowhere to advance
 }
@@ -495,7 +498,15 @@ const fmtFps = (v) => (v === undefined ? '—' : String(Math.round(v)));
 		};
 		const rank = document.createElement('span');
 		rank.className = 'lib-rank';
-		line.parentElement.querySelector('.lib-name').append(rank);
+		const nameEl = line.parentElement.querySelector('.lib-name');
+		if (SLOW_LIBS.has(line.parentElement.dataset.v)) {
+			const slow = document.createElement('span');
+			slow.className = 'lib-slow';
+			slow.textContent = 'slow';
+			slow.title = 'excluded from the auto tour at 720p and above';
+			nameEl.append(slow);
+		}
+		nameEl.append(rank);
 		return { line, rank, mount: seg('mount', 'mount'), fps: seg('fps', 'fps'), unmount: seg('unmount', 'unmount') };
 	});
 	effect(() => {
