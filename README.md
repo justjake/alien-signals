@@ -9,42 +9,61 @@
 
 # dalien-signals
 
-**d**alien-signals is a **d**ata-oriented fork of [alien-signals][], a fast [signals][tc39] reactivity library. Its reactive dependency graph is stored in a single `Int32Array` memory [arena][arena-wikipedia], like a contiguous array of structs in C.
+`dalien-signals` is a data-oriented fork of [alien-signals][], a fast [signals][tc39] reactivity library. Its dependency graph is stored in a single `Int32Array` memory [arena][arena-wikipedia], like a contiguous array of structs in C, rather than as JavaScript objects.
 
-The default arena reserves 64 MB of address space (2,097,152 records of 32 bytes). Large zero-filled buffers are typically demand-paged, or lazily committed: allocation reserves virtual address space, but resident physical memory grows only as pages are touched. `growCapacity()` raises the reservation for bigger graphs, and the arena also grows itself when it fills.
+- Improved performance for very large graphs through cache locality.
+- Signals with amortized `O(0)` allocation via `signalId(value): number`, freed with `dispose(signalId)`.
+- Pre-allocate memory to avoid resize copying/re-allocation pauses during application start-up.
+- Trade-off: no advantage on workloads with small homogeneous graphs, where object-based graphs would be JIT specialized favorably.
 
-Demo with interactive examples: [justjake.github.io/dalien-signals](https://justjake.github.io/dalien-signals/).
+## What are signals?
 
-## How it works
-
-`dalien-signals` keeps calculations and callbacks in sync with changing values. It provides three main primitives:
-
-- A `signal` stores a value. Call it with no argument to read it, or with an argument to write it.
-- A `computed` derives and caches a value from signals or other computeds.
-- An `effect` runs a function now, then again when a value it read changes.
-
-Dependencies are automatic. While a computed or effect runs, the library records every signal and computed it reads.
+A **signal** stores a value of state that you can change over time, it's like `useState` in React. Signals are used by many UI frameworks ([Solid][], [Vue][], [Svelte 5][], [Ember][]) as their native reactive primitive.
 
 ```ts
-import { computed, effect, signal } from "dalien-signals";
+const count = signal(0);
+console.log(count()); // 0
+count(2); // set state
+console.log(count()); // 2
+```
 
-const count = signal(1);
-const doubled = computed(() => count() * 2);
+A **computed** memoizes a function that depends on (reads) signals or computeds. Once read, it returns a cached value until one of its dependencies changes. It's like `useMemo` in React, or a selector in Redux.
+
+```ts
+const doubled = computed(() => {
+  console.log(`recomputed`);
+  return count() * 2;
+});
 const isEven = computed(() => count() % 2 === 0);
+console.log(doubled()); // recomputed, 4
+doubled(); // returns 4 without running the function
+```
 
-effect(() => console.log(doubled(), isEven())); // 2 false
-count(2); // 4 true
+An **effect** runs a side-effect function immediately, and re-runs it whenever one of its signal dependencies changes. It's like `useEffect` in React.
+
+```ts
+const stop = effect(() => {
+  const original = document.title;
+  document.title = `doubled = ${doubled()}`;
+  return () => {
+    document.title = original;
+  };
+});
+console.log(document.title); // "doubled = 4"
+count(100);
+console.log(document.title); // "doubled = 200"
+stop(); // stop running the effect and clean up
+console.log(document.title); // "My great page"
 ```
 
 ```mermaid
 flowchart LR
     count["signal: count"] -->|read by| doubled["computed: doubled"]
-    count -->|read by| even["computed: isEven"]
-    doubled -->|read by| log["effect: console.log both"]
-    even -->|read by| log
+    count -->|read by| isEven["computed: isEven"]
+    doubled -->|read by| title["effect: document.title"]
 ```
 
-Arrows point from a value to the work that depends on it. When `count` changes, the effect is reached through both computeds but queued only once.
+Arrows point from a value to the work that depends on it. When `count` changes, the effect is queued and pulls `doubled` up to date; `isEven` recomputes only the next time it is read.
 
 Recalculating every downstream node on each write would waste work. Recalculating dependents immediately could also run an effect more than once or before all of its inputs are current. Updates instead use a push-pull algorithm:
 
@@ -56,88 +75,47 @@ sequenceDiagram
     participant S as signal: count
     participant D as computed: doubled
     participant V as computed: isEven
-    participant E as effect: console.log
+    participant E as effect: document.title
 
+    Note over S: count(100)
     S->>D: push: mark possibly stale
     D->>E: push: queue effect
     S->>V: push: mark possibly stale
-    V->>E: push: effect already queued
+    Note over V: nothing reads isEven — it recomputes on its next read
     E->>D: pull: effect reads doubled
     D->>S: pull: read count
-    S-->>D: 2
-    D-->>E: 4
-    E->>V: pull: effect reads isEven
-    V->>S: pull: read count
-    S-->>V: 2
-    V-->>E: true
-    Note over D,V: both values are current
-    E->>E: console.log(4, true)
+    S-->>D: 100
+    D-->>E: 200
+    E->>E: document.title = "doubled = 200"
 ```
 
 ## API
 
-The library has two interfaces over the same graph, distinguished by what
-a "reactive value" is in your hands:
-
-- **The function tier** — `signal`, `computed`, `effect`, `effectScope` —
-  returns callables: `count()` reads, `count(1)` writes, and calling an
-  effect's returned function stops it. Each callable **owns its record**:
-  the engine registers it with a `FinalizationRegistry`, so dropping the
-  last reference reclaims the node's memory automatically. This is the
-  default, the leak-free choice, and the interface all published
-  benchmarks measure.
-- **The id tier** — `signalId`, `computedId`, `effectId`, `effectScopeId`
-  with `get`, `set`, and `dispose` — returns the record's integer id
-  itself. Nothing is allocated per node beyond the 32-byte record, and
-  nothing is garbage-collected for you: an id lives until you `dispose`
-  it, its creating effect scope is disposed, or an `owner` object you
-  passed at creation is collected. Ids are what the arena actually
-  stores; the function tier is a thin ownership layer over them.
-
-Choose by lifetime discipline, not by speed: reads and writes go through
-the same engine paths, and creation differs by one closure per node.
-Frameworks embedding the graph — storing ids in their own structures,
-managing lifetimes with their own model — use the id tier; application
-code uses functions. The tiers interoperate in one graph: an id-tier
-computed can read function-tier signals and vice versa.
-
-```ts
-import { signal, get, set, signalId, dispose } from "dalien-signals";
-
-const count = signal(0); // function tier: GC-owned callable
-count(1);
-
-const id = signalId(0); // id tier: a plain integer
-set(id, get(id) + 1);
-dispose(id); // explicit end of life
-```
-
-The function tier in full:
-
 ````ts
-import type { SignalId } from "dalien-signals/system";
+import type { ReactiveNode } from "dalien-signals/system";
 
-/** Return the id of the node currently recording signal reads (0 = none). */
-export declare function getActiveSub(): SignalId;
+/** Return the node currently recording signal reads, if there is one. */
+export declare function getActiveSub(): ReactiveNode | undefined;
 
 /**
  * Set the node that records subsequent reads.
- * Returns the previous id so it can be restored.
+ * Returns the previous node so it can be restored.
  */
-export declare function setActiveSub(sub?: SignalId): SignalId;
+export declare function setActiveSub(
+  sub?: ReactiveNode,
+): ReactiveNode | undefined;
 
 /**
- * Raise the arena's capacity to at least `records` 32-byte records (no-op
- * if already that big). Best called before building a large graph so it
- * never grows mid-flight. The default capacity is 2,097,152 records.
+ * Set the arena's starting capacity before creating any reactive values.
+ * `initialRecords` defaults to 8,388,608 32-byte records.
  *
  * @example
  * ```ts
- * growCapacity(1 << 22);
+ * configure({ initialRecords: 1 << 20 });
  * const count = signal(0);
  * ```
  */
-export declare function growCapacity(records: number): void;
+export declare function configure(options?: { initialRecords?: number }): void;
 
 /** Return the number of currently open batches. */
 export declare function getBatchDepth(): number;
@@ -258,17 +236,7 @@ export declare function effectScope(fn: () => void): () => void;
 export declare function trigger(fn: () => void): void;
 ````
 
-The id tier mirrors the functions above: `signalId(initialValue?, owner?)`,
-`computedId(getter, owner?)`, `effectId(fn)`, and `effectScopeId(fn)`
-return `SignalId`s; `get(id)` / `set(id, value)` read and write;
-`dispose(id)` frees effects, scopes, or records explicitly; `getFlags` /
-`setFlags` expose the node's engine state bits. Ids created inside an
-`effectScopeId` belong to that scope's region and are freed with it; ids
-created with an `owner` object are freed when the owner is collected;
-bare ids are the caller's responsibility.
-
-The `dalien-signals/system` entry point exposes isolated engines, the raw
-graph operations, debugging, and bulk reset.
+The `dalien-signals/system` entry point exposes isolated engines, numeric record IDs, debugging, and bulk reset.
 
 ## Storage
 
@@ -343,75 +311,115 @@ Whenever a write could invalidate cached work, the engine increments a global wr
 ## Performance details
 
 - One- and two-link updates use dedicated fast paths instead of the general graph traversal. Runs of single-dependency, single-subscriber nodes — chains — walk without the traversal stack: the way back up is recoverable from each node's unique subscriber link.
+- The engine seeds its user-callback call sites past V8's megamorphic threshold (>4 function shapes) when minted callback shapes diversify — sampled per call-site family (getters vs effect callbacks) on a geometric cadence. Single-shape processes never seed and keep full monomorphic JIT speculation at any graph size (measured 1.15x on a hot chain); diverse processes converge to the seeded steady state (insurance ratio 1.01, `benchs/phaseTransition.mjs`). `configure({ seeding: 'eager' | 'off' })` overrides.
 - A `FinalizationRegistry` tracks when signal or computed functions are GC'd and returns their underlying record memory to a free-list for re-use.
 - The lower-level engine's `reset()` method clears the whole arena at once. Functions and numeric IDs created before the reset become invalid.
 - `tests/bytecode.spec.ts` enforces V8's 460-bytecode inline limit for hot functions. Large functions are split so the JIT can inline them into callers.
 
 ## Build your own framework
 
-`createReactiveSystem` is the graph engine with none of the signal semantics: five raw operations over the arena, allocation, growth, and a set of seams the host fills in. `src/index.ts` — the whole default library — is one client of this surface (`tests/policyBoundary.spec.ts` enforces that it uses nothing else). A host can bring its own semantics:
+`createReactiveSystem` returns a complete, composable kit of id-based operations. `src/index.ts` is one example client — a typed signal framework built strictly from this public surface (`tests/policyBoundary.spec.ts` enforces that). A host can build its own instead:
 
-```ts
+````ts
 import { createReactiveSystem } from "dalien-signals/system";
+import type {
+  ComputedId,
+  EffectId,
+  EffectScopeId,
+  LinkId,
+  NodeId,
+  SignalId,
+} from "dalien-signals/system";
 
-const sys = createReactiveSystem({
-  // Required: the arena's capacity, in records or megabytes (1 MB = 32,768
-  // records). maxCapacityRecords / maxCapacityMegabytes cap growth.
-  capacityRecords: 1 << 16,
+export declare function createReactiveSystem(options?: {
+  /** Arena starting capacity in 32-byte records. Default 8,388,608. */
+  initialRecords?: number;
+  /**
+   * Take over effect scheduling. The engine reports each affected effect
+   * once per wave and runs nothing until you call `runEffect(id, gen)`.
+   *
+   * @example Buffer all effects to the end of the animation frame:
+   * ```ts
+   * const queue: Array<[number, number]> = [];
+   * const sys = createReactiveSystem({
+   *   notify: (id, gen) => {
+   *     if (queue.push([id, gen]) === 1) {
+   *       requestAnimationFrame(() => {
+   *         for (const [e, g] of queue.splice(0)) sys.runEffect(e, g);
+   *       });
+   *     }
+   *   },
+   * });
+   * ```
+   */
+  notify?: (effectId: number, gen: number) => void;
+  /**
+   * Runs when a node gains its first subscriber. Whatever it returns is
+   * stored and passed to `stop`. Connect external resources here.
+   * `js` is a signal's current value, or the node's installed function.
+   */
+  start?: (id: NodeId, js: unknown) => unknown;
+  /**
+   * Runs when the node's last subscriber unlinks, and for every started
+   * node during `reset()`. Disconnect the resource `start` connected.
+   */
+  stop?: (id: NodeId, js: unknown, state: unknown) => void;
+}): ReactiveSystem;
 
-  // Fires at creation and after every growth: capture the arena here. The
-  // object is replaced when the arena grows, so hosts re-capture rather
-  // than holding fields.
-  allocated(arena) {
-    // arena.memory: Int32Array — the records themselves
-    // arena.versions: Float64Array — the same buffer, for version stamps
-    // arena.link(dep, sub, version) / arena.unlink(linkId, sub?)
-    // arena.propagate(subsLink, innerWrite) / arena.checkDirty(depsLink, sub)
-    // arena.shallowPropagate(subsLink)
-    // arena.allocNode(hostBits) / arena.freeNode(id, gen)
-  },
+export declare interface ReactiveSystem {
+  /** Allocate a node record. IDs are integers into this system's arena. */
+  signal(initialValue?: unknown): SignalId;
+  computed(getter: (previousValue?: unknown) => unknown): ComputedId;
+  effect(fn: () => (() => void) | void): EffectId;
+  effectScope(fn: () => void): EffectScopeId;
 
-  // The walks call this for every stale node: commit whatever "update"
-  // means for your kind (dispatch on your own host bits in `flags`) and
-  // return whether the value changed — it feeds the equality cut-off.
-  update(id, flags) { return true; },
+  /** Read or stage a value; pull a computed up to date. */
+  signalRead(id: SignalId): unknown;
+  signalWrite(id: SignalId, value: unknown): void;
+  computedRead(id: ComputedId): unknown;
 
-  // An effect needs to run: queue it however you schedule work.
-  notify(id, gen) {},
+  /** Generation counter for an id — capture at creation, pass to the
+   * gen-guarded operations so stale ids become no-ops. */
+  gen(id: NodeId): number;
+  dispose(id: EffectId | EffectScopeId, gen: number): void;
+  runEffect(id: EffectId, gen: number): void;
 
-  // A node gained its first subscriber / lost its last one. Connect and
-  // disconnect external resources here; `unwatched` also fires for every
-  // watched node during reset().
-  watched(id) {},
-  unwatched(id, state) {},
+  /**
+   * Add a dependency edge by hand: `sub` re-verifies when `dep` changes.
+   * Returns the edge id (the existing one if already linked). Manual edges
+   * age out if the subscriber re-tracks without re-establishing them,
+   * exactly like read-discovered edges.
+   */
+  link(depId: NodeId, subId: NodeId): LinkId;
+  unlink(linkId: LinkId): void;
 
-  // A record went back to the free list: drop anything you keep for it
-  // (values, callbacks), or dead objects stay pinned until the id is
-  // reused.
-  freed(id) {},
-});
+  /**
+   * Out-of-band invalidation: mark everything downstream of `id` possibly
+   * stale, queue affected effects, invalidate epoch stamps, and flush
+   * unless a batch is open. Follow with `shallowPropagate(id)` to promote
+   * direct subscribers to dirty so they actually recompute.
+   */
+  propagate(id: NodeId): void;
+  shallowPropagate(id: NodeId): void;
 
-// Lifetime tiers on the system object:
-sys.createNode(owner, hostBits); // automatic: freed when `owner` is GC'd
-sys.adoptNode(owner, id);        // tie an already-created id to an owner
-sys.allocNode(hostBits);         // manual: pair with disposeNode/freeNode
-sys.disposeNode(id, gen?);       // gen-guarded free; stale ids are no-ops
-sys.generationOf(id);            // capture at creation to guard stored ids
-sys.growCapacity(records);       // immediate when idle, else at the next boundary
-sys.reset();                     // rewind the whole arena; every id dies
-sys.stats();                     // capacity, live records, free-list depth
-```
+  /** Tracking control and introspection. */
+  setActiveSub(id: NodeId): NodeId;
+  getActiveSub(): NodeId;
+  nodeFlags(id: NodeId): number;
+  setNodeFlags(id: NodeId, flags: number): void;
+  stats(): object;
+  buffer(): Int32Array;
+}
+````
 
-Node state lives in the arena as 32-byte records of eight `int32` slots — flags, dependency-list head and cursor, subscriber-list head and tail, a generation counter, and a float64 version stamp. Edges are records too. The [live inspector](https://justjake.github.io/dalien-signals/) decodes a real arena, record by record, as you mutate a graph.
-
-`tests/hostPrimitives.spec.ts` is the proof: signal, computed, and effect implemented entirely from this surface — glitch-free diamonds, equality cut-off, batching, re-tracking, implicit stamping — interoperating both directions with the built-ins in one graph, at parity on the benchmark suite.
+Using an ID after its node is disposed or reclaimed is undefined behavior, except through the gen-guarded operations (`dispose`, `runEffect`).
 
 ## Constraints
 
-- The arena grows between operations. Once 3/4 full, the engine and the library's hot tier are rebuilt over an arena twice the size; every record is copied and existing signals keep working. Both rebuilds compile from freshly generated source (`new Function`) so each generation keeps the JIT specialization a repeated closure would lose. Growing **before** a graph is built runs at full speed afterwards; growing under an already-hot graph leaves long-lived callables with mixed call-site feedback, measured at ~1.3x on sustained recompute chains — call `growCapacity()` up front for graphs you expect to be large. Where Content-Security-Policy forbids runtime codegen, growth falls back to plain instantiation: correct, with the same mixed-feedback cost.
-- Growth cannot move the arena under a running callback. A single effect or computed callback that allocates past the remaining quarter of the arena throws; `growCapacity()` raises capacity up front for allocation-heavy paths. The default reservation is 64 MB of address space (2,097,152 records); physical memory is consumed only for records that are touched.
+- The arena grows between operations. Once 3/4 full, the engine is rebuilt over an arena twice the size; every record is copied and IDs survive, so functions created before a growth keep working. Before any growth there is no cost (totals within noise; epoch-fast-path reads pay nothing). Growth rebuilds the engine from freshly compiled source (`new Function`) so each generation keeps V8's arena-address embedding; measured post-growth cost is ~1.1-1.2x (functions created before the growth pay one forwarding hop). Where Content-Security-Policy forbids runtime codegen, the engine falls back to reusing its static code and post-growth steady state runs up to ~1.9x slower — size `initialRecords` so hot processes never grow there. Additional systems in one process get the same fresh-compilation treatment.
+- Growth cannot move the arena under a running callback. A single effect or computed callback that allocates past the remaining quarter of the arena throws; `configure({ initialRecords })` sets a larger starting capacity for allocation-heavy paths. By default the arena asks the operating system for a 256 MB address range holding 8,388,608 records; physical memory is consumed only for records that are touched.
 - The JavaScript runtime must support `FinalizationRegistry`, which is part of ES2021.
-- Across the write-cost crossover matrix (5 shape families x 10 sizes, `benchs/crossover.mjs`, Node 24, Apple M4 Max, 2026-07-07), this arena averages ~11% faster than the original `alien-signals` (geometric mean ratio 0.89) and reaches 1.9-2.9x faster once a write recomputes hundreds of nodes (grid cones bottom out at 0.34x, broad fan-outs at 0.5-0.6x). The remaining upstream edge is a narrow band: single-node and few-node writes run up to ~1.1x this fork's time, and a fixed cone surrounded by idle nodes carries a flat ~10% premium. `benchs/propagateSustained.mjs` and `benchs/memoryUsage.mjs` probe the adjacent regimes.
+- Across the write-cost crossover matrix (5 shape families x 11 sizes, `benchs/crossover.mjs`), this arena averages ~8% faster than the original `alien-signals` (geometric mean ratio 0.92) and reaches 1.4-2.5x faster once a write recomputes hundreds of nodes. The remaining upstream edge is a narrow band: single-node writes and 10-300-node chain segments run up to ~1.2x this fork's time, and a fixed cone surrounded by idle nodes carries a flat ~5% premium. `benchs/propagateSustained.mjs` and `benchs/memoryUsage.mjs` probe the adjacent regimes.
 
 <img width="1080" alt="Sustained write cost ratio (dalien over alien) by recomputed nodes per write" src="assets/crossover.png" />
 
@@ -421,33 +429,32 @@ The chart divides dalien-signals time by alien-signals time. Values below `1.0` 
 
 These charts compare JavaScript reactivity libraries with the `sbench`, `kairo`, `cellx`, and `dynamic` workload groups from [js-reactivity-benchmark](https://github.com/milomg/js-reactivity-benchmark). Each table reports elapsed milliseconds; lower is better, and `total` is the sum of those workload groups.
 
-The first two charts run each library in a fresh process, so one library cannot leave compiled code or uncollected objects behind for the next. Each number is the median of four CI rounds; the libraries take turns each round instead of completing all runs in a fixed order. See [run 28848044239](https://github.com/justjake/dalien-signals/actions/runs/28848044239) at `ae1b4ae`; `benchs/ci/` contains the harness and method. On Node, dalien-signals posts the lowest total of every framework measured.
+The first two charts run each library in a fresh process, so one library cannot leave compiled code or uncollected objects behind for the next. Each number is the median of four CI rounds; the libraries take turns each round instead of completing all runs in a fixed order. See [run 28762874098](https://github.com/justjake/dalien-signals/actions/runs/28762874098) at `c47c607`; `benchs/ci/` contains the harness and method.
 
 ### Node (V8)
 
 <!-- benchmark:node:begin — generated by benchs/ci/pull-run.mjs; edits inside are overwritten -->
-<img width="1080" alt="Total benchmark time by framework, Node (V8): Dalien Id Alloc/Free 3,351 ms; Reactively 3,384 ms; Alien Signals 3,447 ms; Dalien Signals 3,471 ms; Preact Signals 3,792 ms; s-js 5,077 ms; Vue 5,478 ms; Svelte v5 7,399 ms; amadeus-it-group/tansu 7,504 ms; Pota 7,851 ms; Angular Signals 8,337 ms; SolidJS 9,533 ms; x-reactivity 11,967 ms; MobX 18,028 ms; Compostate 19,721 ms" src="assets/benchmark.png" />
+<img width="1080" alt="Total benchmark time by framework, Node (V8): Dalien Signals 3,989 ms; Reactively 4,104 ms; Alien Signals 4,273 ms; Preact Signals 4,793 ms; s-js 5,704 ms; Vue 6,264 ms; Svelte v5 7,656 ms; Pota 8,277 ms; amadeus-it-group/tansu 8,445 ms; Angular Signals 9,279 ms; SolidJS 10,414 ms; x-reactivity 13,418 ms; MobX 18,946 ms; Compostate 20,368 ms" src="assets/benchmark.png" />
 
 <details>
-<summary>Node (V8) suite totals (ms, lower is better) — CI run 28883585345 @ a205758, 2026-07-07</summary>
+<summary>Node (V8) suite totals (ms, lower is better) — CI run 28762874098 @ c47c607, 2026-07-06</summary>
 
-| framework | sbench | kairo | cellx | dynamic | total |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Dalien Id Alloc/Free | 595 | 870 | 23 | 1863 | 3351 |
-| Reactively | 683 | 1029 | 50 | 1623 | 3384 |
-| Alien Signals | 683 | 838 | 41 | 1884 | 3447 |
-| Dalien Signals | 577 | 901 | 29 | 1964 | 3471 |
-| Preact Signals | 565 | 893 | 38 | 2295 | 3792 |
-| s-js | 725 | 1150 | 68 | 3134 | 5077 |
-| Vue | 835 | 1403 | 94 | 3147 | 5478 |
-| Svelte v5 | 1625 | 2163 | 59 | 3552 | 7399 |
-| amadeus-it-group/tansu | 2663 | 1559 | 217 | 3066 | 7504 |
-| Pota | 1567 | 2018 | 132 | 4134 | 7851 |
-| Angular Signals | 1580 | 1812 | 110 | 4836 | 8337 |
-| SolidJS | 1354 | 2064 | 142 | 5973 | 9533 |
-| x-reactivity | 2759 | 2886 | 187 | 6136 | 11967 |
-| MobX | 4286 | 4512 | 214 | 9015 | 18028 |
-| Compostate | 2276 | 3277 | 350 | 13818 | 19721 |
+| framework              | sbench | kairo | cellx | dynamic | total |
+| ---------------------- | -----: | ----: | ----: | ------: | ----: |
+| Dalien Signals         |    736 |  1002 |    41 |    2209 |  3989 |
+| Reactively             |    657 |  1174 |    98 |    2175 |  4104 |
+| Alien Signals          |    716 |   946 |    40 |    2569 |  4273 |
+| Preact Signals         |    574 |   990 |    35 |    3193 |  4793 |
+| s-js                   |    750 |  1228 |    48 |    3678 |  5704 |
+| Vue                    |    861 |  1499 |    88 |    3816 |  6264 |
+| Svelte v5              |   1470 |  2105 |    52 |    4029 |  7656 |
+| Pota                   |   1565 |  2048 |   135 |    4529 |  8277 |
+| amadeus-it-group/tansu |   2787 |  1735 |   150 |    3774 |  8445 |
+| Angular Signals        |   1683 |  1853 |   122 |    5621 |  9279 |
+| SolidJS                |   1432 |  2189 |    94 |    6700 | 10414 |
+| x-reactivity           |   2892 |  3052 |   168 |    7306 | 13418 |
+| MobX                   |   4462 |  4721 |   223 |    9539 | 18946 |
+| Compostate             |   2435 |  3507 |   287 |   14139 | 20368 |
 
 <img width="1080" alt="Individual benchmark times, Node (V8), one panel per test" src="assets/benchmark-details.png" />
 
@@ -456,36 +463,66 @@ The first two charts run each library in a fresh process, so one library cannot 
 
 ### Bun (JavaScriptCore)
 
-Bun's JavaScriptCore currently runs this library well behind alien-signals (the engine work above is tuned against V8, and the current host structure regressed JSC from the previous release, which beat alien-signals under Bun at 0.84x). Treat the Bun numbers as a known issue under active investigation rather than a stable property.
-
 <!-- benchmark:bun:begin — generated by benchs/ci/pull-run.mjs; edits inside are overwritten -->
-<img width="1080" alt="Total benchmark time by framework, Bun (JavaScriptCore): Dalien Id Alloc/Free 3,267 ms; Reactively 3,340 ms; Dalien Signals 3,425 ms; Alien Signals 3,829 ms; Preact Signals 4,172 ms; s-js 4,901 ms; Vue 5,301 ms; Angular Signals 6,034 ms; Svelte v5 6,800 ms; amadeus-it-group/tansu 8,119 ms; Pota 8,220 ms; SolidJS 9,506 ms; x-reactivity 10,167 ms; MobX 13,947 ms; Compostate 30,203 ms" src="assets/benchmark-bun.png" />
+<img width="1080" alt="Total benchmark time by framework, Bun (JavaScriptCore): Dalien Signals 3,073 ms; Reactively 3,638 ms; Alien Signals 4,267 ms; Preact Signals 4,270 ms; s-js 4,973 ms; Vue 5,467 ms; Angular Signals 6,191 ms; Svelte v5 6,391 ms; Pota 8,516 ms; amadeus-it-group/tansu 9,312 ms; SolidJS 9,558 ms; x-reactivity 10,219 ms; MobX 13,900 ms; Compostate 31,312 ms" src="assets/benchmark-bun.png" />
 
 <details>
-<summary>Bun (JavaScriptCore) suite totals (ms, lower is better) — CI run 28883585345 @ a205758, 2026-07-07</summary>
+<summary>Bun (JavaScriptCore) suite totals (ms, lower is better) — CI run 28762874098 @ c47c607, 2026-07-06</summary>
 
-| framework | sbench | kairo | cellx | dynamic | total |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Dalien Id Alloc/Free | 562 | 722 | 28 | 1955 | 3267 |
-| Reactively | 445 | 1123 | 69 | 1703 | 3340 |
-| Dalien Signals | 505 | 724 | 46 | 2150 | 3425 |
-| Alien Signals | 613 | 739 | 34 | 2444 | 3829 |
-| Preact Signals | 669 | 708 | 32 | 2764 | 4172 |
-| s-js | 643 | 951 | 39 | 3269 | 4901 |
-| Vue | 739 | 958 | 79 | 3524 | 5301 |
-| Angular Signals | 1603 | 1187 | 81 | 3163 | 6034 |
-| Svelte v5 | 1194 | 1655 | 57 | 3894 | 6800 |
-| amadeus-it-group/tansu | 2338 | 1571 | 221 | 3990 | 8119 |
-| Pota | 1073 | 2029 | 91 | 5028 | 8220 |
-| SolidJS | 1098 | 1841 | 64 | 6503 | 9506 |
-| x-reactivity | 2263 | 2174 | 106 | 5624 | 10167 |
-| MobX | 2442 | 3547 | 207 | 7751 | 13947 |
-| Compostate | 2017 | 3191 | 320 | 24674 | 30203 |
+| framework              | sbench | kairo | cellx | dynamic | total |
+| ---------------------- | -----: | ----: | ----: | ------: | ----: |
+| Dalien Signals         |    559 |   638 |    28 |    1847 |  3073 |
+| Reactively             |    498 |  1171 |    69 |    1900 |  3638 |
+| Alien Signals          |    744 |   770 |    39 |    2713 |  4267 |
+| Preact Signals         |    733 |   710 |    37 |    2791 |  4270 |
+| s-js                   |    712 |   937 |    34 |    3290 |  4973 |
+| Vue                    |    856 |   963 |    76 |    3573 |  5467 |
+| Angular Signals        |   1596 |  1126 |    76 |    3393 |  6191 |
+| Svelte v5              |   1182 |  1650 |    52 |    3508 |  6391 |
+| Pota                   |   1190 |  2098 |   108 |    5120 |  8516 |
+| amadeus-it-group/tansu |   2920 |  1753 |   237 |    4402 |  9312 |
+| SolidJS                |   1152 |  1832 |   114 |    6460 |  9558 |
+| x-reactivity           |   2352 |  2082 |   163 |    5622 | 10219 |
+| MobX                   |   2515 |  3493 |   188 |    7704 | 13900 |
+| Compostate             |   1992 |  3037 |   341 |   25942 | 31312 |
 
 <img width="1080" alt="Individual benchmark times, Bun (JavaScriptCore), one panel per test" src="assets/benchmark-details-bun.png" />
 
 </details>
 <!-- benchmark:bun:end -->
+
+The final chart uses another [js-reactivity-benchmark fork](https://github.com/transitive-bullshit/js-reactivity-benchmark) that runs every library in one Node process. Its result depends on run order because each library inherits compiled code and allocated objects left by earlier libraries. Its graph-creation tests also force JavaScript garbage collection (GC) inside the timed region. Treat it as a different workload, not a direct comparison with the isolated charts. Here, `alien-signals` means the old `1.0.0-alpha.1` version pinned by that benchmark; `alien-signals v3.2.1` is the version dalien-signals follows. Node 24, Apple M4 Max, 2026-07-06; raw data is in `benchs/results/`.
+
+<!-- benchmark:tb:begin — generated by benchs/ci/pull-run.mjs; edits inside are overwritten -->
+<img width="1080" alt="Total benchmark time by framework, shared process: alien-signals 1.0.0-alpha.1 1,674 ms; alien-signals v3.2.1 1,906 ms; dalien-signals 2,598 ms; @reactively 3,007 ms; Svelte v5 3,325 ms; s-js 3,788 ms; @amadeus-it-group/tansu 3,998 ms; Oby 4,125 ms; $mol_wire 4,232 ms; uSignal 4,990 ms; Preact Signals 5,074 ms; SolidJS 5,497 ms; MobX 7,165 ms; Signia 7,409 ms; @vue/reactivity 8,145 ms; TC39 Signals Polyfill 17,597 ms; @angular/signals 21,544 ms" src="assets/benchmark-tb.png" />
+
+<details>
+<summary>Suite totals (ms, lower is better)</summary>
+
+| framework                   | sbench | kairo | dynamic | total |
+| --------------------------- | -----: | ----: | ------: | ----: |
+| alien-signals 1.0.0-alpha.1 |     32 |   907 |     735 |  1674 |
+| alien-signals v3.2.1        |     50 |   985 |     871 |  1906 |
+| dalien-signals              |    551 |  1106 |     941 |  2598 |
+| @reactively                 |    673 |  1336 |     999 |  3007 |
+| Svelte v5                   |    651 |  1561 |    1113 |  3325 |
+| s-js                        |    778 |  1539 |    1471 |  3788 |
+| @amadeus-it-group/tansu     |    713 |  1845 |    1440 |  3998 |
+| Oby                         |    863 |  1789 |    1472 |  4125 |
+| $mol_wire                   |    688 |  2085 |    1459 |  4232 |
+| uSignal                     |    688 |  2390 |    1912 |  4990 |
+| Preact Signals              |    665 |  1108 |    3301 |  5074 |
+| SolidJS                     |    840 |  2097 |    2559 |  5497 |
+| MobX                        |    737 |  3578 |    2850 |  7165 |
+| Signia                      |    699 |  1792 |    4917 |  7409 |
+| @vue/reactivity             |    709 |  1873 |    5563 |  8145 |
+| TC39 Signals Polyfill       |    771 |  3296 |   13530 | 17597 |
+| @angular/signals            |    715 |  2437 |   18392 | 21544 |
+
+<img width="1080" alt="Individual benchmark times, shared process, one panel per test" src="assets/benchmark-details-tb.png" />
+
+</details>
+<!-- benchmark:tb:end -->
 
 ## Origin
 
@@ -494,3 +531,7 @@ The [alien-signals][] repository contains the original algorithm history, ports,
 [alien-signals]: https://github.com/stackblitz/alien-signals
 [tc39]: https://github.com/tc39/proposal-signals
 [arena-wikipedia]: https://en.wikipedia.org/wiki/Region-based_memory_management
+[Solid]: https://docs.solidjs.com/concepts/signals
+[Vue]: https://vuejs.org/guide/essentials/reactivity-fundamentals.html
+[Svelte 5]: https://svelte.dev/docs/svelte/$state
+[Ember]: https://guides.emberjs.com/release/in-depth-topics/autotracking-in-depth/
