@@ -487,14 +487,14 @@ async function run(page, url) {
 		return `${tail.join(' | ')}; live "${log.live}"`;
 	});
 
-	await check('sticky selection survives reload; tour boots paused', async () => {
+	await check('sticky selection survives reload; tour boots playing', async () => {
 		await clickButton(page, 'tier-bar', '720p');
 		await awaitBuildNote(page, 'alien-signals', '720p');
 		await page.reload({ waitUntil: 'load' });
+		// The stored selection picks the starting stop; play is the default,
+		// so the reloaded page resumes touring from it.
 		const note = await awaitBuildNote(page, 'alien-signals', '720p');
-		// A stored library records a past explicit click, so the reloaded
-		// page must not start touring away from it.
-		await assertTourGlyph(page, '⏵', 'a stored selection boots the tour paused');
+		await assertTourGlyph(page, '⏸', 'the tour boots playing');
 		const dumps = await assertBars(page, { 'lib-bar': 'alien-signals', 'tier-bar': '720p', 'mode-bar': 'wave' });
 		return `${note} — ${dumps}`;
 	});

@@ -178,10 +178,10 @@ const liveAvgMs = () => {
 // snapshotted onto the library's subtitle, and — when the tour is running —
 // the selection advances to the next stop. While paused the clock keeps
 // running in place, so a parked library's subtitle refreshes with each
-// ~5s of new frames. Booting with a stored selection starts paused: the
-// stored library records a past explicit click, which should hold.
+// ~5s of new frames. The tour always boots playing; a stored library only
+// picks the starting stop. Pausing is a per-visit act, not a preference.
 const TOUR_DWELL_MS = 5000;
-const cycling = signal(!sticky.paused);
+const cycling = signal(true);
 // Per-library subtitle stats, each field recorded where it is measured:
 // setupMs when a build succeeds, teardownMs when the library is left (it
 // is unknowable sooner), frameAvgMs at dwell end. One signal-of-map keeps
