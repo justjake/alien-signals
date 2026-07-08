@@ -22,7 +22,7 @@ env:
   # Pinned fork of the milomg harness (suites, adapters, lockfile all
   # committed there); bump FORK_SHA deliberately when the fork moves.
   FORK_REPO: https://github.com/justjake/js-reactivity-benchmark
-  FORK_SHA: 8c423dd12676fcba5776e79f7bf0431f42dfaf05
+  FORK_SHA: 4e7d83a27c80e6921c408c7e1b223ddf96f25e47
   # The fork's core links ../upstream-alien-signals (the comparator build).
   ALIEN_REPO: https://github.com/stackblitz/alien-signals
   ALIEN_SHA: c00e63969bf261fc5dce31fae70cb9a90912b06e

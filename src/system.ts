@@ -1287,7 +1287,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 					const bit = bits & -bits;
 					bits ^= bit;
 					const id = ((w << 5) + (31 - Math.clz32(bit))) << 3;
-					if (tail === 0) {
+					if (!tail) {
 						head = id;
 					} else {
 						M[tail + LinkSlot.FreeNext] = id;
