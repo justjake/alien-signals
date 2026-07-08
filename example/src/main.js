@@ -93,7 +93,6 @@ const sticky = readStickySelection();
 const libName = signal(sticky.lib);
 const tierName = signal(sticky.tier);
 const mode = signal('wave'); // 'off' | 'wave' | 'storm'
-const cutoffOn = signal(true);
 const building = signal(false);
 const recomputedCount = signal(0);
 const frameMs = signal(0);
@@ -200,7 +199,11 @@ function recordLibStats(name, patch) {
 // by hand always works and still records its stats. A library whose build
 // fails during the tour joins tourFailed so the rotation advances past it
 // instead of wedging on the failure.
-const SLOW_LIBS = new Set(['tansu', 'svelte', 'tc39-signals']);
+const SLOW_LABELS = new Map([
+	['tansu', 'slow'],
+	['svelte', 'slow unmount'],
+	['tc39-signals', 'slow & quadratic unmount'],
+]);
 const SLOW_TIER_MIN = Object.keys(TIERS).indexOf('720p');
 const tierTooBigForSlow = () => Object.keys(TIERS).indexOf(tierName()) >= SLOW_TIER_MIN;
 const tourFailed = new Set();
@@ -209,7 +212,7 @@ function nextTourStop(from) {
 	const at = TOUR_ORDER.indexOf(from);
 	for (let step = 1; step <= TOUR_ORDER.length; step++) {
 		const key = TOUR_ORDER[(at + step) % TOUR_ORDER.length];
-		if (SLOW_LIBS.has(key) && tierTooBigForSlow()) continue;
+		if (SLOW_LABELS.has(key) && tierTooBigForSlow()) continue;
 		if (!tourFailed.has(key)) return key;
 	}
 	return undefined; // every stop skipped or failed — nowhere to advance
@@ -273,7 +276,6 @@ const logAppend = (...lines) => logLines(
 	[...logLines(), ...lines.map((line) => (typeof line === 'string' ? { text: line } : line))].slice(-LOG_LIMIT),
 );
 
-const cutoffLabel = computed(() => `equality cutoff: ${cutoffOn() ? 'on' : 'off'}`);
 
 const $ = (id) => document.getElementById(id);
 const canvas = $('grid');
@@ -398,7 +400,6 @@ if (performance.memory) {
 	heap(performance.memory.usedJSHeapSize);
 }
 bindText('note', note);
-bindText('btn-cutoff', cutoffLabel);
 
 // The frozen log lines rebuild as a whole — at most 9 short rows, on
 // rebuild-frequency events — while the live line updates every frame.
@@ -499,10 +500,10 @@ const fmtFps = (v) => (v === undefined ? '—' : String(Math.round(v)));
 		const rank = document.createElement('span');
 		rank.className = 'lib-rank';
 		const nameEl = line.parentElement.querySelector('.lib-name');
-		if (SLOW_LIBS.has(line.parentElement.dataset.v)) {
+		if (SLOW_LABELS.has(line.parentElement.dataset.v)) {
 			const slow = document.createElement('span');
 			slow.className = 'lib-slow';
-			slow.textContent = 'slow';
+			slow.textContent = SLOW_LABELS.get(line.parentElement.dataset.v);
 			slow.title = 'excluded from the auto tour at 720p and above';
 			nameEl.append(slow);
 		}
@@ -548,20 +549,6 @@ effect(() => {
 radioGroup('tier-bar', tierName, tierName);
 radioGroup('mode-bar', mode, mode);
 
-$('btn-cutoff').addEventListener('click', () => {
-	const next = !cutoffOn();
-	cutoffOn(next);
-	timeFullPass(() => {
-		const v = view();
-		v.rt.set(v.graph.quantize, next);
-	});
-});
-$('btn-invalidate').addEventListener('click', () => {
-	timeFullPass(() => {
-		const v = view();
-		v.rt.set(v.graph.epoch, v.rt.get(v.graph.epoch) + 1);
-	});
-});
 
 // rebuild is a projection of (library, tier)
 //
@@ -671,7 +658,7 @@ finishRebuild(builtName, builtTier); // initial view: size the canvas and post t
 
 function finishRebuild(name, tier) {
 	const v = view();
-	v.rt.set(v.graph.quantize, cutoffOn());
+	v.rt.set(v.graph.quantize, true); // the equality cutoff is always on
 	canvas.width = v.w;
 	canvas.height = v.h;
 	resetAverages();
@@ -706,22 +693,6 @@ function paint(e) {
 	});
 }
 
-function timeFullPass(write) {
-	if (building()) return;
-	const v = view();
-	v.graph.stats.recomputes = 0;
-	const t0 = performance.now();
-	try {
-		v.rt.batch(write);
-	} catch (err) {
-		// A failed pass must surface in the note, not escape the handler
-		// mid-flush and strand whatever effects are still queued.
-		note(`update failed — ${err?.message ?? err}`);
-		return;
-	}
-	recomputedCount(v.graph.stats.recomputes);
-	note(`${v.graph.stats.recomputes.toLocaleString()} recomputes in ${(performance.now() - t0).toFixed(1)} ms`);
-}
 
 // ---- render loop ----------------------------------------------------------------
 // Render effects repaint changed pixels as each library's scheduler runs

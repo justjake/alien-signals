@@ -9,15 +9,39 @@ body {
 main { max-width: 1060px; margin: 0 auto; padding: 24px 20px 48px; }
 header h1 { margin: 0 0 4px; font-size: 22px; letter-spacing: 0.02em; }
 header p { margin: 0 0 16px; color: #9aa1b2; max-width: 62ch; }
+.readme-intro > p:first-of-type { font-size: 17px; max-width: 68ch; color: #c8cede; }
+.readme-intro ul { max-width: 72ch; color: #b7bdcc; padding-left: 22px; margin: 0 0 16px; }
+.readme-intro ul li { margin: 6px 0; }
 code { color: #7fd4ff; }
+#stage { border-radius: 8px; overflow: hidden; background: #05060a; }
 canvas {
 	width: 100%;
+	display: block;
 	image-rendering: pixelated;
-	border-radius: 8px;
 	background: #05060a;
 	cursor: crosshair;
 	touch-action: none;
 }
+/* A hairline control strip inside the stage's rounded corners. */
+#stage-footer {
+	display: flex;
+	justify-content: space-between;
+	align-items: stretch;
+	background: #0b0d12;
+	border-top: 1px solid #1c2130;
+}
+#stage-footer .libpick { border: 0; border-radius: 0; }
+#stage-footer .libpick button {
+	background: transparent;
+	color: #5b667e;
+	border: 0;
+	border-right: 1px solid #1c2130;
+	padding: 0 9px;
+	font: 10px/1.4 ui-sans-serif, system-ui;
+	cursor: pointer;
+}
+#stage-footer .libpick button:last-child { border-right: 0; }
+#stage-footer .libpick button.on { background: #7fd4ff; color: #0b0d12; font-weight: 600; }
 /* Grid tracks size from the container, not the content: a value gaining
    a digit cannot move its neighbors. tabular-nums (below) keeps digits
    equal-width so values don't wiggle inside their own tile either. */

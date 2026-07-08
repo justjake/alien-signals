@@ -9,27 +9,11 @@
 	</head>
 	<body>
 		<main>
-			<header>
-				<h1>dalien-signals</h1>
+			<header class="readme-intro">
+				<!-- readme:intro -->
 				<p class="lede">
-					<a href="https://github.com/justjake/dalien-signals">dalien-signals</a>
-					is a data-oriented fork of
-					<a href="https://github.com/stackblitz/alien-signals">alien-signals</a>,
-					a fast <a href="https://github.com/tc39/proposal-signals">signals</a>
-					reactivity library. A <em>signal</em> is a value that remembers
-					who read it: when it changes, everything computed from it — and
-					nothing else — updates. Many UI frameworks use signals as their
-					native reactive primitive:
-					<a href="https://docs.solidjs.com/concepts/signals">Solid</a>,
-					<a href="https://vuejs.org/guide/essentials/reactivity-fundamentals.html">Vue</a>,
-					<a href="https://svelte.dev/docs/svelte/$state">Svelte 5</a>,
-					<a href="https://guides.emberjs.com/release/in-depth-topics/autotracking-in-depth/">Ember</a>.
-					There is no subscription step and no
-					re-rendering pass; the dependency graph assembles itself while
-					code runs. dalien-signals stores that graph in a single
-					<code>Int32Array</code> memory arena, like a contiguous array of
-					structs in C. Every demo below — including this page's own HUD
-					and controls — runs the production build.
+					Every demo below — including this page's own HUD and controls —
+					runs the production build.
 				</p>
 			</header>
 
@@ -51,7 +35,23 @@
 					<li><b>wide bands</b> (violet→amber): every ~32nd source pixel is a hub read by thousands of cells — one hub write is a broad wave, one level deep.</li>
 					<li><b>equality cutoff</b>: propagation stops wherever a cell recomputes to the value it already held, so fading ripples end early.</li>
 				</ul>
-				<canvas id="grid"></canvas>
+				<div id="stage">
+					<canvas id="grid"></canvas>
+					<div id="stage-footer">
+						<span class="libpick" id="tier-bar" role="group" aria-label="graph size">
+							<button data-v="320p">320p</button>
+							<button data-v="480p">480p</button>
+							<button data-v="720p">720p</button>
+							<button data-v="1080p">1080p</button>
+							<button data-v="4k">4k</button>
+						</span>
+						<span class="libpick" id="mode-bar" role="group" aria-label="mode">
+							<button data-v="off">off</button>
+							<button data-v="wave">wave</button>
+							<button data-v="storm">storm</button>
+						</span>
+					</div>
+				</div>
 				<section id="hud">
 					<!-- Per-frame and per-sample stats show "<current> / avg <average>"
 					     in one tile: the .now and .avg nodes are bound separately in
@@ -73,20 +73,6 @@
 					<span class="libpick" id="lib-bar" role="group" aria-label="library">
 						<button id="btn-tour" type="button"></button>
 					</span>
-					<span class="libpick" id="tier-bar" role="group" aria-label="graph size">
-						<button data-v="320p">320p</button>
-						<button data-v="480p">480p</button>
-						<button data-v="720p">720p</button>
-						<button data-v="1080p">1080p</button>
-						<button data-v="4k">4k</button>
-					</span>
-					<span class="libpick" id="mode-bar" role="group" aria-label="mode">
-						<button data-v="off">off</button>
-						<button data-v="wave">wave</button>
-						<button data-v="storm">storm</button>
-					</span>
-					<button id="btn-cutoff">equality cutoff: on</button>
-					<button id="btn-invalidate">invalidate everything</button>
 					<span id="note"></span>
 				</section>
 				<section id="activity" aria-label="activity log">
@@ -109,13 +95,11 @@
 					<li><b>memory</b>: arena size is dalien's whole graph at 32 bytes a record; other libraries build heap objects, visible in js heap instead.</li>
 				</ul>
 				<p>
-					Two controls poke the propagation machinery directly and time
-					the result in the status line.
+					Every cell rounds its output to a coarse step, so fading
+					ripples recompute to the value they already held and
+					propagation stops there — the equality cutoff at work across
+					the whole field.
 				</p>
-				<ul class="algo">
-					<li><b>equality cutoff</b>: cells round their output to a coarse step, so fading ripples recompute to the value they already held and stop; disabling it makes the cones visibly taller.</li>
-					<li><b>invalidate everything</b>: writes the one signal every cell reads, recomputing the whole field in a single pass.</li>
-				</ul>
 			</section>
 
 			<section>

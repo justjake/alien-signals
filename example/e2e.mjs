@@ -33,13 +33,6 @@ const HUB_SPACING = 32;
 const hubCount = (w) => Math.max(2, Math.round(w / HUB_SPACING) + 1);
 const TIERS = { '320p': [568, 320], '480p': [854, 480], '720p': [1280, 720] };
 const tierNodes = (tier) => TIERS[tier][0] * TIERS[tier][1] + 2;
-const tierComputeds = (tier) => {
-	const [w, h] = TIERS[tier];
-	const bands = Math.ceil(h / BAND);
-	const signals = w * Math.ceil(bands / 2) + hubCount(w) * Math.floor(bands / 2);
-	return w * h - signals;
-};
-
 const BARS = ['lib-bar', 'tier-bar', 'mode-bar'];
 const BUILD_TIMEOUT_MS = 180_000; // rebuilds create one node + one effect per pixel
 const POLL_MS = 100;
@@ -188,24 +181,6 @@ async function awaitBuildNote(page, lib, tier) {
 	}
 }
 
-// A full-field pass posts "<n> recomputes in <ms> ms" and must not
-// rebuild: same note shape check and node-count identity in one place.
-async function assertTimedPass(page, label, expectedRecomputes) {
-	const nodesBefore = digits(await statText(page, 'stat-nodes'));
-	await page.click(`#${label}`);
-	const text = await noteText(page);
-	const match = text.match(/^([\d,]+) recomputes in ([\d.]+) ms$/);
-	if (!match) die(`#${label} did not post a timed pass; note is "${text}"`);
-	const recomputes = digits(match[1]);
-	if (recomputes < 1) die(`#${label} reported ${recomputes} recomputes`);
-	if (expectedRecomputes !== undefined && recomputes !== expectedRecomputes) {
-		die(`#${label} reported ${recomputes} recomputes, want ${expectedRecomputes}`);
-	}
-	const nodesAfter = digits(await statText(page, 'stat-nodes'));
-	if (nodesAfter !== nodesBefore) die(`#${label} changed the node count ${nodesBefore} -> ${nodesAfter}: it rebuilt`);
-	return text;
-}
-
 // Sample the canvas coarsely: `lit` counts sampled pixels above the
 // near-black floor (the field's base ramp is navy, so a painted frame is
 // almost entirely lit), and `checksum` folds in enough bytes that any
@@ -351,23 +326,6 @@ async function run(page, url) {
 		const nodes = digits(await statText(page, 'stat-nodes'));
 		if (nodes !== tierNodes('720p')) die(`#stat-nodes shows ${nodes}, want ${tierNodes('720p')}`);
 		await assertBars(page, { 'lib-bar': 'dalien-signals', 'tier-bar': '720p', 'mode-bar': 'wave' });
-		return note;
-	});
-
-	await check('equality cutoff: timed pass, no rebuild', async () => {
-		const note = await assertTimedPass(page, 'btn-cutoff');
-		const label = await statText(page, 'btn-cutoff');
-		if (label !== 'equality cutoff: off') die(`cutoff label is "${label}", want "equality cutoff: off"`);
-		return note;
-	});
-
-	await check('invalidate everything: full-field recompute', () =>
-		assertTimedPass(page, 'btn-invalidate', tierComputeds('720p')));
-
-	await check('equality cutoff: restore', async () => {
-		const note = await assertTimedPass(page, 'btn-cutoff');
-		const label = await statText(page, 'btn-cutoff');
-		if (label !== 'equality cutoff: on') die(`cutoff label is "${label}", want "equality cutoff: on"`);
 		return note;
 	});
 

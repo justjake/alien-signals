@@ -4,8 +4,10 @@
 // the FORK's directory chain — alias them (exact matches, subpaths first)
 // to this example's own installed copies so the demo, the selector, and
 // the benchmarks all run identical library builds, locally and in CI.
+import { readFileSync } from 'node:fs';
 import { defineConfig } from 'vite';
 import { fileURLToPath } from 'node:url';
+import { marked } from 'marked';
 const here = (p) => fileURLToPath(new URL(p, import.meta.url));
 // Paths through the fork core's own package links (pnpm symlinks): they
 // resolve wherever the store physically lives, on any machine. A
@@ -17,6 +19,28 @@ const fork = (p) => here(`../../../milomg-reactivity-benchmark/packages/core/nod
 // block for shiki's span-per-token HTML while the page is served (dev) or
 // emitted (build). The browser gets finished markup — no highlighter
 // bundle to download, no post-load repaint to shift the layout.
+// The page's opening section IS the README's opening section: extracted at
+// build time (heading through the paragraph and bullets before the next
+// h2, plus the reference-link definitions so reference-style links
+// resolve) and rendered to HTML in place of the <!-- readme:intro -->
+// marker. Hand-mirrored copies drift; this cannot.
+function readmeIntro() {
+	return {
+		name: 'readme-intro',
+		transformIndexHtml: {
+			order: 'pre',
+			handler(html) {
+				const readme = readFileSync(here('../README.md'), 'utf8');
+				const start = readme.indexOf('# dalien-signals');
+				const end = readme.indexOf('\n## ', start);
+				const linkDefs = [...readme.matchAll(/^\[[^\]]+\]: \S+$/gm)].map((m) => m[0]).join('\n');
+				const intro = marked.parse(readme.slice(start, end) + '\n\n' + linkDefs);
+				return html.replace('<!-- readme:intro -->', intro);
+			},
+		},
+	};
+}
+
 function shikiHighlight() {
 	// index.html authors the samples as escaped HTML; shiki wants source
 	// text and does its own escaping on the way back out.
@@ -55,7 +79,7 @@ function shikiHighlight() {
 }
 
 export default defineConfig({
-	plugins: [shikiHighlight()],
+	plugins: [readmeIntro(), shikiHighlight()],
 	// Two versions of @solidjs/signals are in play: the x-reactivity adapter
 	// uses 0.10.2, while solid-js 2 beta ships against its own matching
 	// beta (0.10.2 lacks exports the beta build imports, e.g.
