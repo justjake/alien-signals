@@ -467,6 +467,12 @@ for (const [key, framework] of Object.entries(FRAMEWORKS)) {
 	b.append(nameLine, statsLine);
 	$('lib-bar').append(b);
 }
+// Explicit row count so the tour toggle can span the full column height:
+// implicit grid rows ignore `grid-row: 1 / -1`.
+$('lib-bar').style.setProperty(
+	'--lib-rows',
+	Math.ceil($('lib-bar').querySelectorAll('button[data-v]').length / 4),
+);
 // Subtitle projection: setup · avg frame · teardown from the library's
 // most recent visit, an em dash per still-unmeasured segment. The visible
 // line is positional to fit the cell; the title spells the labels out.
