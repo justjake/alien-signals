@@ -183,8 +183,17 @@ section > p { max-width: 72ch; color: #b7bdcc; }
 /* the active button's background is bright cyan — keep the subtitle legible */
 #lib-bar .lib-stats .seg { display: inline-flex; align-items: baseline; gap: 4px; text-transform: uppercase; letter-spacing: 0.05em; }
 #lib-bar .lib-stats .seg b { font-weight: 600; font-size: 15px; letter-spacing: 0; text-transform: none; }
-/* the flagship row: dalien's cell carries the accent even when idle */
+/* the flagship row: dalien's cell carries the accent even when idle, and
+   breathes softly until selected so the eye finds it first */
 #lib-bar button[data-v="dalien-signals"] { border-color: #7fd4ff; }
+@keyframes dalien-pulse {
+	0%, 100% { box-shadow: 0 0 0 0 rgba(127, 212, 255, 0); }
+	50% { box-shadow: 0 0 12px 1px rgba(127, 212, 255, 0.4); }
+}
+#controls #lib-bar button[data-v="dalien-signals"]:not(.on) { animation: dalien-pulse 2.8s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) {
+	#controls #lib-bar button[data-v="dalien-signals"]:not(.on) { animation: none; }
+}
 #lib-bar button[data-v="dalien-signals"] .lib-name { color: #7fd4ff; font-weight: 600; }
 #controls #lib-bar button.on[data-v="dalien-signals"] .lib-name { color: #0b0d12; }
 #lib-bar .lib-stats .seg.mount b { color: #7fd4ff; }
