@@ -9,6 +9,11 @@
 // set PW_CHANNEL or PW_EXECUTABLE to point at a different Chrome. Exits
 // non-zero with a message on the first failed check, prints a PASS
 // summary otherwise.
+//
+// A fresh profile has no stored selection, so the library tour boots
+// running and would advance off the boot selection after ~5s. The boot
+// check pauses it through the ⏵/⏸ toggle first; every check that assumes
+// a stable selection runs paused, and the tour checks resume it on purpose.
 import { existsSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { spawn } from 'node:child_process';
@@ -131,6 +136,26 @@ async function assertBars(page, expected) {
 
 const clickButton = (page, barId, value) => page.click(`#${barId} button[data-v="${value}"]`);
 
+// ---- library tour probes ------------------------------------------------------------
+// The toggle's glyph names the action a click performs: ⏸ while the tour
+// runs, ⏵ while it is paused.
+const tourGlyph = (page) => page.evaluate(() => document.getElementById('btn-tour').textContent);
+async function assertTourGlyph(page, want, why) {
+	const glyph = await tourGlyph(page);
+	if (glyph !== want) die(`tour toggle shows "${glyph}", want "${want}" (${why})`);
+	return glyph;
+}
+// A library button's subtitle: "setup·avg/f·teardown" with an em dash per
+// unmeasured segment; data-avg-ms carries the unrounded frame average so a
+// refreshed snapshot is observable even when the rounded text repeats.
+const libSubtitle = (page, key) => page.evaluate((k) => {
+	const line = document.querySelector(`#lib-bar button[data-v="${k}"] .lib-stats`);
+	return { text: line.textContent, avgMs: line.dataset.avgMs ?? null };
+}, key);
+// duration segment -> milliseconds ("890ms" or "2.3s"; "—" comes out NaN)
+const durMs = (seg) => (seg.endsWith('ms') ? Number(seg.slice(0, -2))
+	: seg.endsWith('s') ? Number(seg.slice(0, -1)) * 1000 : NaN);
+
 // Dispatch every click inside one page task: no rAF can fire between
 // them, so this is the tightest interleaving the UI can ever see.
 function rapidClicks(page, barId, values) {
@@ -229,8 +254,14 @@ async function run(page, url) {
 		results.push(`${label}: ${detail}`);
 	};
 
-	await check('boot', async () => {
+	await check('boot: tour runs on a fresh profile; pause it', async () => {
 		await page.goto(url, { waitUntil: 'load' });
+		// No stored selection -> the tour boots running and would advance
+		// off dalien-signals ~5s after its build. Pause before anything else
+		// so the remaining paused-state checks see a stable selection.
+		await assertTourGlyph(page, '⏸', 'fresh profile boots with the tour running');
+		await page.click('#btn-tour');
+		await assertTourGlyph(page, '⏵', 'the toggle pauses the tour');
 		const note = await awaitBuildNote(page, 'dalien-signals', '720p');
 		await assertBars(page, { 'lib-bar': 'dalien-signals', 'tier-bar': '720p', 'mode-bar': 'wave' });
 		return note;
@@ -342,6 +373,69 @@ async function run(page, url) {
 		return awaitBuildNote(page, 'dalien-signals', '320p');
 	});
 
+	await check('tour: resume auto-advances through two stops', async () => {
+		// Resuming lets the current dwell finish, then the tour advances in
+		// bar order: dalien-signals -> alien-signals -> @preact/signals-core.
+		// Each hop is one ~5s dwell plus one 320p build; the second hop is
+		// measured from the previous build note, so it must take at least a
+		// full dwell — proof the advance rides the 5s clock.
+		await assertTourGlyph(page, '⏵', 'paused since boot');
+		await page.click('#btn-tour');
+		await assertTourGlyph(page, '⏸', 'the toggle resumes the tour');
+		const t0 = Date.now();
+		await awaitBuildNote(page, 'alien-signals', '320p');
+		const hop1 = Date.now() - t0;
+		if (hop1 > 30_000) die(`first auto-advance took ${hop1} ms, want within one dwell plus one 320p build`);
+		await assertBars(page, { 'lib-bar': 'alien-signals', 'tier-bar': '320p', 'mode-bar': 'wave' });
+		const t1 = Date.now();
+		await awaitBuildNote(page, '@preact/signals-core', '320p');
+		const hop2 = Date.now() - t1;
+		if (hop2 < 4_500) die(`second auto-advance took ${hop2} ms, want a full ~5s dwell first`);
+		if (hop2 > 30_000) die(`second auto-advance took ${hop2} ms, want within one dwell plus one 320p build`);
+		await assertBars(page, { 'lib-bar': '@preact/signals-core', 'tier-bar': '320p', 'mode-bar': 'wave' });
+		return `dalien→alien in ${hop1} ms, alien→preact in ${hop2} ms`;
+	});
+
+	await check('tour: a library click pauses the rotation', async () => {
+		await clickButton(page, 'lib-bar', 'alien-signals');
+		await awaitBuildNote(page, 'alien-signals', '320p');
+		await assertTourGlyph(page, '⏵', 'a library click pauses the tour');
+		// No advance across a full dwell and change: the explicit choice holds.
+		await sleep(6_000);
+		await assertTourGlyph(page, '⏵', 'still paused after a dwell');
+		return assertBars(page, { 'lib-bar': 'alien-signals', 'tier-bar': '320p', 'mode-bar': 'wave' });
+	});
+
+	await check('tour: subtitle carries the visit stats', async () => {
+		// alien-signals has been set up (the click above), dwelt on (the 6s
+		// just slept), and torn down (left during the tour) — every segment
+		// should carry a plausible number.
+		const sub = await libSubtitle(page, 'alien-signals');
+		const segs = sub.text.split('·');
+		if (segs.length !== 3) die(`subtitle is "${sub.text}", want "setup·avg/f·teardown"`);
+		const setup = durMs(segs[0]);
+		const frame = segs[1].endsWith('ms/f') ? Number(segs[1].slice(0, -4)) : NaN;
+		const teardown = durMs(segs[2]);
+		if (!(setup > 0 && setup < BUILD_TIMEOUT_MS)) die(`setup segment "${segs[0]}" is not a plausible duration`);
+		if (!(frame > 0 && frame < 1_000)) die(`frame segment "${segs[1]}" is not a plausible per-frame average`);
+		if (!(teardown >= 0 && teardown < BUILD_TIMEOUT_MS)) die(`teardown segment "${segs[2]}" is not a plausible duration`);
+		return `"${sub.text}"`;
+	});
+
+	await check('tour: a second dwell refreshes the stats', async () => {
+		// Parked libraries keep their ~5s clock: each dwell end takes a new
+		// snapshot, visible as a fresh unrounded average.
+		const before = await libSubtitle(page, 'alien-signals');
+		if (before.avgMs === null) die('no data-avg-ms after a completed dwell');
+		const deadline = Date.now() + 12_000;
+		for (;;) {
+			const now = await libSubtitle(page, 'alien-signals');
+			if (now.avgMs !== before.avgMs) return `avg ${before.avgMs} -> ${now.avgMs} ms`;
+			if (Date.now() > deadline) die(`data-avg-ms stayed "${before.avgMs}" for 12 s, want a fresh snapshot per dwell`);
+			await sleep(POLL_MS);
+		}
+	});
+
 	await check('library switch to alien-signals', async () => {
 		await clickButton(page, 'lib-bar', 'alien-signals');
 		const note = await awaitBuildNote(page, 'alien-signals', '320p');
@@ -365,13 +459,14 @@ async function run(page, url) {
 
 	await check('activity log narrates the framework switch', async () => {
 		const log = await readActivity(page);
-		// The switch to alien-signals was the last rebuild, so its narration
+		// The tour-pausing click on alien-signals (arriving from the tour's
+		// @preact/signals-core stop) was the last rebuild, so its narration
 		// is the log's tail: frozen average, change line, teardown, setup.
 		const tail = log.lines.slice(-4);
 		const want = [
-			/^dalien-signals: avg frame time \d+(\.\d+)? ms$/,
+			/^@preact\/signals-core: avg frame time \d+(\.\d+)? ms$/,
 			/^framework changed to alien-signals$/,
-			/^dalien-signals: graph teardown (\d+) ms$/,
+			/^@preact\/signals-core: graph teardown (\d+) ms$/,
 			/^alien-signals: graph setup (\d+) ms$/,
 		];
 		for (let k = 0; k < want.length; k++) {
@@ -390,11 +485,14 @@ async function run(page, url) {
 		return `${tail.join(' | ')}; live "${log.live}"`;
 	});
 
-	await check('sticky selection survives reload', async () => {
+	await check('sticky selection survives reload; tour boots paused', async () => {
 		await clickButton(page, 'tier-bar', '720p');
 		await awaitBuildNote(page, 'alien-signals', '720p');
 		await page.reload({ waitUntil: 'load' });
 		const note = await awaitBuildNote(page, 'alien-signals', '720p');
+		// A stored library records a past explicit click, so the reloaded
+		// page must not start touring away from it.
+		await assertTourGlyph(page, '⏵', 'a stored selection boots the tour paused');
 		const dumps = await assertBars(page, { 'lib-bar': 'alien-signals', 'tier-bar': '720p', 'mode-bar': 'wave' });
 		return `${note} — ${dumps}`;
 	});

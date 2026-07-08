@@ -69,14 +69,19 @@ const UNSELECTABLE = new Set(['mol-wire', 'dalien-malloc-free']);
 // the current roster — stale keys from an older deploy fall back to the
 // defaults — and storage access is allowed to fail silently (private
 // mode, file: contexts): stickiness is a nicety, never a boot blocker.
+// A stored library only ever comes from an explicit selection — while the
+// library tour runs, the persistence effect stores the tier alone — so
+// its presence is what tells the next boot to start the tour paused.
 const STICKY_KEY = 'dalien-example-selection';
 function readStickySelection() {
-	const fallback = { lib: 'dalien-signals', tier: '720p' };
+	const fallback = { lib: 'dalien-signals', tier: '720p', paused: false };
 	try {
 		const stored = JSON.parse(localStorage.getItem(STICKY_KEY) ?? '{}');
+		const storedLib = FRAMEWORKS[stored.lib] && !UNSELECTABLE.has(stored.lib) ? stored.lib : undefined;
 		return {
-			lib: FRAMEWORKS[stored.lib] && !UNSELECTABLE.has(stored.lib) ? stored.lib : fallback.lib,
+			lib: storedLib ?? fallback.lib,
 			tier: TIERS[stored.tier] ? stored.tier : fallback.tier,
+			paused: storedLib !== undefined,
 		};
 	} catch {
 		return fallback;
@@ -165,6 +170,69 @@ const liveAvgMs = () => {
 	const avg = frameAvg.average();
 	return Number.isFinite(avg) ? avg : 0;
 };
+
+// ---- library tour -----------------------------------------------------------------
+// The bar visits every selectable library on a ~5s dwell clock. A dwell
+// starts when a build finishes (startDwell in finishRebuild) and ends
+// TOUR_DWELL_MS later: the frame average accumulated since that build is
+// snapshotted onto the library's subtitle, and — when the tour is running —
+// the selection advances to the next stop. While paused the clock keeps
+// running in place, so a parked library's subtitle refreshes with each
+// ~5s of new frames. Booting with a stored selection starts paused: the
+// stored library records a past explicit click, which should hold.
+const TOUR_DWELL_MS = 5000;
+const cycling = signal(!sticky.paused);
+// Per-library subtitle stats, each field recorded where it is measured:
+// setupMs when a build succeeds, teardownMs when the library is left (it
+// is unknowable sooner), frameAvgMs at dwell end. One signal-of-map keeps
+// the subtitles a pure projection; writes replace the map so the render
+// effect reruns on any change.
+const libStats = signal(new Map());
+function recordLibStats(name, patch) {
+	const next = new Map(libStats());
+	next.set(name, { ...next.get(name), ...patch });
+	libStats(next);
+}
+// The tour's stops are the bar's buttons in bar order, minus tc39-signals:
+// the polyfill's Watcher.unwatch scans every watched producer per call, so
+// disposing the field's render effects is quadratic — ~55s of frozen tab
+// when leaving it at 320p, far worse at 720p. Selecting it by hand still
+// works and still records its stats; the tour just never drives through
+// it. A library whose build fails during the tour joins tourFailed so the
+// rotation advances past it instead of wedging on the failure.
+const TOUR_SKIP = new Set(['tc39-signals']);
+const tourFailed = new Set();
+const TOUR_ORDER = Object.keys(FRAMEWORKS).filter((key) => !UNSELECTABLE.has(key));
+function nextTourStop(from) {
+	const at = TOUR_ORDER.indexOf(from);
+	for (let step = 1; step <= TOUR_ORDER.length; step++) {
+		const key = TOUR_ORDER[(at + step) % TOUR_ORDER.length];
+		if (!TOUR_SKIP.has(key) && !tourFailed.has(key)) return key;
+	}
+	return undefined; // every stop skipped or failed — nowhere to advance
+}
+let dwellTimer;
+let dwellLib; // the library whose ~5s visit clock is running
+function startDwell(name) {
+	clearTimeout(dwellTimer);
+	dwellLib = name;
+	dwellTimer = setTimeout(endDwell, TOUR_DWELL_MS);
+}
+function endDwell() {
+	// ~5s of frames since this library's build finished: the rolling frame
+	// average was reset at that build, so it is exactly this visit's reading.
+	const avg = frameAvg.average();
+	if (Number.isFinite(avg)) recordLibStats(dwellLib, { frameAvgMs: avg });
+	if (cycling()) {
+		const next = nextTourStop(dwellLib);
+		if (next !== undefined) {
+			libName(next); // the rebuild effect takes over; the next dwell starts at finishRebuild
+			return;
+		}
+		cycling(false); // nowhere to advance — park here
+	}
+	startDwell(dwellLib); // paused: refresh this library's stats every ~5s
+}
 // The whole render bundle — runtime, graph, size-matched buffers — is one
 // signal, rebuilt when the library or tier changes. A sticky selection
 // can boot straight into a heavy tier; if this machine refuses it (the
@@ -346,11 +414,15 @@ if (bootError) {
 	logAppend({ text: `${sticky.lib} @ ${sticky.tier}: build failed on boot — ${String(bootError)}`, error: true });
 }
 logAppend(`${libName()}: graph setup ${bootSetupMs.toFixed(0)} ms`);
+recordLibStats(libName(), { setupMs: bootSetupMs });
 
-// state => persistence: one effect mirrors the selection pair into
-// storage whenever either changes; a write failure is silently ignored.
+// state => persistence: one effect mirrors the selection into storage
+// whenever it changes; a write failure is silently ignored. While the
+// tour runs, the library is a transient stop, not a choice to restore —
+// only the tier persists then, and the absent lib key is what makes the
+// next boot start the tour running (see readStickySelection).
 effect(() => {
-	const value = JSON.stringify({ lib: libName(), tier: tierName() });
+	const value = JSON.stringify(cycling() ? { tier: tierName() } : { lib: libName(), tier: tierName() });
 	try {
 		localStorage.setItem(STICKY_KEY, value);
 	} catch {
@@ -378,17 +450,56 @@ function radioGroup(barId, read, write) {
 }
 // The library bar is generated from the frameworks map, so the selector
 // can never drift from the set of imported adapters (UNSELECTABLE keys
-// excluded, see above). data-v carries the key makeRuntime receives; the
-// label is the adapter's display name. Buttons must exist before
-// radioGroup snapshots the group.
+// excluded, see above). data-v carries the key makeRuntime receives. Each
+// button holds two fixed lines — the adapter's display name over the
+// visit-stats subtitle — so a stat appearing never resizes its cell.
+// Buttons must exist before radioGroup snapshots the group.
 for (const [key, framework] of Object.entries(FRAMEWORKS)) {
 	if (UNSELECTABLE.has(key)) continue;
 	const b = document.createElement('button');
 	b.dataset.v = key;
-	b.textContent = framework.name;
+	b.title = framework.name; // long names ellipsize in the grid cell
+	const nameLine = document.createElement('span');
+	nameLine.className = 'lib-name';
+	nameLine.textContent = framework.name;
+	const statsLine = document.createElement('span');
+	statsLine.className = 'lib-stats';
+	b.append(nameLine, statsLine);
 	$('lib-bar').append(b);
 }
+// Subtitle projection: setup · avg frame · teardown from the library's
+// most recent visit, an em dash per still-unmeasured segment. The visible
+// line is positional to fit the cell; the title spells the labels out.
+// data-avg-ms carries the unrounded average so a fresh snapshot is
+// observable even when the rounded text comes out identical.
+const fmtDur = (ms) => (ms === undefined ? '—' : ms < 999.5 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`);
+const fmtFrameAvg = (ms) => (ms === undefined ? '—' : `${ms.toFixed(1)}ms/f`);
+{
+	const lines = [...$('lib-bar').querySelectorAll('button[data-v] .lib-stats')];
+	effect(() => {
+		const stats = libStats();
+		for (const line of lines) {
+			const s = stats.get(line.parentElement.dataset.v);
+			line.textContent = `${fmtDur(s?.setupMs)}·${fmtFrameAvg(s?.frameAvgMs)}·${fmtDur(s?.teardownMs)}`;
+			line.title = `setup ${fmtDur(s?.setupMs)} · avg frame ${fmtFrameAvg(s?.frameAvgMs)} · teardown ${fmtDur(s?.teardownMs)}`;
+			if (s?.frameAvgMs !== undefined) line.dataset.avgMs = String(s.frameAvgMs);
+		}
+	});
+}
 radioGroup('lib-bar', libName, libName);
+// An explicit library choice holds: clicking any library pauses the tour.
+// The toggle carries no data-v, so it is not a choice — it flips the tour,
+// and resuming advances at the current dwell's end rather than instantly.
+$('lib-bar').addEventListener('click', (e) => {
+	if (e.target.closest('button[data-v]')) cycling(false);
+});
+$('btn-tour').addEventListener('click', () => cycling(!cycling()));
+effect(() => {
+	const on = cycling();
+	const btn = $('btn-tour');
+	btn.textContent = on ? '⏸' : '⏵'; // the glyph names the action a click performs
+	btn.title = on ? 'pause the library tour' : 'play the library tour';
+});
 radioGroup('tier-bar', tierName, tierName);
 radioGroup('mode-bar', mode, mode);
 
@@ -425,6 +536,9 @@ effect(() => {
 	// The running view already shows this pair: the effect's initial run,
 	// or the selection was just put back after a failed build.
 	if (name === builtName && tier === builtTier) return;
+	// A new selection ends the current visit: stop its dwell clock now so a
+	// stale snapshot can't land (or advance the tour) while graphs swap.
+	clearTimeout(dwellTimer);
 	const seq = ++buildSeq;
 	building(true);
 	note(`building ${name} @ ${tier}…`);
@@ -450,7 +564,11 @@ effect(() => {
 		const teardownT0 = performance.now();
 		view().rt.dispose();
 		if (builtName !== undefined) {
-			logAppend(`${builtName}: graph teardown ${(performance.now() - teardownT0).toFixed(0)} ms`);
+			// Teardown is only knowable on the way out — write it back onto
+			// the outgoing library's subtitle.
+			const teardownMs = performance.now() - teardownT0;
+			logAppend(`${builtName}: graph teardown ${teardownMs.toFixed(0)} ms`);
+			recordLibStats(builtName, { teardownMs });
 		}
 		let next;
 		const setupT0 = performance.now();
@@ -460,6 +578,20 @@ effect(() => {
 			// The note stays concise; the log line carries the whole error.
 			note(`build failed for ${name} @ ${tier} — ${err?.message ?? err}`);
 			logAppend({ text: `${name} @ ${tier}: build failed — ${String(err)}`, error: true });
+			// A failure during the tour must not wedge the rotation: skip
+			// this library for the rest of the session and advance to the
+			// next stop immediately. The old graph is already freed, so the
+			// advance is an ordinary rebuild with no built pair behind it.
+			if (cycling()) {
+				tourFailed.add(name);
+				const nextStop = nextTourStop(name);
+				if (nextStop !== undefined) {
+					builtName = builtTier = undefined;
+					libName(nextStop);
+					return;
+				}
+				cycling(false); // nowhere left to advance — fall through to the manual retry path
+			}
 			// The old graph is already freed, so put the selection back and
 			// clear the built pair: the rebuild effect sees the reverted
 			// selection as new work and rebuilds it from scratch. If this
@@ -481,7 +613,9 @@ effect(() => {
 			}
 			return;
 		}
-		logAppend(`${name}: graph setup ${(performance.now() - setupT0).toFixed(0)} ms`);
+		const setupMs = performance.now() - setupT0;
+		logAppend(`${name}: graph setup ${setupMs.toFixed(0)} ms`);
+		recordLibStats(name, { setupMs });
 		builtName = name;
 		builtTier = tier;
 		view(next);
@@ -499,6 +633,7 @@ function finishRebuild(name, tier) {
 	runningLib(name); // the live log line starts averaging under the new name
 	building(false);
 	note(`${name} @ ${tier}: ${v.graph.nodes.toLocaleString()} nodes built in ${v.graph.buildMs.toFixed(1)} ms`);
+	startDwell(name); // this visit's ~5s clock starts once the graph is running
 }
 
 // ---- input => state --------------------------------------------------------------

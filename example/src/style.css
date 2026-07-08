@@ -139,6 +139,52 @@ section > p { max-width: 72ch; color: #b7bdcc; }
 #controls .libpick button:last-child { border-right: 0; }
 #controls .libpick button.on { background: #7fd4ff; color: #0b0d12; font-weight: 600; }
 
+/* Library tour bar: one fixed-track grid — a narrow toggle column, then
+   eight equal columns, so the sixteen libraries land on two rows at full
+   width. Track sizes come from the container, and the subtitle line always
+   renders (— placeholders), so a button never resizes as stats appear —
+   the HUD's no-jitter discipline. */
+#lib-bar {
+	flex: 1 0 100%;
+	display: grid;
+	grid-template-columns: auto repeat(8, minmax(0, 1fr));
+	gap: 4px;
+	border: 0;
+	border-radius: 0;
+	overflow: visible;
+}
+#controls #lib-bar button {
+	border: 1px solid #2a3040;
+	border-radius: 6px;
+	padding: 4px 7px;
+	text-align: left;
+	min-width: 0;
+	display: grid;
+	align-content: center;
+}
+#lib-bar .lib-name {
+	display: block;
+	font-size: 12.5px;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+#lib-bar .lib-stats {
+	display: block;
+	font: 9px/1.7 ui-monospace, SFMono-Regular, Menlo, monospace;
+	font-variant-numeric: tabular-nums;
+	color: #5b667e;
+	white-space: nowrap;
+	overflow: hidden;
+}
+/* the active button's background is bright cyan — keep the subtitle legible */
+#controls #lib-bar button.on .lib-stats { color: #0b0d12; opacity: 0.7; }
+/* triple-id selector: the shared cell rule above is #controls #lib-bar button */
+#controls #lib-bar #btn-tour { grid-row: span 2; font-size: 16px; padding: 4px 10px; text-align: center; }
+@media (max-width: 720px) {
+	#lib-bar { grid-template-columns: auto repeat(4, minmax(0, 1fr)); }
+}
+
 #w-bench .actions { display: flex; gap: 12px; align-items: center; margin: 14px 0; }
 #w-bench button { background: #161a24; color: #e8eaf0; border: 1px solid #2a3040; padding: 7px 14px; border-radius: 6px; font: inherit; cursor: pointer; }
 #w-bench button:disabled { opacity: 0.5; cursor: default; }
