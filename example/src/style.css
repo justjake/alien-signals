@@ -29,8 +29,18 @@ canvas {
 }
 .stat { min-width: 0; }
 .stat > span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.stat > span { display: block; font-size: 22px; font-variant-numeric: tabular-nums; }
-.stat .avg { font-size: 14px; color: #9aa1b2; }
+.stat > span { display: block; font-size: 21px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+/* Decimal alignment: the current value renders right-aligned inside a
+   fixed slot sized per metric (ch is exact in monospace), so the units
+   digit and the avg segment hold position when a value crosses a
+   magnitude ("9.8%" -> "10.4%"). Slots fit each metric's widest reading. */
+.stat .now { display: inline-block; text-align: right; }
+#stat-recomputed .now { min-width: 7ch; }
+#stat-share .now { min-width: 5ch; }
+#stat-frame .now { min-width: 9ch; }
+#stat-fps .now { min-width: 3ch; }
+#stat-heap .now { min-width: 9ch; }
+.stat .avg { font-size: 13px; color: #9aa1b2; }
 .stat label { color: #9aa1b2; font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; }
 #controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 #controls button {
