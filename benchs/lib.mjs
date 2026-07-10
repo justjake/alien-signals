@@ -21,11 +21,13 @@ export const INK2 = '#52514e';
 export const INK3 = '#8a8984';
 export const GRID = '#e8e8e6';
 
-/** Parse the isolated-runner CSV: rows of `framework , test , time`. */
+/** Parse the isolated-runner CSV: rows of `framework , test , time , ...`.
+ * The fork appends memory columns after time (additive; not charted yet), so
+ * accept any row with at least the three timing columns and read only those. */
 export function parseResults(text) {
 	return text.split('\n')
 		.map((l) => l.split(',').map((p) => p.trim()))
-		.filter((p) => p.length === 3 && p[0] !== 'framework' && Number.isFinite(Number(p[2])))
+		.filter((p) => p.length >= 3 && p[0] !== 'framework' && Number.isFinite(Number(p[2])))
 		.map(([framework, test, time]) => ({ framework, test, time: Number(time) }));
 }
 

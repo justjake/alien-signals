@@ -23,7 +23,10 @@ const samples = new Map(); // "fw,test" -> number[]; insertion order preserved
 for (const path of inputs) {
 	for (const line of readFileSync(path, 'utf8').split('\n')) {
 		const parts = line.split(',').map((p) => p.trim());
-		if (parts.length !== 3 || parts[0] === 'framework' || !Number.isFinite(Number(parts[2]))) continue;
+		// Rounds from the fork carry additive memory columns after time. The
+		// merged CSV stays timing-only for now (charts don't read memory yet);
+		// the per-round artifacts keep the full rows.
+		if (parts.length < 3 || parts[0] === 'framework' || !Number.isFinite(Number(parts[2]))) continue;
 		const key = `${parts[0]},${parts[1]}`;
 		if (!samples.has(key)) samples.set(key, []);
 		samples.get(key).push(Number(parts[2]));
