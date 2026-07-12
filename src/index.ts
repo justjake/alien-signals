@@ -510,12 +510,21 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 		++M[SysSlot.EnterDepth];
 		++runDepth;
 		try {
-			cleanups[idx] = fn() as (() => void) | void;
-		} finally {
-			--runDepth;
-			--M[SysSlot.EnterDepth];
-			activeSub = prevSub;
-			M[id + NodeSlot.Flags] &= ~Flag.RecursedCheck;
+			try {
+				cleanups[idx] = fn() as (() => void) | void;
+			} finally {
+				--runDepth;
+				--M[SysSlot.EnterDepth];
+				activeSub = prevSub;
+				M[id + NodeSlot.Flags] &= ~Flag.RecursedCheck;
+			}
+		} catch (e) {
+			// A throwing FIRST run has no stop callable: dispose instead of
+			// leaving a half-armed effect that re-runs but can never be
+			// stopped. Runs after the frame restore above, so the teardown's
+			// cleanup cascades are not tracked into the dying record.
+			disposeEffect(id);
+			throw e;
 		}
 		return id;
 	}
@@ -551,11 +560,19 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 		}
 		++M[SysSlot.EnterDepth];
 		try {
-			fn();
-		} finally {
-			--M[SysSlot.EnterDepth];
-			activeSub = prevSub;
-			currentScope = prevScope;
+			try {
+				fn();
+			} finally {
+				--M[SysSlot.EnterDepth];
+				activeSub = prevSub;
+				currentScope = prevScope;
+			}
+		} catch (e) {
+			// Same contract as effectId: a throwing first run disposes the
+			// scope — its record, its region, and the children created
+			// before the throw — instead of leaking an unstoppable group.
+			disposeEffect(id);
+			throw e;
 		}
 		return id;
 	}
