@@ -174,9 +174,10 @@ export const enum LinkSlot {
 	PrevDep = 5,
 	NextDep = 6,
 	/**
-	 * Free-list thread. Freed links keep every REAL field intact: walks may
-	 * deliberately read stale nextDep/nextSub off links unlinked earlier in
-	 * the same pass, and those must name former neighbors, never the list.
+	 * Reserved (formerly the free-list thread; free records now live in the
+	 * EngineState stacks). Freed links keep every REAL field intact: walks
+	 * may deliberately read stale nextDep/nextSub off links unlinked earlier
+	 * in the same pass, and those must name former neighbors, never the list.
 	 */
 	FreeNext = 7,
 }
@@ -591,8 +592,10 @@ function cloneWorks(): boolean {
 		};
 		const probe = compile()(64, undefined, {
 			recNext: 8,
-			nodeFreeHead: 0,
-			linkFreeHead: 0,
+			nodeFreeStack: new Int32Array(64),
+			nodeFreeCount: 0,
+			linkFreeStack: new Int32Array(64),
+			linkFreeCount: 0,
 		}, dummy);
 		dummy.inner = probe;
 		// Exercise create, flags, edges, staleness resolution: any unresolved
@@ -643,8 +646,15 @@ function instantiateEngine(records: number, from: Int32Array | undefined, boot: 
 /** Hot per-generation counters handed from a retiring engine to its successor. */
 interface EngineState {
 	recNext: number;
-	nodeFreeHead: number;
-	linkFreeHead: number;
+	// Free records as explicit stacks: a pop is an independent indexed load,
+	// while a next-pointer threaded through the record chains a dependent
+	// memory read through every allocation. Entries at [0, count) are free.
+	// The arrays ride between generations by reference; record ids are
+	// arena-relative and survive growth verbatim, so no fixup is needed.
+	nodeFreeStack: Int32Array;
+	nodeFreeCount: number;
+	linkFreeStack: Int32Array;
+	linkFreeCount: number;
 }
 
 /**
@@ -754,8 +764,10 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 		shared.registry = makeRegistry();
 		const engine = instantiateEngine(configuredRecords, undefined, {
 			recNext: 8,
-			nodeFreeHead: 0,
-			linkFreeHead: 0,
+			nodeFreeStack: new Int32Array(1024),
+			nodeFreeCount: 0,
+			linkFreeStack: new Int32Array(1024),
+			linkFreeCount: 0,
 		}, shared);
 		shared.inner = engine;
 		for (let i = 0; i < allocatedCallbacks.length; i++) {
@@ -1013,8 +1025,10 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 
 	// Hot per-generation counters, handed off through boot/state().
 	let recNext = boot.recNext; // bump pointer, nodes and links (record 0 burned)
-	let nodeFreeHead = boot.nodeFreeHead; // free list threaded through M[id + NodeSlot.Deps]
-	let linkFreeHead = boot.linkFreeHead; // free list threaded through M[id + LinkSlot.NextDep]
+	let nodeFreeStack = boot.nodeFreeStack; // free node records, entries at [0, count)
+	let nodeFreeCount = boot.nodeFreeCount;
+	let linkFreeStack = boot.linkFreeStack; // free link records, entries at [0, count)
+	let linkFreeCount = boot.linkFreeCount;
 	// Tracking state (the active subscriber, run depth, batching) is the
 	// HOST's, as module or closure lets on its side of the seam — exactly
 	// upstream's split. Enter depth (live frames holding the arena; 0 = an
@@ -1022,7 +1036,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 	// host brackets its own user-code frames with it.
 
 	function snapshot(): EngineState {
-		return { recNext, nodeFreeHead, linkFreeHead };
+		return { recNext, nodeFreeStack, nodeFreeCount, linkFreeStack, linkFreeCount };
 	}
 
 	// Persistent scratch stacks (upstream's cons-cell Stack<T>). Re-entrant
@@ -1047,6 +1061,18 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		checkStack = bigger;
 	}
 
+	function growNodeFreeStack(): void {
+		const bigger = new Int32Array(nodeFreeStack.length * 2);
+		bigger.set(nodeFreeStack);
+		nodeFreeStack = bigger;
+	}
+
+	function growLinkFreeStack(): void {
+		const bigger = new Int32Array(linkFreeStack.length * 2);
+		bigger.set(linkFreeStack);
+		linkFreeStack = bigger;
+	}
+
 	// A retired engine's create/free entry points forward to shared.inner (the
 	// current generation): allocation calls in flight across a growth keep
 	// working at one extra hop. Set at most once, at an operation boundary.
@@ -1055,6 +1081,14 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 	function retire(): void {
 		retired = true;
 		M.fill(0, 0, recNext);
+		// Detach the free stacks: the live arrays ride to the next generation
+		// by reference through snapshot(), so a stale caller reaching this
+		// closure's unguarded free paths must write into dead private arrays —
+		// the same isolation the zeroed arena gives stale record reads.
+		nodeFreeStack = new Int32Array(64);
+		nodeFreeCount = 0;
+		linkFreeStack = new Int32Array(64);
+		linkFreeCount = 0;
 	}
 
 	// Local aliases for the shared side arrays (stable identities): one load
@@ -1127,8 +1161,13 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		function resetState(): void {
 			M.fill(0, 0, recNext);
 			recNext = 8;
-			nodeFreeHead = 0;
-			linkFreeHead = 0;
+			// Fresh stacks, not just zeroed counts: reset is the bulk-teardown
+			// seam, and a stack grown for a huge graph must not pin its peak
+			// capacity for the process lifetime.
+			nodeFreeStack = new Int32Array(1024);
+			nodeFreeCount = 0;
+			linkFreeStack = new Int32Array(1024);
+			linkFreeCount = 0;
 			pendingFree.length = 0;
 			shared.pendingFreeEnd = 0;
 			// The host's globalVersion/cycle counters keep counting: fresh
@@ -1179,23 +1218,13 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		}
 
 		function freeRecordCounts(): { freeNodeRecords: number; freeLinkRecords: number } {
-			let freeNodeRecords = 0;
-			for (let id = nodeFreeHead; id !== 0; id = M[id + NodeSlot.Deps]) {
-				++freeNodeRecords;
-			}
-			let freeLinkRecords = 0;
-			for (let id = linkFreeHead; id !== 0; id = M[id + LinkSlot.FreeNext]) {
-				++freeLinkRecords;
-			}
-			return { freeNodeRecords, freeLinkRecords };
+			return { freeNodeRecords: nodeFreeCount, freeLinkRecords: linkFreeCount };
 		}
 
 		function allocNode(flags: number): number {
 			let id: number;
-			if (nodeFreeHead !== 0) {
-				id = nodeFreeHead;
-				nodeFreeHead = M[id + NodeSlot.Deps];
-				M[id + NodeSlot.Deps] = 0;
+			if (nodeFreeCount !== 0) {
+				id = nodeFreeStack[--nodeFreeCount];
 			} else {
 				id = recNext;
 				if (id >= M.length) {
@@ -1221,8 +1250,14 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			M[id + NodeSlot.Subs] = 0;
 			M[id + NodeSlot.SubsTail] = 0;
 			++M[id + NodeSlot.Gen];
-			M[id + NodeSlot.Deps] = nodeFreeHead;
-			nodeFreeHead = id;
+			M[id + NodeSlot.Deps] = 0;
+			if (id === 0) {
+				return; // the burned system record must never reach the free stack
+			}
+			if (nodeFreeCount === nodeFreeStack.length) {
+				growNodeFreeStack();
+			}
+			nodeFreeStack[nodeFreeCount++] = id;
 		}
 
 		function sweepPendingFree(): void {
@@ -1231,79 +1266,41 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 				return;
 			}
 			const end = shared.pendingFreeEnd;
-			// A whole-arena teardown rebuilds both free lists in ascending
-			// record order. Free lists are LIFO, so without this the highest
-			// records come back first and the next build scatters across the
-			// arena: value columns go sparse (dictionary-mode side columns)
-			// and neighbouring nodes lose cache adjacency. Sorting restores
-			// dense, near-sequential reuse. (Measured: rebuilding a 2M-node
-			// graph after a full dispose went from ~30s to build-from-fresh
-			// speed.) The trigger is proportional — the freed nodes must be a
-			// sizable fraction of everything allocated — so steady churn of
-			// small graphs never pays the sort or the free-list walk; only
-			// tearing down most of the arena does.
+			// A whole-arena teardown re-sorts both free stacks so reuse comes
+			// back in ascending record order. The stacks are LIFO, so without
+			// this the highest records come back first and the next build
+			// scatters across the arena: value columns go sparse
+			// (dictionary-mode side columns) and neighbouring nodes lose cache
+			// adjacency. Sorting restores dense, near-sequential reuse.
+			// (Measured: rebuilding a 2M-node graph after a full dispose went
+			// from ~30s to build-from-fresh speed.) The trigger is
+			// proportional — the freed nodes must be a sizable fraction of
+			// everything allocated — so steady churn of small graphs never
+			// pays the sort; only tearing down most of the arena does.
+			for (let i = 0; i < end; ++i) {
+				freeNode(pendingFree[i]);
+			}
 			if (end > MASS_TEARDOWN_RECORDS && end * 64 >= recNext) {
-				const batch = new Int32Array(end);
-				for (let i = 0; i < end; ++i) {
-					batch[i] = pendingFree[i];
-				}
-				batch.sort();
-				// Push in descending order so pops come off ascending.
-				for (let i = end - 1; i >= 0; --i) {
-					freeNode(batch[i]);
-				}
-				sortLinkFreeList();
-			} else {
-				for (let i = 0; i < end; ++i) {
-					freeNode(pendingFree[i]);
-				}
+				// Pops take the stack's end, so descending order in memory hands
+				// out ascending record ids. This also re-sorts entries freed
+				// before this sweep — strictly denser than ordering the batch
+				// alone.
+				sortStackForAscendingPops(nodeFreeStack, nodeFreeCount);
+				sortStackForAscendingPops(linkFreeStack, linkFreeCount);
 			}
 			shared.pendingFreeEnd = 0;
 		}
 
-		function sortLinkFreeList(): void {
-			// ONE pass over the LIFO list marks members in a bitmap and counts
-			// them; free-list order never matters again after this, so sorted
-			// order is recovered by scanning the bitmap ascending and
-			// rethreading — no second pointer-chase walk over the arena and no
-			// comparison sort. The list walk is unavoidably random-access; the
-			// bitmap scan and the rethreading stores both ascend, so hardware
-			// prefetch covers them.
-			let n = 0;
-			const words = new Uint32Array(((recNext >> 3) + 32) >> 5);
-			for (let id = linkFreeHead; id !== 0; id = M[id + LinkSlot.FreeNext]) {
-				const rec = id >> 3;
-				words[rec >> 5] |= 1 << (rec & 31);
-				++n;
-			}
-			if (n <= MASS_TEARDOWN_RECORDS) {
-				return; // below the mass threshold: keep LIFO order, drop the bitmap
-			}
-			let head = 0;
-			let tail = 0; // last rethreaded id; 0 until the first member
-			for (let w = 0; w < words.length; ++w) {
-				let bits = words[w];
-				while (bits !== 0) {
-					const bit = bits & -bits;
-					bits ^= bit;
-					const id = ((w << 5) + (31 - Math.clz32(bit))) << 3;
-					if (!tail) {
-						head = id;
-					} else {
-						M[tail + LinkSlot.FreeNext] = id;
-					}
-					tail = id;
-				}
-			}
-			M[tail + LinkSlot.FreeNext] = 0;
-			linkFreeHead = head;
+		function sortStackForAscendingPops(stack: Int32Array, count: number): void {
+			const live = stack.subarray(0, count);
+			live.sort();
+			live.reverse();
 		}
 
 		function allocLink(): number {
 			let id: number;
-			if (linkFreeHead !== 0) {
-				id = linkFreeHead;
-				linkFreeHead = M[id + LinkSlot.FreeNext];
+			if (linkFreeCount !== 0) {
+				id = linkFreeStack[--linkFreeCount];
 			} else {
 				id = recNext;
 				if (id >= M.length) {
@@ -1319,8 +1316,13 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		}
 
 		function freeLink(id: number): void {
-			M[id + LinkSlot.FreeNext] = linkFreeHead;
-			linkFreeHead = id;
+			if (id === 0) {
+				return; // the burned system record must never reach the free stack
+			}
+			if (linkFreeCount === linkFreeStack.length) {
+				growLinkFreeStack();
+			}
+			linkFreeStack[linkFreeCount++] = id;
 		}
 
 		// ---- graph kernel (upstream system.ts, transliterated) ----------------
