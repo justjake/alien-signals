@@ -1,10 +1,12 @@
-# Design v4: detached signal records (default signal callables stop using the FinalizationRegistry)
+# Design v5: detached signal records (default signal callables stop using the FinalizationRegistry)
 
-Status: v4 DRAFT — fourth revision. v1 refuted outright (reviews -a, -b);
-v2 materially sounder, refuted on boundaries (-a2, -b2); v3 refuted on its
-hardening mechanisms (-a3, -b3) — which in the process surfaced three
-pre-existing kernel bugs this revision turns into named prerequisite
-fixes. Resolution maps for all rounds are at the end.
+Status: v5 DRAFT — fifth revision. v1 refuted outright (reviews -a, -b);
+v2 sounder, refuted on boundaries (-a2, -b2); v3 refuted on its gate
+mechanism (-a3, -b3); v4 refuted on two residues (-a4, -b4): frame-saved
+subscriber ids need generation validation, not liveness validation, and
+deferred growth can never run at frame exits. The review rounds have
+surfaced FOUR pre-existing kernel/host bugs, each now a named
+prerequisite fix. Resolution maps for all rounds are at the end.
 
 ## Problem
 
@@ -26,7 +28,7 @@ Every other path keeps its current reclaimer. Precisely:
 | raw `signalId(v)` at top level | `dispose()` / `reset()` | unchanged |
 | raw `signalId(v)` inside a scope | scope region | unchanged |
 | `computed()` / `computedId` | registry (at creation) | unchanged |
-| effects / scopes | explicit stop, disposer registry net | unchanged |
+| effects / scopes | explicit stop only | unchanged |
 
 Note on today's behavior this table encodes: a default callable created
 inside a scope is **not** region-owned today (region membership requires
@@ -88,7 +90,7 @@ name a real node) and `value`. Nothing else happens.
    arena between the allocation and the link insert, and any throw —
    including record allocation hitting the hard capacity limit at step
    1 — unwinds the bracket, so maintenance and reset stay reachable
-   (hardening 5's exit check may then grow the arena);
+   (growth, per hardening 5, happens only on the microtask path or an explicit growCapacity call — never at the exit itself);
 2. seed **both** `currentVals[idx]` and `pendingVals[idx]` with the
    closure value (seeding only one produces a spurious first-write
    invalidation, v1 finding 7);
@@ -162,64 +164,100 @@ the frame lifecycle itself. Five hardenings close them at the source.
 Each is an independent bug fix against today's code; the first three fix
 corruption or leaks that are reachable today without this design.
 
-**Hardening 1 — disposing the active subscriber ends tracking.** When
-disposal reaches a record that is the current `activeSub` (an effect
-stopping itself mid-run, a computed disposed from inside its own getter,
-a manual frame whose subscriber is disposed before the frame ends),
-`activeSub` becomes 0 on the spot. Every site that restores a saved
-subscriber (the public frame setter and the run/update/trigger exits)
-validates the saved id's live flag first and restores 0 for a dead one —
-so a stale id can never be re-installed after its record was freed or
-recycled. Consequences: reads in a doomed frame are simply untracked
-(a detached signal read there returns its closure value and never
-attaches — no link, no gate, no refusal case, nothing to roll back), and
-tracking can never be attributed to a recycled record's new occupant,
-because a dead id never survives inside `activeSub`. One semantic pinned
-by test: an effect that stops itself and then spawns a replacement child
-creates that child in an untracked context — the child becomes a root
-effect and survives, matching today's observable behavior.
+**Hardening 1 — saved subscriber identity is an (id, generation) pair,
+and every free clears the live caches.** Bare record ids are
+identity-blind: a freed record can be recycled, and its new occupant is
+live, so no liveness test on a saved id can ever be sound — this killed
+the v3 link gate and the v4 restore validation alike. The record
+generation counter that already exists is the identity the frames need:
 
-**Hardening 2 — disposal unlinks the full dependency list, walking
-forward from the list head.** Today's teardown walks backward from the
-dependency-tail cursor, which a RUNNING frame has reset to zero — so
-disposing a running subscriber unlinks nothing and leaves its old edges
-alive in every dependency's subscriber list (reachable today; the edges
-survive the record's reclamation and later misattribute propagation to
-whatever recycles the record). A forward walk from the head is complete
-regardless of cursor state and idempotent (the head empties as it goes),
-which also fixes the double-teardown corruption for computeds, where the
-unwatched cleanup and the disposal path each run a backward walk today.
+- every site that SAVES the current subscriber to restore later — the
+  public frame setter and the exits of run, update, trigger, effect
+  creation, scope creation, and cleanup invocation (all seven; the v4
+  review enumerated them) — saves the (id, generation) pair and restores
+  0 when the generation no longer matches;
+- the same discipline covers the two cached-id channels that are not the
+  active subscriber: the current scope and the trigger scratch record;
+- the CLEAR side rides the existing freed-notification seam: every
+  record free (explicit dispose, scope-region teardown, registry
+  reclamation) already dispatches the host's freed hook, which now also
+  compares the freed id against the active subscriber, current scope,
+  and trigger scratch, and zeroes any match — so a doomed frame stops
+  tracking at the moment of the free, whatever path freed it, and no
+  window exists between a free and the next restore.
+
+Consequences: reads in a doomed frame are simply untracked (a detached
+signal read there returns its closure value and never attaches), a
+recycled record can never inherit a stale frame (generation mismatch
+restores 0), and tracking can never be attributed to a recycled
+occupant. One semantic pinned by test: an effect that stops itself and
+then spawns a replacement child creates that child in an untracked
+context — the child becomes a root effect and survives.
+
+**Hardening 2 — disposal unlinks the full dependency list by
+repeatedly consuming the list HEAD.** Today's teardown walks backward
+from the dependency-tail cursor, which a RUNNING frame has reset to
+zero — so disposing a running subscriber unlinks nothing and leaves its
+old edges alive in every dependency's subscriber list (reachable today).
+The replacement loop is normatively "unlink whatever the head slot
+currently names, until it names nothing": re-reading the head each
+iteration — never a cached next pointer — is what makes the walk correct
+under re-entrancy, because an unlinked child's own cleanup can dispose
+siblings and recycle link records mid-walk. This also fixes the
+double-teardown corruption for computeds (the second walk finds an empty
+head and stops). Pinned semantic change: child cleanups now run in
+creation order rather than newest-first; the reset path keeps its own
+separately documented newest-first order. A test pins the new order.
 
 **Hardening 3 — the unwatched dependency-drop of a computed that is
-mid-update is deferred to its update exit.** Today the drop runs
-synchronously inside the unlink cascade even when the computed's own
-getter is on the stack, leaving the running frame's dependency-tail
-cursor pointing at a freed link; the next link insertion can pop that
-same link off the free stack and stitch a self-referential dependency
-list (an unbounded unlink loop — reachable today). Deferral: the
-unwatched dispatch, on finding the computed mid-update, sets a pending
-bit instead of dropping; the update exit performs the drop if the bit is
-set. A computed that was never watched never receives the dispatch, so
-lazy untracked computeds keep their dependency graph and their caching
-semantics exactly as today.
+mid-update is deferred, conditionally, to its update exit.** Today the
+drop runs synchronously inside the unlink cascade even when the
+computed's own getter is on the stack, leaving the running frame's
+dependency-tail cursor pointing at a freed link; the next link insertion
+can pop that same link and stitch a self-referential dependency list
+(reachable today). Deferral discipline: the unwatched dispatch, finding
+the computed mid-update, sets a pending bit; EVERY update exit —
+including exits by throw — clears the bit, and performs the drop only if
+the bit was set AND the subscriber list is still empty at that moment (a
+computed re-watched before its exit keeps its dependencies); the watched
+dispatch also clears the bit. A computed that was never watched never
+receives the dispatch, so lazy untracked computeds keep their dependency
+graph and caching semantics exactly as today.
 
 **Hardening 4 — a throwing FIRST run disposes what it created.** Today
-`effect(fn)` whose initial run throws leaks the effect record, its
-callback column entry, and every link the partial run tracked (no stop
-callable was ever returned); `effectScope(fn)` leaks the scope record,
-its region, and any children the same way. Both dispose on initial-run
-throw.
+`effect(fn)` whose initial run throws keeps its record, its pre-throw
+links, and its armed state — it re-runs when those dependencies change,
+even though no stop callable was ever returned, so it can never be
+stopped: an unstoppable half-armed effect that is also a leak.
+`effectScope(fn)` leaks its record, region, and children the same way.
+Both now dispose on initial-run throw. This is a SEMANTIC CHANGE, not
+just a leak fix — retry-shaped code that relied on the half-armed effect
+re-running loses that behavior — and the test pins the new semantics
+explicitly.
 
-**Hardening 5 — pending boundary work runs when the frame depth returns
-to zero.** Maintenance (the free-record sweep, deferred growth) runs
-today only from allocation sites and microtasks; a synchronous loop
-whose only allocations happen inside tracked frames starves it. With
+**Hardening 5 — the free-record SWEEP (and only the sweep) runs when
+the frame depth returns to zero.** A synchronous loop whose only
+allocations happen inside tracked frames starves maintenance today; with
 detachment, attach/detach cycles are exactly such a loop (a `trigger`
-loop over a detachable signal consumes a record per iteration and never
-reaches a boundary today's creation allocations would have provided).
-Frame-bracket exits check for pending boundary work at depth zero and
-run it synchronously, restoring bounded steady-state record usage for
-synchronous churn loops.
+loop over a detachable signal consumes a record per iteration). Frame
+exits at depth zero run the pending free-record sweep synchronously —
+the sweep moves no memory and every queue that could name swept records
+is generation-guarded, so it is safe under live host closures. Arena
+GROWTH is excluded, permanently: growth retires the arena generation,
+and any host closure on the stack — an exiting effect's own finally, the
+flush loop between queued effects, an update's promotion wave — still
+holds the retiring generation's state; growth may run only where the
+host stack is empty, which means the microtask maintenance path and the
+explicit `growCapacity()` call. The review rounds established that even
+today's allocation-site growth violates this (a `trigger` whose scratch
+allocation grows mid-setup runs its body un-bracketed against a retired
+closure; a scope-owned record allocated across a growth registers a
+generation read from the zeroed arena) — filed as pre-existing kernel
+bug #4: synchronous growth under live host frames is unsound wherever it
+fires, and the fix (microtask-only growth) is a prerequisite here.
+Synchronous code whose LIVE set outgrows the arena inside one frame
+still throws with headroom exhausted, exactly as today; churn loops need
+the sweep, not growth, and get it at every exit.
 
 ## Documented limitation: mass first-reads inside one tracked frame
 
@@ -231,7 +269,7 @@ first-reads all of them inside a single effect can exhaust the arena
 mid-operation and throw, where today's eager allocation would have grown
 the arena between creations. This is a real behavioral regression for
 that shape. The throw itself is bounded: the attach rollback (step 3)
-frees the failing signal's record, and hardening 2 disposes a first-run
+frees the failing signal's record, and hardening 4 disposes a first-run
 effect that dies to it — but links and attachments completed BEFORE the
 throw belong to the (possibly never-returned) effect and follow its
 lifecycle, exactly as any throwing effect body behaves today. The escape
@@ -244,15 +282,19 @@ class; it does not pretend the shape got better.
 
 ## `reset()` contract
 
-`reset()` walks live records and delivers the unwatched dispatch before
-rewinding the arena; an attached default callable has a populated hook,
-so the walk DETACHES it — newest value copied into the closure, closure
-id zeroed, hook cleared. This is the defined behavior, and it is a
-strictly better contract than today's for this one path: after
-`reset()`, every default signal callable (attached or not) is a working
-detached signal holding its newest accepted value. Every OTHER pre-reset
-handle (raw ids, owner-stamped objects, computed callables, effect
-stops) remains undefined to reuse, exactly as today.
+`reset()` refuses to run inside an open batch (it already refuses during
+active operations; the batch guard closes a documented-but-unenforced
+gap: resetting host counters under a live `endBatch()` would drive the
+batch depth negative and kill flushing for the process). At quiescence,
+the reset walk delivers the unwatched dispatch before rewinding the
+arena; an attached default callable has a populated hook, so the walk
+DETACHES it — newest value copied into the closure, closure id zeroed,
+hook cleared. This is the defined behavior, and a strictly better
+contract than today's for this one path: after `reset()`, every default
+signal callable (attached or not) is a working detached signal holding
+its newest accepted value. Every OTHER pre-reset handle (raw ids,
+owner-stamped objects, computed callables, effect stops) remains
+undefined to reuse, exactly as today.
 
 ## Double-free defense
 
@@ -267,10 +309,13 @@ and record reclamation goes through the same live-flag discipline as
 
 Measurement protocol, used by every gate below: at least five isolated
 alternating runs against the pre-change build; the statistic is the
-ratio of medians; a gate passes when that ratio is at or below
-max(the stated threshold, 1 + 2x the baseline's relative median absolute
-deviation across its own five runs). Thresholds ARE ratios; the noise
-term only ever loosens them, never tightens.
+ratio of medians. REGRESSION gates (threshold at or above 1) pass when
+the ratio is at or below max(threshold, 1 + 2x the baseline's relative
+median absolute deviation across its own five runs). PAYOFF gates
+(threshold below 1) get no noise loosening: the bare ratio must meet the
+threshold. If the baseline's relative median absolute deviation exceeds
+3%, the environment is rejected and the measurement redone — a noisy
+machine must not loosen every gate at once.
 
 - **One `id === 0` compare on every default-callable read and write.**
   Gate: read-heavy and update-heavy suite rows, threshold 1.01, measured
@@ -280,12 +325,13 @@ term only ever loosens them, never tightens.
   that repeatedly mounts and unmounts around the same signal pays record
   alloc + column seed + hook closure + link per cycle, where today it
   pays link/unlink against a persistent record. Dedicated micro through
-  the callable tier whose measured window is K cycles PLUS a forced
+  the callable tier whose measured window is 10,000 cycles PLUS a forced
   maintenance flush, so the deferred sweep cost cannot fall between
   samples. Threshold: 2.0. `trigger()` over an otherwise unwatched
   detachable signal is the same cost family and is measured in the same
-  micro; hardening 5 additionally gates its steady state (a bounded
-  arena over one million synchronous trigger iterations).
+  micro; hardening 5 additionally gates its steady state: one million
+  synchronous trigger iterations over one detachable signal never grow
+  the arena beyond its initial capacity.
 - **Teardown-heavy micro**: one effect over 1,000 detachable
   dependencies, stopped; window includes the maintenance flush.
   Threshold: 2.0.
@@ -328,43 +374,88 @@ term only ever loosens them, never tightens.
 11. Double `unwatched` dispatch for one record (re-entrant stop patterns)
     → second is a no-op via the cleared hook.
 
-## Additional correctness obligations (v3/v4)
+## Additional correctness obligations (v3-v5)
 
-12. Hardening 1: dispose the active subscriber inside a manual frame,
-    then read a detachable signal — the read is untracked (closure value,
-    no attach, no record), and ending the frame restores nothing dead.
-13. Hardening 1: a computed disposed from inside its own getter tracks
-    nothing for the rest of that update; an effect that stops itself and
-    spawns a replacement child leaves the child alive as a root effect.
-14. Hardening 2: disposing a subscriber MID-RUN unlinks its entire old
-    dependency set (the dependency-tail cursor is mid-frame state); no
-    edge survives into the record's reclamation. Regression covers the
-    computed double-teardown corruption.
+12. Identity: save a frame, dispose its subscriber, force a sweep and a
+    recycle so the record hosts a live stranger, restore the frame — the
+    restore installs 0 (generation mismatch), and subsequent reads are
+    untracked. Repeat via every save channel: the public frame setter,
+    effect/scope creation exits, cleanup invocation, and the trigger
+    scratch.
+13. Clear side: free the active subscriber via scope-region teardown and
+    via registry reclamation (paths that never pass through dispose) —
+    tracking stops at the free; a detachable signal read afterwards in
+    the same frame returns its closure value with no attach.
+14. Disposal mid-run unlinks the entire old dependency set via the
+    consume-the-head loop, including when an unlinked child's cleanup
+    disposes siblings mid-walk; child cleanups run in creation order
+    (pinned); the computed double-teardown corruption is covered.
 15. Attach inside a scoped effect for a top-level signal: the record
     joins NO region; disposing the scope leaves the outside consumer
     linked and propagating.
 16. Attach under a pending arena growth inside a manual frame: the
     enter-depth bracket defers migration; the link lands in the same
     generation as the record. A record-allocation throw at step 1
-    unwinds the bracket (maintenance, growth, and reset() all remain
-    reachable afterwards).
+    unwinds the bracket (maintenance and reset() remain reachable).
 17. Reset-sweep masquerade immunity: with cycle counters forced past
     8192, reset over live links never invokes the Signal detach branch
     (hook-presence gate holds); the underlying kernel misdispatch is
     filed and tested separately.
 18. Hardening 4: a throwing first run of effect() OR effectScope()
-    disposes the record (and the scope region); only pre-throw
-    attachments owned by OTHER live consumers persist.
-19. Hardening 3: a computed that loses its last subscriber mid-update
-    drops its dependencies exactly once, at update exit; an untracked
-    never-watched computed keeps its dependencies and recomputes only
-    when invalidated (caching semantics unchanged).
+    disposes the record (and the scope region); the semantic change from
+    today's half-armed survivor is pinned explicitly.
+19. Hardening 3: drop exactly once at update exit only if still
+    unwatched; bit cleared on every exit including throw and on
+    re-watch; a computed re-watched before its exit keeps its
+    dependencies; never-watched untracked computeds unchanged.
 20. Hardening 5: one million synchronous trigger() iterations over one
-    detachable signal hold arena usage bounded (records recycle at
-    frame-exit boundaries).
-21. reset() detach contract: attached default callables come back as
-    working detached signals holding their newest accepted value,
-    including values staged inside an open batch at reset time.
+    detachable signal never grow the arena beyond initial capacity
+    (records recycle at exits); growth fires only from the microtask
+    path or growCapacity() — never inside a frame exit (asserted by
+    instrumentation in the test build).
+21. reset() throws inside an open batch; at quiescence it detaches
+    attached default callables with their newest accepted value.
+22. Pre-existing bug #4 regression (lands with its fix): a trigger()
+    issued right after an in-frame growth-threshold crossing is fully
+    functional — tracked reads link, the finally propagates, the
+    enter-depth bracket brackets the live arena.
+23. Frame identity across growth: a saved (id, generation) pair
+    validates correctly when the growth migration happens between save
+    and restore (generations survive migration verbatim).
+24. GC leak suite extension: hook environments, detached closures, and
+    the freed-notification cache clears under all of scope, registry,
+    and dispose reclamation paths.
+
+## How v5 answers the v4 reviews
+
+- Restore-site identity blindness (a4 FATAL 1; b4 FATAL 1) → saved
+  subscribers are (id, generation) pairs at all seven save channels plus
+  the scope and trigger-scratch caches; generation, not liveness, is the
+  validation. Obligations 12, 23.
+- Incomplete site/clear enumeration (a4 MAJOR 3; b4 MAJOR 2) → the seven
+  sites are named; the clear side rides the freed-notification seam,
+  covering region and registry frees. Obligation 13.
+- Growth at exits (a4 FATAL 2; b4 FATAL 5-class) → hardening 5 is
+  sweep-only; growth is microtask-or-explicit only, which also names
+  pre-existing kernel bug #4 (today's allocation-site growth under live
+  host frames). Obligations 20, 22.
+- Re-watched-before-exit drop (a4 MAJOR 4; b4 FATAL 4) → conditional
+  drop (still-empty check), bit cleared on all exits and on re-watch.
+  Obligation 19.
+- Forward-walk order and idempotence (a4 MAJOR 5; b4 MAJOR 3) →
+  consume-the-head loop is normative; creation-order cleanups pinned;
+  reset keeps its own order. Obligation 14.
+- reset() in an open batch (a4 MAJOR 6; b4 FATAL 6) → reset refuses
+  (batch guard added), closing today's documented-but-unenforced gap.
+  Obligation 21.
+- Hardening 4 framing (a4 MINOR 8) → pinned as a semantic change with
+  the old behavior described. Obligation 18.
+- Renumbering slip (a4 MINOR 9) → fixed.
+- Gate residue (a4 MINOR 10; b4 MAJOR 7-8) → payoff gates exempt from
+  the noise floor; environment rejected above 3% relative deviation;
+  the oscillation window is 10,000 cycles; the steady-state gate is
+  "never grows beyond initial capacity"; the taxonomy cell for
+  effects/scopes reads "explicit stop only."
 
 ## How v4 answers the v3 reviews
 
