@@ -1089,9 +1089,13 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 		}
 		// Quiescent point: the flush's teardown work (freed records, pending
 		// growth) applies here rather than piling up across a synchronous
-		// churn loop until the microtask. Depth-gated inside — a flush
-		// nested in a live frame skips it.
-		deps.sys.boundary();
+		// churn loop until the microtask. Gated on one arena load — the
+		// engine raises MaintPending only when boundary() would actually do
+		// work — so the common write pays no cross-object call; the depth
+		// gate inside covers a flush nested in a live frame.
+		if (M[SysSlot.MaintPending] !== 0) {
+			deps.sys.boundary();
+		}
 	}
 	// Abnormal flush exit (an effect threw): survivors are re-armed — a change
 	// to THEIR dependencies re-notifies them — but the failed flush does not

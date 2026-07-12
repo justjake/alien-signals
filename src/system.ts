@@ -201,6 +201,13 @@ export const enum SysSlot {
 	 * M[SysSlot.EnterDepth]++ / --.
 	 */
 	EnterDepth = 1,
+	/**
+	 * Nonzero when a boundary() call would actually do work (a pending
+	 * growth, or a free-record backlog past the sweep threshold): hosts
+	 * gate their quiescent-point boundary() calls on this one arena load so
+	 * the common operation return pays no cross-object call.
+	 */
+	MaintPending = 2,
 }
 
 /**
@@ -920,6 +927,7 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 		if (shared.boundaryPending) {
 			boundaryWork();
 		}
+		shared.inner!.memory[SysSlot.MaintPending] = 0;
 	}
 
 	function boundaryWork(): void {
@@ -958,6 +966,7 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 				// frames. Stash the request; maintenance applies it at the
 				// next operation boundary.
 				shared.growPending = true;
+				shared.inner!.memory[SysSlot.MaintPending] = 1;
 				shared.scheduleMaintenance();
 				return;
 			}
@@ -1216,6 +1225,8 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			if (shared.boundaryPending && shared.pendingFreeEnd > 8192) {
 				shared.boundaryWork();
 			}
+			// Through shared.inner: grow() above retires this closure's M.
+			shared.inner!.memory[SysSlot.MaintPending] = 0;
 		}
 
 		function resetGuard(): void {
@@ -1300,6 +1311,9 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			}
 			pendingFree[shared.pendingFreeEnd++] = id;
 			shared.boundaryPending = true;
+			if (shared.pendingFreeEnd > 8192) {
+				M[SysSlot.MaintPending] = 1;
+			}
 			shared.scheduleMaintenance();
 		}
 
@@ -1319,6 +1333,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 				recNext = id + 8;
 				if (recNext > growAt && !shared.growPending) {
 					shared.growPending = true;
+					M[SysSlot.MaintPending] = 1;
 					shared.scheduleMaintenance();
 				}
 			}
@@ -1398,6 +1413,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 				recNext = id + 8;
 				if (recNext > growAt && !shared.growPending) {
 					shared.growPending = true;
+					M[SysSlot.MaintPending] = 1;
 					shared.scheduleMaintenance();
 				}
 			}
@@ -1948,6 +1964,9 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			disposeAllDeps(id);
 			pendingFree[shared.pendingFreeEnd++] = id;
 			shared.boundaryPending = true;
+			if (shared.pendingFreeEnd > 8192) {
+				M[SysSlot.MaintPending] = 1;
+			}
 			shared.scheduleMaintenance();
 		}
 
