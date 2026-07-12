@@ -26,6 +26,8 @@ const PUBLIC_SURFACE = new Set([
 	'SysSlot',
 	'Arena',
 	'Flag',
+	// (id, generation) token packing for frame saves and registry cells
+	'FrameToken',
 	// codegen feature detection
 	'codegenAvailable',
 	'codegenSupported',

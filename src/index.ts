@@ -24,6 +24,7 @@
 import {
 	Arena,
 	Flag,
+	FrameToken,
 	LinkSlot,
 	NodeSlot,
 	SysSlot,
@@ -184,6 +185,7 @@ function instantiateHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot): 
 let hostUpdateNode!: (id: SignalId, flags: number) => boolean;
 let hostEnqueueEffect!: (id: SignalId) => void;
 let hostFreedNode!: (id: SignalId) => void;
+let hostFreeingNode!: (id: SignalId) => void;
 let hostUnwatchedNode!: (id: SignalId) => void;
 let hostReadSignal!: (id: SignalId) => unknown;
 let hostReadComputed!: (id: SignalId, getter?: NodeFn) => unknown;
@@ -217,6 +219,7 @@ const system = createReactiveSystem({
 		hostUpdateNode = host.updateNode;
 		hostEnqueueEffect = host.enqueueEffect;
 		hostFreedNode = host.freedNode;
+		hostFreeingNode = host.freeingNode;
 		hostUnwatchedNode = host.unwatchedNode;
 		hostReadSignal = host.readSignal;
 		hostReadComputed = host.readComputed;
@@ -230,6 +233,7 @@ const system = createReactiveSystem({
 	update: (id, flags) => hostUpdateNode(id, flags),
 	notify: (id) => hostEnqueueEffect(id),
 	freed: (id) => hostFreedNode(id),
+	freeing: (id) => hostFreeingNode(id),
 	unwatched: (id) => hostUnwatchedNode(id),
 });
 hostDeps.sys = system;
@@ -350,13 +354,66 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 	/**
 	 * Set the node that records subsequent signal reads.
 	 *
-	 * Pass an id previously returned by {@link getActiveSub}, or `undefined` (or
-	 * 0) to disable tracking. Returns the previous id so callers can restore it.
+	 * Pass an id you KNOW is live (one whose record cannot have been freed
+	 * since you obtained it — the raw-handle contract), or `undefined` (or 0)
+	 * to disable tracking. Returns the previous id. For save/restore across
+	 * code that may free the saved subscriber, use the validated
+	 * {@link getActiveSubFrame}/{@link setActiveSubFrame} token pair instead:
+	 * a bare id cannot be validated later, because a freed record's recycled
+	 * occupant is itself live.
 	 */
 	function setActiveSub(sub?: SignalId): SignalId {
 		const prev = activeSub;
 		activeSub = sub !== undefined ? sub : 0;
 		return prev;
+	}
+	/**
+	 * Save the active subscriber as a FRAME TOKEN: one number packing the id
+	 * and its record generation (no allocation). Restore it with
+	 * {@link setActiveSubFrame}, which installs the id only if the record
+	 * was never freed in between.
+	 */
+	function getActiveSubFrame(): number {
+		return activeSub + (M[activeSub + NodeSlot.Gen] & FrameToken.GenMask) * FrameToken.GenScale;
+	}
+	/**
+	 * Restore a frame token saved by {@link getActiveSubFrame}: installs the
+	 * saved subscriber when its generation still matches, and 0 (untracked)
+	 * when the record was freed — even if a live stranger occupies it now.
+	 * Returns the PREVIOUS frame as a token. Tokens saved before a `reset()`
+	 * are pre-reset handles and undefined to restore, like every other
+	 * pre-reset handle.
+	 */
+	function setActiveSubFrame(token: number): number {
+		const prev = getActiveSubFrame();
+		const id = token & FrameToken.IdMask;
+		activeSub = id !== 0 && (M[id + NodeSlot.Gen] & FrameToken.GenMask) === (token - id) / FrameToken.GenScale
+			? id
+			: 0;
+		return prev;
+	}
+	// Validated restore for the internal save channels: the saved subscriber
+	// (or scope) returns only if its record was never freed while the frame
+	// was open; a freed-and-recycled record hosts a live STRANGER, which is
+	// why the generation — not liveness — is the test.
+	function frameOr0(id: SignalId, gen: number): SignalId {
+		return id !== 0 && M[id + NodeSlot.Gen] === gen ? id : 0;
+	}
+	// The identity phase of a logical free (the kernel's `freeing` seam):
+	// the freed id must vanish from the live frame caches before the free's
+	// teardown can run user code, or reads in the dying frame keep tracking
+	// and a recycled record inherits the dead frame.
+	function freeingNode(id: SignalId): void {
+		if (activeSub === id) {
+			activeSub = 0;
+		}
+		if (currentScope === id) {
+			currentScope = 0;
+		}
+		if (triggerScratch === id) {
+			triggerScratch = 0;
+			triggerScratchBusy = false;
+		}
 	}
 	/** Return the number of currently open batches. */
 	function getBatchDepth(): number {
@@ -507,6 +564,7 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 		}
 		fns[idx] = fn as NodeFn;
 		const prevSub = activeSub;
+		const prevSubGen: SignalGen = M[prevSub + NodeSlot.Gen];
 		activeSub = id;
 		if (prevSub !== 0) {
 			// A child effect is a dependency of its parent: the parent's next
@@ -522,7 +580,7 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 			} finally {
 				--runDepth;
 				--M[SysSlot.EnterDepth];
-				activeSub = prevSub;
+				activeSub = frameOr0(prevSub, prevSubGen);
 				M[id + NodeSlot.Flags] &= ~Flag.RecursedCheck;
 			}
 		} catch (e) {
@@ -558,7 +616,9 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 		fns[sidx] = fn as NodeFn;
 		owned[sidx] = [];
 		const prevSub = activeSub;
+		const prevSubGen: SignalGen = M[prevSub + NodeSlot.Gen];
 		const prevScope = currentScope;
+		const prevScopeGen: SignalGen = M[prevScope + NodeSlot.Gen];
 		activeSub = id;
 		currentScope = id;
 		if (prevSub !== 0) {
@@ -571,8 +631,8 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 				fn();
 			} finally {
 				--M[SysSlot.EnterDepth];
-				activeSub = prevSub;
-				currentScope = prevScope;
+				activeSub = frameOr0(prevSub, prevSubGen);
+				currentScope = frameOr0(prevScope, prevScopeGen);
 			}
 		} catch (e) {
 			// Same contract as effectId: a throwing first run disposes the
@@ -644,6 +704,12 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 			const region = pendingRegions[r]!;
 			for (let i = 0; i < region.length; i += 2) {
 				const member: SignalId = region[i];
+				// Generation guard BEFORE any store: a member freed early has
+				// possibly been recycled, and the fns erasure below would
+				// delete the live occupant's getter.
+				if (M[member + NodeSlot.Gen] !== region[i + 1]) {
+					continue;
+				}
 				fns[member >> Arena.NodeIndexShift] = undefined;
 				freeNode(member, region[i + 1]);
 			}
@@ -681,13 +747,14 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 			triggerScratchBusy = true;
 		}
 		const prevSub = activeSub;
+		const prevSubGen: SignalGen = M[prevSub + NodeSlot.Gen];
 		activeSub = id;
 		++batchDepth;
 		++M[SysSlot.EnterDepth];
 		try {
 			fn();
 		} finally {
-			activeSub = prevSub;
+			activeSub = frameOr0(prevSub, prevSubGen);
 			M[id + NodeSlot.Flags] &= Host.Hidden;
 			++globalVersion;
 			// Consume the head, never the unlink's returned next pointer: the
@@ -833,6 +900,7 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 		M[id + NodeSlot.DepsTail] = 0;
 		M[id + NodeSlot.Flags] = (flags & Host.Hidden) | Flag.Mutable | Flag.RecursedCheck;
 		const prevSub = activeSub;
+		const prevSubGen: SignalGen = M[prevSub + NodeSlot.Gen];
 		activeSub = id;
 		++cycle;
 		++M[SysSlot.EnterDepth];
@@ -848,7 +916,7 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 			return changed;
 		} finally {
 			--M[SysSlot.EnterDepth];
-			activeSub = prevSub;
+			activeSub = frameOr0(prevSub, prevSubGen);
 			const exitFlags = M[id + NodeSlot.Flags];
 			M[id + NodeSlot.Flags] = exitFlags & ~(Flag.RecursedCheck | Host.PendingDrop);
 			purgeDeps(id);
@@ -884,6 +952,7 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 			M[id + NodeSlot.DepsTail] = 0;
 			M[id + NodeSlot.Flags] = (M[id + NodeSlot.Flags] & Host.Hidden) | Flag.Watching | Flag.RecursedCheck;
 			const prevSub = activeSub;
+			const prevSubGen: SignalGen = M[prevSub + NodeSlot.Gen];
 			activeSub = id;
 			++cycle;
 			++M[SysSlot.EnterDepth];
@@ -893,7 +962,7 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 			} finally {
 				--runDepth;
 				--M[SysSlot.EnterDepth];
-				activeSub = prevSub;
+				activeSub = frameOr0(prevSub, prevSubGen);
 				M[id + NodeSlot.Flags] &= ~Flag.RecursedCheck;
 				purgeDeps(id);
 			}
@@ -948,13 +1017,14 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 		const cleanup = cleanups[idx] as () => void;
 		cleanups[idx] = undefined;
 		const prevSub = activeSub;
+		const prevSubGen: SignalGen = M[prevSub + NodeSlot.Gen];
 		activeSub = 0;
 		++M[SysSlot.EnterDepth];
 		try {
 			cleanup();
 		} finally {
 			--M[SysSlot.EnterDepth];
-			activeSub = prevSub;
+			activeSub = frameOr0(prevSub, prevSubGen);
 		}
 	}
 	// Unlink the child effects/scopes a re-running parent created last time:
@@ -1100,6 +1170,7 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 		updateNode,
 		enqueueEffect,
 		freedNode,
+		freeingNode,
 		unwatchedNode,
 		readSignal,
 		readComputed,
@@ -1111,6 +1182,8 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 		resetState,
 		getActiveSub,
 		setActiveSub,
+		getActiveSubFrame,
+		setActiveSubFrame,
 		getBatchDepth,
 		startBatch,
 		endBatch,
@@ -1275,6 +1348,25 @@ export function getActiveSub(): SignalId {
 
 export function setActiveSub(sub?: SignalId): SignalId {
 	return host.setActiveSub(sub);
+}
+
+/**
+ * Save the active subscriber as a validated FRAME TOKEN: one number packing
+ * the id with its record generation (no allocation per save). Restore with
+ * {@link setActiveSubFrame}. Prefer this pair over getActiveSub/setActiveSub
+ * whenever the code between save and restore can free the saved subscriber:
+ * a bare id cannot be validated later (a freed record's recycled occupant is
+ * itself live), but the token restores 0 (untracked) on a generation
+ * mismatch. Tokens saved before reset() are pre-reset handles, undefined to
+ * restore.
+ */
+export function getActiveSubFrame(): number {
+	return host.getActiveSubFrame();
+}
+
+/** Restore a frame token from {@link getActiveSubFrame}; returns the previous frame's token. */
+export function setActiveSubFrame(token: number): number {
+	return host.setActiveSubFrame(token);
 }
 
 export function getBatchDepth(): number {

@@ -515,12 +515,39 @@ export interface ReactiveSystemOptions {
 	 */
 	freed?: (id: SignalId) => void;
 	/**
+	 * The IDENTITY phase of a logical free, dispatched at the top of the
+	 * free — after the record goes non-live and its generation bumps, before
+	 * any teardown that can cascade into user code. Zero every live frame
+	 * cache (active subscriber, current scope, scratch records) that names
+	 * this id: reads in the dying frame become untracked, and a recycled
+	 * record can never inherit the dead frame's tracking. Touch no columns
+	 * here — column release is `freed`'s job, at the sweep.
+	 */
+	freeing?: (id: SignalId) => void;
+	/**
 	 * Runs when an arena generation comes into being: once inside
 	 * createReactiveSystem (the arena is allocated eagerly), and again after
 	 * every growth. Bind your views of {@link ReactiveSystem.arena} here —
 	 * it fires before any node can observe the new arena.
 	 */
 	allocated?: (arena: ReactiveArena) => void;
+}
+
+/**
+ * Packing of an (id, generation) pair into ONE f64 — the frame-token and
+ * registry-cell representation. The record id occupies the low 31 bits and
+ * the generation's low 22 bits sit above it (31 + 22 = 53: both halves stay
+ * integer-exact in one f64; zero allocation per save). A false match
+ * requires the same record to be freed exactly 2^22 times between save and
+ * validate — documented and accepted.
+ */
+export const enum FrameToken {
+	/** Low 31 bits: the record id. */
+	IdMask = 0x7FFFFFFF,
+	/** The 22 generation bits kept above the id. */
+	GenMask = 0x3FFFFF,
+	/** 2^31: multiplying the masked generation shifts it past the id. */
+	GenScale = 2147483648,
 }
 
 // Branded number types, deliberately LENIENT: any plain number is
@@ -584,6 +611,7 @@ function cloneWorks(): boolean {
 			hostWatched: undefined,
 			hostUnwatched: undefined,
 			hostFreed: undefined,
+			hostFreeing: undefined,
 			growPending: false,
 			boundaryPending: false,
 			grow: noop,
@@ -677,6 +705,7 @@ interface EngineShared {
 	hostWatched: ((id: SignalId) => unknown) | undefined;
 	hostUnwatched: ((id: SignalId, state: unknown) => void) | undefined;
 	hostFreed: ((id: SignalId) => void) | undefined;
+	hostFreeing: ((id: SignalId) => void) | undefined;
 	growPending: boolean;
 	boundaryPending: boolean;
 	grow(): void;
@@ -735,6 +764,7 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 		hostWatched: options?.watched,
 		hostUnwatched: options?.unwatched,
 		hostFreed: options?.freed,
+		hostFreeing: options?.freeing,
 		growPending: false,
 		boundaryPending: false,
 		grow,
@@ -786,12 +816,16 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 	// drain only fires when a long fully-synchronous burst piles work past
 	// the caps, keeping memory bounded without taxing the common op.
 	let maintenanceScheduled = false;
-	// Deferred owner registrations as (owner, id) pairs: a registry cell is
-	// weak-GC machinery the collector traces, and creating one per create
-	// inside a creation burst measured worse than queueing (create-heavy
-	// workloads regressed ~35%). Owners are held strongly until
-	// the maintenance microtask registers them, so none can be collected
-	// before its registration lands.
+	// Deferred owner registrations as (owner, token) pairs, where the token
+	// packs (id, generation) per FrameToken — captured atomically at
+	// allocation (from the CURRENT engine's memory, after any forwarding),
+	// never at the drain: a record freed and recycled between create and
+	// drain would otherwise register the stranger's generation. A registry
+	// cell is weak-GC machinery the collector traces, and creating one per
+	// create inside a creation burst measured worse than queueing
+	// (create-heavy workloads regressed ~35%). Owners are held strongly
+	// until the maintenance microtask registers them, so none can be
+	// collected before its registration lands.
 	let pendingRegister: unknown[] = [];
 	// Live extent of pendingRegister. The array keeps its capacity across
 	// drains (truncation forces regrowth allocations on the next creation
@@ -955,8 +989,12 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 			const engine = shared.inner!;
 			engine.maybeBoundary();
 			const id = engine.allocNode(hostBits ?? 0);
+			// The generation reads through shared.inner, NOT the captured
+			// engine: maybeBoundary above can retire it, and the forwarded
+			// allocation's record lives in the new arena.
 			pendingRegister[pendingRegisterEnd++] = owner;
-			pendingRegister[pendingRegisterEnd++] = id;
+			pendingRegister[pendingRegisterEnd++] = id
+				+ (shared.inner!.memory[id + NodeSlot.Gen] & FrameToken.GenMask) * FrameToken.GenScale;
 			if (pendingRegisterEnd >= REGISTER_DRAIN_THRESHOLD) {
 				drainPendingRegister();
 			}
@@ -970,7 +1008,8 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 		},
 		adoptNode(owner: WeakKey, id: SignalId): void {
 			pendingRegister[pendingRegisterEnd++] = owner;
-			pendingRegister[pendingRegisterEnd++] = id;
+			pendingRegister[pendingRegisterEnd++] = id
+				+ (shared.inner!.memory[id + NodeSlot.Gen] & FrameToken.GenMask) * FrameToken.GenScale;
 			if (pendingRegisterEnd >= REGISTER_DRAIN_THRESHOLD) {
 				drainPendingRegister();
 			}
@@ -1105,6 +1144,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 	const hostUpdate = shared.hostUpdate;
 	const hostNotify = shared.hostNotify;
 	const hostFreed = shared.hostFreed;
+	const hostFreeing = shared.hostFreeing;
 	const lifecycleArmed = shared.hostWatched !== undefined || shared.hostUnwatched !== undefined;
 	const hostState = shared.hostState;
 
@@ -1202,10 +1242,25 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			if (!(flags & Flag.Live)) {
 				return; // already freed
 			}
+			// IDENTITY PHASE, in pinned order, before any teardown below can
+			// cascade into user cleanups: non-live FIRST (a re-entrant
+			// dispose from a cascade hits the Live gate above instead of
+			// queueing the record twice under the fresh generation), the
+			// generation bump SECOND (every saved (id, gen) pair — effect
+			// queue, regions, registry, frame tokens — mismatches from this
+			// instant), the host's frame-cache clears THIRD (reads in the
+			// dying frame become untracked). Kind and lifecycle bits survive
+			// for the unwatched dispatch; the sweep zeroes the word. Host
+			// columns stay intact until the sweep's release phase: the
+			// freeing caller's own continuation may still read them.
+			M[id + NodeSlot.Flags] = flags & (Flag.HostMask | Flag.HostStarted);
+			++M[id + NodeSlot.Gen];
+			if (hostFreeing !== undefined) {
+				hostFreeing(id);
+			}
 			if (flags & Flag.HostStarted) {
 				hostUnwatchedNode(id);
 			}
-			M[id + NodeSlot.Flags] = 0;
 			disposeAllDeps(id);
 			let sub = M[id + NodeSlot.Subs];
 			while (sub !== 0) {
@@ -1240,6 +1295,10 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			return id;
 		}
 
+		// The sweep-time RELEASE phase: zero the slots and clear the host
+		// columns (hostFreed catches stores that landed after the logical
+		// free, e.g. a self-stopping effect's returned cleanup). The
+		// generation was bumped at the logical free — never twice.
 		function freeNode(id: number): void {
 			if (hostFreed !== undefined) {
 				hostFreed(id);
@@ -1249,7 +1308,6 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			M[id + NodeSlot.DepsTail] = 0;
 			M[id + NodeSlot.Subs] = 0;
 			M[id + NodeSlot.SubsTail] = 0;
-			++M[id + NodeSlot.Gen];
 			M[id + NodeSlot.Deps] = 0;
 			if (id === 0) {
 				return; // the burned system record must never reach the free stack
@@ -1533,8 +1591,10 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			if ((depFlags & (Flag.Mutable | Flag.Dirty)) === (Flag.Mutable | Flag.Dirty)) {
 				if (updateAndShallow(dep, M[dep + NodeSlot.Subs])) {
 					// Same disposed-sub guard as the loop's return: update()
-					// may run user code that disposes the sub mid-walk.
-					return M[startSub + NodeSlot.Flags] !== 0;
+					// may run user code that disposes the sub mid-walk. Live,
+					// not != 0: a logically-freed record keeps its host kind
+					// bits until the sweep.
+					return (M[startSub + NodeSlot.Flags] & Flag.Live) !== 0;
 				}
 				const nextDep = M[startLink + LinkSlot.NextDep];
 				if (!nextDep) {
@@ -1556,7 +1616,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 				) {
 					if (updateAndShallow(inner, M[inner + NodeSlot.Subs])) {
 						if (updateAndShallow(dep, M[dep + NodeSlot.Subs])) {
-							return M[startSub + NodeSlot.Flags] !== 0;
+							return (M[startSub + NodeSlot.Flags] & Flag.Live) !== 0;
 						}
 					} else {
 						M[dep + NodeSlot.Flags] &= ~Flag.Pending;
@@ -1577,7 +1637,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			if (!M[startLink + LinkSlot.NextDep]) {
 				const r = chainCheck(startLink);
 				if (r >= 0) {
-					return r !== 0 && M[startSub + NodeSlot.Flags] !== 0;
+					return r !== 0 && (M[startSub + NodeSlot.Flags] & Flag.Live) !== 0;
 				}
 			}
 			const stackBase = checkSp;
@@ -1702,10 +1762,11 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 					}
 				}
 
-				// Upstream: `dirty && !!sub.flags` — a live node always has
-				// its kind bits set; flags reads 0 only if sub was disposed
-				// (record zeroed) by re-entrant user code during update().
-				return dirty && M[sub + NodeSlot.Flags] !== 0;
+				// Upstream: `dirty && !!sub.flags` — the Live bit clears at
+				// the logical free, so this reads false if sub was disposed
+				// by re-entrant user code during update(). (Kind bits survive
+				// until the sweep, so a != 0 test would lie.)
+				return dirty && (M[sub + NodeSlot.Flags] & Flag.Live) !== 0;
 			} while (true);
 		}
 
@@ -1778,14 +1839,21 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		}
 
 		// FinalizationRegistry target: the handle for this signal/computed was
-		// garbage collected. Reclaim the record now if the graph no longer
-		// needs it; otherwise mark it and reclaim when the last subscriber
-		// unlinks (unwatched). Only owner-registered nodes get here, and only
-		// this path frees them, so the id cannot be stale.
-		function orphan(id: number): void {
+		// garbage collected. The registration holds an (id, generation)
+		// token, validated here: an id disposed through another path and
+		// recycled leaves the registration armed against the NEW occupant,
+		// and that occupant is live — only the generation tells them apart
+		// (pre-existing bug #5). On a match, reclaim now if the graph no
+		// longer needs the record; otherwise mark it and reclaim when the
+		// last subscriber unlinks (unwatched).
+		function orphan(token: number): void {
 			if (retired) {
-				shared.inner!.orphan(id);
+				shared.inner!.orphan(token);
 				return;
+			}
+			const id = token & FrameToken.IdMask;
+			if ((M[id + NodeSlot.Gen] & FrameToken.GenMask) !== (token - id) / FrameToken.GenScale) {
+				return; // freed elsewhere (and possibly recycled): not ours
 			}
 			const flags = M[id + NodeSlot.Flags];
 			if (!(flags & Flag.Live)) {
@@ -1799,10 +1867,16 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		}
 
 		// No live handle (the registry fired) and no subscribers: release the
-		// record's edges and queue it for the free list. Zero-flags-first
-		// mirrors disposeInner's re-entrancy guard.
+		// record's edges and queue it for the free list. Same identity phase
+		// as freeNodeId — non-live, bump, cache clears — before the dep walk
+		// can cascade into user cleanups. (An orphan is never HostStarted:
+		// subscribers emptied, so the stop already ran.)
 		function reclaimOrphan(id: number): void {
-			M[id + NodeSlot.Flags] = 0;
+			M[id + NodeSlot.Flags] &= Flag.HostMask;
+			++M[id + NodeSlot.Gen];
+			if (hostFreeing !== undefined) {
+				hostFreeing(id);
+			}
 			disposeAllDeps(id);
 			pendingFree[shared.pendingFreeEnd++] = id;
 			shared.boundaryPending = true;

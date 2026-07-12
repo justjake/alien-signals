@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { NodeSlot, ReactiveFlags, createReactiveSystem } from '../src/system';
+import { Flag, NodeSlot, ReactiveFlags, createReactiveSystem } from '../src/system';
 import type { LinkId, SignalId, ReactiveSystem } from '../src/system';
 import { makeMiniLib } from './helpers/miniLib';
 
@@ -212,7 +212,8 @@ test('disposeNode frees a live id; repeats are no-ops', () => {
 	});
 	const id = sys.createNode({}, 1 << 16 | ReactiveFlags.Mutable);
 	sys.disposeNode(id);
-	expect(sys.arena.memory[id + NodeSlot.Flags]).toBe(0); // freed
+	// Non-live at the logical free; host kind bits survive until the sweep.
+	expect(sys.arena.memory[id + NodeSlot.Flags] & Flag.Live).toBe(0);
 	expect(() => sys.disposeNode(id)).not.toThrow(); // already freed: no-op
 });
 
@@ -226,7 +227,7 @@ test('disposeNode with a stale generation is a no-op', () => {
 	const id = sys.createNode(owner, 1 << 16 | ReactiveFlags.Mutable);
 	const gen = sys.generationOf(id);
 	sys.disposeNode(id, ((gen as number) + 1) as typeof gen); // wrong gen: no-op
-	expect(sys.arena.memory[id + NodeSlot.Flags]).not.toBe(0); // still live
+	expect(sys.arena.memory[id + NodeSlot.Flags] & Flag.Live).not.toBe(0); // still live
 	sys.disposeNode(id, gen); // right gen: freed
-	expect(sys.arena.memory[id + NodeSlot.Flags]).toBe(0);
+	expect(sys.arena.memory[id + NodeSlot.Flags] & Flag.Live).toBe(0);
 });
