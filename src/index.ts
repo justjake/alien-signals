@@ -50,6 +50,13 @@ const enum Host {
 	Effect = 3 << Flag.HostShift,
 	Scope = 4 << Flag.HostShift,
 	KindMask = 7 << Flag.HostShift,
+	/**
+	 * A computed lost its last subscriber while its own getter was running:
+	 * the dependency drop is deferred to the update exit (dropping now would
+	 * dangle the running frame's DepsTail cursor on a freed link). Every
+	 * update exit clears the bit and drops only if still unwatched.
+	 */
+	PendingDrop = 8 << Flag.HostShift,
 }
 
 /**
@@ -783,15 +790,27 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 		const kind = flags & Host.KindMask;
 		if (kind === Host.Computed) {
 			if (M[id + NodeSlot.Deps] !== 0) {
-				// Drop the dependency graph and force re-evaluation on the
-				// next read (the zeroed snapshot defeats the version gate).
-				M[id + NodeSlot.Flags] = (flags & Host.Hidden) | Flag.Mutable | Flag.Dirty;
-				D[(id >> Arena.VersionShift) + Arena.VersionOffset] = 0;
-				disposeAllDeps(id);
+				if (flags & Flag.RecursedCheck) {
+					// The computed's own getter is on the stack (RecursedCheck
+					// is set exactly for the getter's duration): dropping now
+					// would dangle its DepsTail cursor on a freed link, and
+					// the next link insert could pop that record and stitch a
+					// self-referential dependency list. Defer to the exit.
+					M[id + NodeSlot.Flags] = flags | Host.PendingDrop;
+				} else {
+					dropComputedDeps(id);
+				}
 			}
 		} else if (kind >= Host.Effect) {
 			disposeEffect(id);
 		}
+	}
+	// Drop an unwatched computed's dependency graph and force re-evaluation
+	// on the next read (the zeroed snapshot defeats the version gate).
+	function dropComputedDeps(id: SignalId): void {
+		M[id + NodeSlot.Flags] = (M[id + NodeSlot.Flags] & Host.Hidden & ~Host.PendingDrop) | Flag.Mutable | Flag.Dirty;
+		D[(id >> Arena.VersionShift) + Arena.VersionOffset] = 0;
+		disposeAllDeps(id);
 	}
 	function updateSignal(id: SignalId, flags: number): boolean {
 		M[id + NodeSlot.Flags] = (flags & Host.Hidden) | Flag.Mutable;
@@ -830,8 +849,16 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 		} finally {
 			--M[SysSlot.EnterDepth];
 			activeSub = prevSub;
-			M[id + NodeSlot.Flags] &= ~Flag.RecursedCheck;
+			const exitFlags = M[id + NodeSlot.Flags];
+			M[id + NodeSlot.Flags] = exitFlags & ~(Flag.RecursedCheck | Host.PendingDrop);
 			purgeDeps(id);
+			// The deferred unwatched drop (see unwatchedNode), conditional on
+			// STILL unwatched: a computed re-watched before its exit keeps
+			// its dependencies. On a freed record exitFlags reads zero, so
+			// the bit died with the flags word and there is nothing to do.
+			if (exitFlags & Host.PendingDrop && M[id + NodeSlot.Subs] === 0 && M[id + NodeSlot.Deps] !== 0) {
+				dropComputedDeps(id);
+			}
 		}
 	}
 	// Re-run an effect the queue delivered (upstream's run).
