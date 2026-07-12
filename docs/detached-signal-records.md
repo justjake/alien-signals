@@ -1,12 +1,13 @@
-# Design v5: detached signal records (default signal callables stop using the FinalizationRegistry)
+# Design v6: detached signal records (default signal callables stop using the FinalizationRegistry)
 
-Status: v5 DRAFT — fifth revision. v1 refuted outright (reviews -a, -b);
-v2 sounder, refuted on boundaries (-a2, -b2); v3 refuted on its gate
-mechanism (-a3, -b3); v4 refuted on two residues (-a4, -b4): frame-saved
-subscriber ids need generation validation, not liveness validation, and
-deferred growth can never run at frame exits. The review rounds have
-surfaced FOUR pre-existing kernel/host bugs, each now a named
-prerequisite fix. Resolution maps for all rounds are at the end.
+Status: v6 DRAFT — sixth revision. Refutation history: v1 architecture
+(-a/-b); v2 boundaries (-a2/-b2); v3 gate mechanism (-a3/-b3); v4 frame
+identity and exit-growth (-a4/-b4); v5 a single timing premise (-a5/-b5):
+the freed notification and the generation bump fire at the sweep, not at
+the logical free, so the free-to-sweep window defeated the clear side.
+v6 moves both to logical-free time. The rounds have surfaced FIVE
+pre-existing kernel/host bugs, each a named prerequisite fix. Resolution
+maps for all rounds are at the end.
 
 ## Problem
 
@@ -175,16 +176,32 @@ generation counter that already exists is the identity the frames need:
   public frame setter and the exits of run, update, trigger, effect
   creation, scope creation, and cleanup invocation (all seven; the v4
   review enumerated them) — saves the (id, generation) pair and restores
-  0 when the generation no longer matches;
+  0 when the generation no longer matches. One carve-out: `reset()`
+  rewinds every generation, so a frame pair saved before a reset is a
+  pre-reset handle and undefined to restore, like every other pre-reset
+  handle;
 - the same discipline covers the two cached-id channels that are not the
   active subscriber: the current scope and the trigger scratch record;
-- the CLEAR side rides the existing freed-notification seam: every
-  record free (explicit dispose, scope-region teardown, registry
-  reclamation) already dispatches the host's freed hook, which now also
-  compares the freed id against the active subscriber, current scope,
-  and trigger scratch, and zeroes any match — so a doomed frame stops
-  tracking at the moment of the free, whatever path freed it, and no
-  window exists between a free and the next restore.
+- the CLEAR side and the generation bump both move to LOGICAL-FREE
+  time. Today the freed notification and the generation increment fire
+  only in the boundary sweep, leaving a synchronous window between a
+  free and the sweep in which a saved (id, generation) pair still
+  matches and the caches still hold the dead id (the v5 reviews'
+  remaining fatal). The queue-time free (explicit dispose, scope-region
+  teardown, registry reclamation) now bumps the generation and
+  dispatches the freed hook immediately; the hook compares the freed id
+  against the active subscriber, current scope, and trigger scratch and
+  zeroes any match. The sweep keeps its slot-zeroing and free-stack push
+  and does not bump again. Effect-queue entries and region entries
+  holding the pre-bump generation mismatch from the moment of the free —
+  which is the direction every one of those guards wants;
+- the registry ownership channel gets the same identity discipline: the
+  registration's held value becomes an (id, generation) pair, and the
+  orphan callback validates the generation before touching the record
+  (today it checks only the live flag of whatever occupies the slot —
+  filed as pre-existing bug #5: disposing an owner-registered id and
+  recycling its record leaves the registration armed against the new
+  occupant).
 
 Consequences: reads in a doomed frame are simply untracked (a detached
 signal read there returns its closure value and never attaches), a
@@ -203,9 +220,13 @@ The replacement loop is normatively "unlink whatever the head slot
 currently names, until it names nothing": re-reading the head each
 iteration — never a cached next pointer — is what makes the walk correct
 under re-entrancy, because an unlinked child's own cleanup can dispose
-siblings and recycle link records mid-walk. This also fixes the
-double-teardown corruption for computeds (the second walk finds an empty
-head and stops). Pinned semantic change: child cleanups now run in
+siblings and recycle link records mid-walk. The rule is normative for
+ALL THREE link-walk instances — the disposal teardown, the host's
+child-effect disposal pass, and the unwatched dependency drop — each of
+which can run user cleanups mid-walk today with a cached next pointer
+that link recycling can invalidate. This also fixes the double-teardown
+corruption for computeds (the second walk finds an empty head and
+stops). Pinned semantic change: child cleanups now run in
 creation order rather than newest-first; the reset path keeps its own
 separately documented newest-first order. A test pins the new order.
 
@@ -220,9 +241,11 @@ the computed mid-update, sets a pending bit; EVERY update exit —
 including exits by throw — clears the bit, and performs the drop only if
 the bit was set AND the subscriber list is still empty at that moment (a
 computed re-watched before its exit keeps its dependencies); the watched
-dispatch also clears the bit. A computed that was never watched never
-receives the dispatch, so lazy untracked computeds keep their dependency
-graph and caching semantics exactly as today.
+dispatch also clears the bit. The bit lives in the record's flags word,
+so a record freed mid-update drops it with its flags and the exit finds
+nothing to do. A computed that was never watched never receives the
+dispatch, so lazy untracked computeds keep their dependency graph and
+caching semantics exactly as today.
 
 **Hardening 4 — a throwing FIRST run disposes what it created.** Today
 `effect(fn)` whose initial run throws keeps its record, its pre-throw
@@ -236,28 +259,30 @@ re-running loses that behavior — and the test pins the new semantics
 explicitly.
 
 **Hardening 5 — the free-record SWEEP (and only the sweep) runs when
-the frame depth returns to zero.** A synchronous loop whose only
+the frame depth returns to zero; growth keeps today's frameless entry
+points, minus their two unsafe sites.** A synchronous loop whose only
 allocations happen inside tracked frames starves maintenance today; with
 detachment, attach/detach cycles are exactly such a loop (a `trigger`
 loop over a detachable signal consumes a record per iteration). Frame
 exits at depth zero run the pending free-record sweep synchronously —
 the sweep moves no memory and every queue that could name swept records
 is generation-guarded, so it is safe under live host closures. Arena
-GROWTH is excluded, permanently: growth retires the arena generation,
-and any host closure on the stack — an exiting effect's own finally, the
-flush loop between queued effects, an update's promotion wave — still
-holds the retiring generation's state; growth may run only where the
-host stack is empty, which means the microtask maintenance path and the
-explicit `growCapacity()` call. The review rounds established that even
-today's allocation-site growth violates this (a `trigger` whose scratch
-allocation grows mid-setup runs its body un-bracketed against a retired
-closure; a scope-owned record allocated across a growth registers a
-generation read from the zeroed arena) — filed as pre-existing kernel
-bug #4: synchronous growth under live host frames is unsound wherever it
-fires, and the fix (microtask-only growth) is a prerequisite here.
-Synchronous code whose LIVE set outgrows the arena inside one frame
-still throws with headroom exhausted, exactly as today; churn loops need
-the sweep, not growth, and get it at every exit.
+GROWTH never runs at a frame exit: growth retires the arena generation,
+and an exiting frame's own epilogue — the flush loop between queued
+effects, an update's promotion wave — still holds the retiring
+generation's state. Growth keeps its existing sites: the microtask
+maintenance path, explicit `growCapacity()`, and the frameless creation
+entries (a top-level creation burst grows mid-burst exactly as today —
+the entry trampolines are host-stack-empty at that instant). Two of
+today's growth-adjacent sites are unsound and are fixed rather than
+avoided (pre-existing bug #4): the scoped raw creation reads the new
+record's generation through the pre-growth closure (it must re-read
+after the allocation returns), and `trigger` allocates its scratch
+before entering its bracket (the scratch allocation moves inside, or the
+scratch is revalidated after it). Synchronous code whose LIVE set
+outgrows the arena inside one frame still throws with headroom
+exhausted, exactly as today; churn loops need the sweep, not growth, and
+get it at every exit.
 
 ## Documented limitation: mass first-reads inside one tracked frame
 
@@ -382,10 +407,14 @@ machine must not loosen every gate at once.
     untracked. Repeat via every save channel: the public frame setter,
     effect/scope creation exits, cleanup invocation, and the trigger
     scratch.
-13. Clear side: free the active subscriber via scope-region teardown and
-    via registry reclamation (paths that never pass through dispose) —
-    tracking stops at the free; a detachable signal read afterwards in
-    the same frame returns its closure value with no attach.
+13. Clear side at LOGICAL-FREE time: free the active subscriber via
+    explicit dispose inside its own frame, via scope-region teardown,
+    and via registry reclamation — in all three, tracking stops at the
+    free itself (generation bumped, caches cleared before the free
+    returns); a detachable signal read afterwards in the same frame
+    returns its closure value with no attach; the self-stop-then-spawn
+    scenario creates the child as a root effect with no ghost edge into
+    the freed parent.
 14. Disposal mid-run unlinks the entire old dependency set via the
     consume-the-head loop, including when an unlinked child's cleanup
     disposes siblings mid-walk; child cleanups run in creation order
@@ -425,6 +454,37 @@ machine must not loosen every gate at once.
 24. GC leak suite extension: hook environments, detached closures, and
     the freed-notification cache clears under all of scope, registry,
     and dispose reclamation paths.
+25. Registry identity (pre-existing bug #5 regression): dispose an
+    owner-registered id, recycle its record to a live node, drop the
+    owner — the orphan callback generation-mismatches and the new
+    occupant is untouched.
+
+## How v6 answers the v5 reviews
+
+- The free-to-sweep window (a5 FATAL 1; b5 FATAL 1) → the generation
+  bump and the freed-hook dispatch move to logical-free time; the sweep
+  only zeroes slots and stacks the record. Obligation 13 rewritten to
+  pin all three scenarios (scope self-dispose crash, self-stop
+  replacement child, manual frame).
+- Registry bare-id channel (a5 MAJOR 3) → registrations hold (id,
+  generation) and the orphan callback validates it — pre-existing bug
+  #5. Obligation 25.
+- Microtask-only growth overreach (a5 MAJOR 2; b5 MAJOR 4) → retracted:
+  growth keeps its frameless entry sites (top-level bursts grow as
+  today); bug #4's fix targets exactly the two unsafe sites.
+- Cached-prev walks beyond disposal (a5 MAJOR 4) → consume-the-head is
+  normative for all three link-walk instances.
+- Pending-bit home (a5 MINOR 5) → the flags word.
+- Reset carve-out for saved frames (a5 MINOR 6; b5 MAJOR 2-class) →
+  stated: pre-reset frame pairs are pre-reset handles.
+- Exit-sweep column-read invariant (a5 MINOR 7) → stated and asserted
+  by test-build instrumentation.
+- Gate worst-case bound (a5 MINOR 8; b5 MAJOR 5-class) → stated
+  explicitly (at most threshold plus six points under the rejection
+  cap). The public frame-pair API shape (b5 MAJOR 3) → the raw seam
+  keeps its id-based setter; the documented save/restore pattern becomes
+  the pair returned by a new getter and validated by the restore path,
+  named in the implementation change list.
 
 ## How v5 answers the v4 reviews
 
