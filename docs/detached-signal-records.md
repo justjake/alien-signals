@@ -1,13 +1,20 @@
-# Design v6: detached signal records (default signal callables stop using the FinalizationRegistry)
+# Design v7: detached signal records (default signal callables stop using the FinalizationRegistry)
 
-Status: v6 DRAFT — sixth revision. Refutation history: v1 architecture
+Status: v7 DRAFT — seventh revision. Refutation history: v1 architecture
 (-a/-b); v2 boundaries (-a2/-b2); v3 gate mechanism (-a3/-b3); v4 frame
 identity and exit-growth (-a4/-b4); v5 a single timing premise (-a5/-b5):
-the freed notification and the generation bump fire at the sweep, not at
-the logical free, so the free-to-sweep window defeated the clear side.
-v6 moves both to logical-free time. The rounds have surfaced FIVE
-pre-existing kernel/host bugs, each a named prerequisite fix. Resolution
-maps for all rounds are at the end.
+the freed notification and the generation bump fired at the sweep, so the
+free-to-sweep window defeated the clear side; v6 the relocation's
+collateral (-a6/-b6): moving the freed hook WHOLESALE to logical-free time
+cleared the host columns that `disposeEffect` reads after `freeNode`
+returns, and three hardenings were specified more broadly than the code
+they land in (sweep placement, growth sites, walk rules). v7 splits the
+freed hook into an identity phase (logical free) and a release phase
+(sweep), and re-specifies the three hardenings against the actual call
+sites. Both v6 reviews confirmed the detach mechanics proper and the
+queue-time generation bump survive attack unchanged. The rounds have
+surfaced SIX pre-existing kernel/host bugs, each a named prerequisite
+fix. Resolution maps for all rounds are at the end.
 
 ## Problem
 
@@ -91,7 +98,9 @@ name a real node) and `value`. Nothing else happens.
    arena between the allocation and the link insert, and any throw —
    including record allocation hitting the hard capacity limit at step
    1 — unwinds the bracket, so maintenance and reset stay reachable
-   (growth, per hardening 5, happens only on the microtask path or an explicit growCapacity call — never at the exit itself);
+   (growth, per hardening 5, happens only on the microtask path, an
+   explicit growCapacity call, or a creation trampoline's pre-dispatch
+   boundary — never at a frame exit and never inside a host frame);
 2. seed **both** `currentVals[idx]` and `pendingVals[idx]` with the
    closure value (seeding only one produces a spurious first-write
    invalidation, v1 finding 7);
@@ -122,13 +131,17 @@ finds no hook and does nothing):
 
 1. copy `pendingVals[idx]` into the closure via the hook;
 2. reset the closure `id` to 0 and clear the hook column entry;
-3. reclaim the record the way `reclaimOrphan` does today: clear flags,
-   push onto the boundary `pendingFree` queue, schedule maintenance. The
-   record's memory is not reused until the operation-boundary sweep, which
-   is the same mid-walk safety envelope the kernel already grants orphaned
-   records. (The kernel's `unwatched` zeroes the version snapshot after
-   the host dispatch returns — the reclaimed record's snapshot is
-   unreachable either way, and the sweep re-zeroes it.)
+3. reclaim the record through the standard logical free: the hardening-1
+   IDENTITY PHASE runs first (flags cleared, generation bumped, frame
+   caches compared and zeroed), then the record is pushed onto the
+   boundary `pendingFree` queue and maintenance is scheduled — the same
+   sequence every other logical free performs, so the sweep never bumps
+   again. The record's memory is not reused until the quiescent-point
+   sweep (hardening 5), which is the mid-walk safety envelope: no kernel
+   traversal can hold the record when the sweep runs. (The kernel's
+   `unwatched` zeroes the version snapshot after the host dispatch
+   returns — the reclaimed record's snapshot is unreachable either way,
+   and the sweep re-zeroes it.)
 
 A re-read after detach but before the sweep attaches a **fresh** record —
 the closure abandoned the old id, so nothing can reach the queued record
@@ -163,7 +176,9 @@ liveness flag is identity-blind under record recycling, and the re-mark
 fast path never consults an insert gate — and that the true holes are in
 the frame lifecycle itself. Five hardenings close them at the source.
 Each is an independent bug fix against today's code; the first three fix
-corruption or leaks that are reachable today without this design.
+corruption or leaks that are reachable today without this design. (A
+sixth pre-existing kernel bug — mid-walk link-record reuse — is filed
+under hardening 5, where its fix lives.)
 
 **Hardening 1 — saved subscriber identity is an (id, generation) pair,
 and every free clears the live caches.** Bare record ids are
@@ -182,26 +197,67 @@ generation counter that already exists is the identity the frames need:
   handle;
 - the same discipline covers the two cached-id channels that are not the
   active subscriber: the current scope and the trigger scratch record;
-- the CLEAR side and the generation bump both move to LOGICAL-FREE
-  time. Today the freed notification and the generation increment fire
-  only in the boundary sweep, leaving a synchronous window between a
-  free and the sweep in which a saved (id, generation) pair still
-  matches and the caches still hold the dead id (the v5 reviews'
-  remaining fatal). The queue-time free (explicit dispose, scope-region
-  teardown, registry reclamation) now bumps the generation and
-  dispatches the freed hook immediately; the hook compares the freed id
-  against the active subscriber, current scope, and trigger scratch and
-  zeroes any match. The sweep keeps its slot-zeroing and free-stack push
-  and does not bump again. Effect-queue entries and region entries
-  holding the pre-bump generation mismatch from the moment of the free —
-  which is the direction every one of those guards wants;
+- the freed dispatch SPLITS INTO TWO PHASES, because its current single
+  seam does two unrelated jobs. The IDENTITY PHASE moves to LOGICAL-FREE
+  time and runs at the very top of the free, in this normative order,
+  before the dependency unlinking that can cascade into user cleanups:
+  (1) clear the live flag and the rest of the flags word, (2) bump the
+  generation, (3) compare the freed id against the active subscriber,
+  current scope, and trigger scratch and zero any match. Non-live comes
+  FIRST so a child cleanup that re-entrantly disposes the same record
+  hits the live-flag gate instead of queueing it twice under the fresh
+  generation; the bump and cache clears complete before ANY user code
+  can run inside the free, so the v5 free-to-sweep window never opens.
+  The identity phase touches no host columns and runs no user code. The
+  RELEASE PHASE — the existing host freed hook that clears the five host
+  columns — STAYS AT THE SWEEP, unchanged. This split is load-bearing in
+  both directions: `disposeEffect` reads `cleanups[]` and `owned[]`
+  after `freeNode` returns (its cleanup run and region hand-off depend
+  on the columns surviving the free), and a self-stopping effect's try
+  block stores its returned cleanup into the freed record's column AFTER
+  the free — the sweep's unconditional column clear is what catches that
+  late store, so neither dispatch time alone is correct. The invariant,
+  stated normatively: a freed record's host columns remain intact from
+  the logical free until the sweep's release phase, may be read by the
+  freeing call's own straight-line continuation, and are cleared
+  unconditionally at the sweep whatever landed in them meanwhile; no
+  host code may DEPEND on a post-free column write surviving the sweep.
+  Effect-queue entries and region entries holding the pre-bump
+  generation mismatch from the moment of the free — which is the
+  direction every one of those guards wants;
+- every generation guard protects ALL the mutations made on the guarded
+  record's behalf, host-side stores included: a deferred consumer of a
+  saved (id, generation) pair — the region teardown walk, the registry
+  orphan callback — validates the pair BEFORE touching any host column
+  or closure slot for that id. (Today's region teardown erases
+  `fns[idx]` before its generation check runs; against a recycled
+  occupant that store deletes a live stranger's getter. The store moves
+  after the guard.);
 - the registry ownership channel gets the same identity discipline: the
   registration's held value becomes an (id, generation) pair, and the
   orphan callback validates the generation before touching the record
   (today it checks only the live flag of whatever occupies the slot —
   filed as pre-existing bug #5: disposing an owner-registered id and
   recycling its record leaves the registration armed against the new
-  occupant).
+  occupant). The pair is captured ATOMICALLY AT ALLOCATION — read back
+  from the engine's memory after the allocation call returns, so a
+  growth forwarded mid-call yields the new arena's generation — never at
+  the deferred registration drain, where a free-and-recycle between
+  creation and drain would capture the stranger's generation and arm
+  bug #5 one hop later;
+- the public frame save/restore pattern gets a concrete pair-carrying
+  API: `getActiveSubFrame(): number` returns a frame token — a single
+  f64 packing the subscriber id in the low 31 bits and the low 22 bits
+  of its generation above them (both integer-exact in one f64; zero
+  allocation per save) — and `setActiveSubFrame(token: number)` unpacks
+  it, compares the generation bits against the record's current
+  generation, installs the id on match and 0 on mismatch. A false match
+  requires the same record to be freed and recycled exactly 2^22 times
+  between save and restore — documented and accepted. The existing
+  numeric `setActiveSub(id)` seam is retained for the raw tier with a
+  narrowed documented contract: valid only for an id the caller knows
+  is live, like every other raw handle; the documented save/restore
+  pattern moves to the token pair.
 
 Consequences: reads in a doomed frame are simply untracked (a detached
 signal read there returns its closure value and never attaches), a
@@ -211,24 +267,39 @@ occupant. One semantic pinned by test: an effect that stops itself and
 then spawns a replacement child creates that child in an untracked
 context — the child becomes a root effect and survives.
 
-**Hardening 2 — disposal unlinks the full dependency list by
-repeatedly consuming the list HEAD.** Today's teardown walks backward
-from the dependency-tail cursor, which a RUNNING frame has reset to
-zero — so disposing a running subscriber unlinks nothing and leaves its
-old edges alive in every dependency's subscriber list (reachable today).
-The replacement loop is normatively "unlink whatever the head slot
-currently names, until it names nothing": re-reading the head each
-iteration — never a cached next pointer — is what makes the walk correct
-under re-entrancy, because an unlinked child's own cleanup can dispose
-siblings and recycle link records mid-walk. The rule is normative for
-ALL THREE link-walk instances — the disposal teardown, the host's
-child-effect disposal pass, and the unwatched dependency drop — each of
-which can run user cleanups mid-walk today with a cached next pointer
-that link recycling can invalidate. This also fixes the double-teardown
-corruption for computeds (the second walk finds an empty head and
-stops). Pinned semantic change: child cleanups now run in
-creation order rather than newest-first; the reset path keeps its own
-separately documented newest-first order. A test pins the new order.
+**Hardening 2 — no link walk survives an unlink that can run user code
+with a cached link pointer; each walk re-reads a stable anchor
+instead.** Today's teardown walks backward from the dependency-tail
+cursor, which a RUNNING frame has reset to zero — so disposing a running
+subscriber unlinks nothing and leaves its old edges alive in every
+dependency's subscriber list (reachable today). And every walk that
+caches a next pointer across an unlink is corruptible: `unlink`
+dispatches `unwatched` synchronously, which can dispose child effects
+and run user cleanups, which can dispose other link holders and recycle
+the cached link record onto a foreign edge. The normative rules, per
+walk shape:
+
+- FULL teardown walks — the disposal teardown and the unwatched
+  dependency drop, which unlink everything — "unlink whatever the head
+  slot currently names, until it names nothing." The head slot is
+  re-read every iteration; no cached next pointer exists to go stale.
+  This also fixes the double-teardown corruption for computeds (the
+  second walk finds an empty head and stops).
+- SELECTIVE and PARTIAL walks cannot consume the head (the child-effect
+  disposal pass must SKIP non-effect deps; `purgeDeps` trims only past
+  the tail cursor; `trigger`'s teardown loop unlinks the scratch
+  record's deps). Each instead restarts from its stable anchor after
+  EVERY unlink that can run user code, never resuming from a cached
+  link id: the child-effect pass rescans forward from the sub's head
+  slot and unlinks the first child effect found, repeating until a full
+  scan finds none; `purgeDeps` re-reads the sub's tail-cursor slot and
+  its next field after each unlink; `trigger` re-reads the scratch
+  record's own head slot each iteration (its walk unlinks everything,
+  so head-consumption applies).
+
+Pinned semantic change: child cleanups now run in creation order rather
+than newest-first; the reset path keeps its own separately documented
+newest-first order. A test pins the new order.
 
 **Hardening 3 — the unwatched dependency-drop of a computed that is
 mid-update is deferred, conditionally, to its update exit.** Today the
@@ -258,31 +329,73 @@ just a leak fix — retry-shaped code that relied on the half-armed effect
 re-running loses that behavior — and the test pins the new semantics
 explicitly.
 
-**Hardening 5 — the free-record SWEEP (and only the sweep) runs when
-the frame depth returns to zero; growth keeps today's frameless entry
-points, minus their two unsafe sites.** A synchronous loop whose only
-allocations happen inside tracked frames starves maintenance today; with
-detachment, attach/detach cycles are exactly such a loop (a `trigger`
-loop over a detachable signal consumes a record per iteration). Frame
-exits at depth zero run the pending free-record sweep synchronously —
-the sweep moves no memory and every queue that could name swept records
-is generation-guarded, so it is safe under live host closures. Arena
-GROWTH never runs at a frame exit: growth retires the arena generation,
-and an exiting frame's own epilogue — the flush loop between queued
-effects, an update's promotion wave — still holds the retiring
-generation's state. Growth keeps its existing sites: the microtask
-maintenance path, explicit `growCapacity()`, and the frameless creation
-entries (a top-level creation burst grows mid-burst exactly as today —
-the entry trampolines are host-stack-empty at that instant). Two of
-today's growth-adjacent sites are unsound and are fixed rather than
-avoided (pre-existing bug #4): the scoped raw creation reads the new
-record's generation through the pre-growth closure (it must re-read
-after the allocation returns), and `trigger` allocates its scratch
-before entering its bracket (the scratch allocation moves inside, or the
-scratch is revalidated after it). Synchronous code whose LIVE set
-outgrows the arena inside one frame still throws with headroom
-exhausted, exactly as today; churn loops need the sweep, not growth, and
-get it at every exit.
+**Hardening 5 — the free-record SWEEP (and only the sweep) runs at
+QUIESCENT POINTS: the return path of an outermost public entry, where
+frame depth is zero AND no kernel traversal is live; growth moves to the
+creation trampolines' pre-dispatch boundary and out of the host frames
+entirely.** A synchronous loop whose only allocations happen inside
+tracked frames starves maintenance today; with detachment, attach/detach
+cycles are exactly such a loop (a `trigger` loop over a detachable
+signal consumes a record per iteration).
+
+The sweep's placement condition is QUIESCENCE, which frame depth alone
+does not establish: the dirtiness walk runs unbracketed at depth zero
+(both the flush loop and a top-level lazy read evaluate it before or
+outside any user-code bracket), and a computed update inside that walk
+brackets 0→1→0 — so "any frame exit at depth zero" would sweep while the
+walk's traversal stacks still hold link ids naming the freed records,
+and a subsequent in-walk allocation could recycle a record the unwind is
+about to consult. The sweep therefore runs only where BOTH hold: frame
+depth is zero and the kernel's traversal state is empty (the check and
+propagation stacks, and the stackless chain climb, are not mid-walk).
+Concretely that is the return path of the outermost public entries —
+write-flush completion, trigger completion, a top-level lazy read's
+return, the microtask maintenance path — which is exactly where the
+churn-loop motivation needs it: one sweep per trigger/write iteration.
+The sweep moves no memory and every queue that could name swept records
+is generation-guarded, so it is safe under live host closures at those
+points.
+
+Related and filed here as pre-existing bug #6: freed LINK records are
+reusable mid-walk today. Links recycle immediately at unlink, so a
+getter that disposes a node the current dirtiness walk descended
+through frees link records still held on the walk's stack, and a later
+in-walk `link()` can rewrite one as a foreign edge before the unwind
+pops it. The fix rides the same quiescence notion: while a kernel
+traversal is live, unlinked link records queue on a walk-local pending
+list and join the free stack only when the walk unwinds — link-record
+reuse becomes quiescent-only, matching node records. (Today's host
+absorbs part of this through its freed-mid-walk guard, which is why the
+bug is latent rather than everyday; detachment raises unlink churn, so
+the design requires the fix rather than inheriting the latency.)
+
+Arena GROWTH never runs at a frame exit (growth retires the arena
+generation, and an exiting frame's epilogue still holds the retiring
+generation's state) and never inside an in-flight host operation. The
+v5/v6 claim that today's in-call growth forwarding is safe for all
+frameless creation entries was wrong: it holds for top-level unscoped
+`signalId`/`computedId` (post-allocation work touches only shared side
+columns — verified twice), but `effectId` and `effectScopeId` allocate
+BEFORE establishing their frame state and then keep executing in the
+retired closure — the effect sets the dead generation's active
+subscriber and brackets the dead arena while reads dispatch through the
+new host: the effect is born tracking nothing, and under a manual frame
+its parent link lands in the dead arena. Pre-existing bug #4 therefore
+has FOUR sites, all fixed: (1) `trigger` allocates its scratch before
+entering its bracket — the allocation moves inside the bracket; (2, 3)
+the SCOPED creation entries (`signalId`, `computedId` under a current
+scope) read the new record's generation through the pre-growth closure —
+they re-read after the allocation returns; (4) `effectId` and
+`effectScopeId` — the growth boundary check hoists OUT of the host
+closure INTO the module trampoline, which runs the pending growth (host
+stack genuinely empty at that instant) and only then dispatches into the
+current — possibly new — host generation; inside a host closure,
+allocation never grows. Growth's complete site list after this
+hardening: the microtask maintenance path, explicit `growCapacity()`,
+and the creation trampolines' pre-dispatch boundary. Synchronous code
+whose LIVE set outgrows the arena inside one frame still throws with
+headroom exhausted, exactly as today; churn loops need the sweep, not
+growth, and get it at every quiescent point.
 
 ## Documented limitation: mass first-reads inside one tracked frame
 
@@ -298,8 +411,10 @@ frees the failing signal's record, and hardening 4 disposes a first-run
 effect that dies to it — but links and attachments completed BEFORE the
 throw belong to the (possibly never-returned) effect and follow its
 lifecycle, exactly as any throwing effect body behaves today. The escape
-hatches are `growCapacity()` before the wide read, or first reads spread
-across operations. Attach's enter-depth bracket (step 1) also means a
+hatches are `growCapacity()` before the wide read, or yielding to the
+microtask maintenance path between batches of first reads (an attach
+always runs inside a tracked frame, so no synchronous spreading of the
+reads alone can reach a growth site). Attach's enter-depth bracket (step 1) also means a
 pending growth never migrates the arena mid-attach in manual frames —
 the deferral is uniform whatever frame shape triggered the read. The
 spec gates this with a test asserting the clean throw and no NEW leak
@@ -323,12 +438,14 @@ undefined to reuse, exactly as today.
 
 ## Double-free defense
 
-Generation stamps do not defend this path (link records carry none, and
-node generation bumps are deferred to the sweep — v1 finding 8). The
-actual guards: the hook column entry is cleared at detach, so a second
-`unwatched` dispatch for the same record finds no hook and is a no-op;
-and record reclamation goes through the same live-flag discipline as
-`freeNodeId` (flags cleared at queue time, sweep frees once).
+Link records carry no generation stamp, so generation cannot defend the
+detach dispatch itself (v1 finding 8's residue). The actual guards: the
+hook column entry is cleared at detach, so a second `unwatched` dispatch
+for the same record finds no hook and is a no-op; and record reclamation
+goes through the standard logical free, whose live-flag clear comes
+FIRST in the identity phase (hardening 1) — a re-entrant second free
+hits the flag gate before the generation has any chance to mislead it,
+and the sweep frees each queued record once.
 
 ## Costs and gates
 
@@ -407,17 +524,25 @@ machine must not loosen every gate at once.
     untracked. Repeat via every save channel: the public frame setter,
     effect/scope creation exits, cleanup invocation, and the trigger
     scratch.
-13. Clear side at LOGICAL-FREE time: free the active subscriber via
-    explicit dispose inside its own frame, via scope-region teardown,
-    and via registry reclamation — in all three, tracking stops at the
-    free itself (generation bumped, caches cleared before the free
-    returns); a detachable signal read afterwards in the same frame
-    returns its closure value with no attach; the self-stop-then-spawn
-    scenario creates the child as a root effect with no ghost edge into
-    the freed parent.
-14. Disposal mid-run unlinks the entire old dependency set via the
-    consume-the-head loop, including when an unlinked child's cleanup
-    disposes siblings mid-walk; child cleanups run in creation order
+13. Identity phase at LOGICAL-FREE time, in pinned order: free the
+    active subscriber via explicit dispose inside its own frame, via
+    scope-region teardown, and via registry reclamation — in all three,
+    the live flag clears FIRST, the generation bumps SECOND, and the
+    frame caches zero THIRD, all before the free's dependency unlinking
+    can cascade into user code; tracking stops at the free itself; a
+    detachable signal read afterwards in the same frame returns its
+    closure value with no attach; the self-stop-then-spawn scenario
+    creates the child as a root effect with no ghost edge into the freed
+    parent; a child cleanup that re-entrantly disposes the same record
+    hits the live-flag gate and queues nothing.
+14. No walk resumes from a cached link id across an unlink that can run
+    user code: disposal mid-run unlinks the entire old dependency set
+    via the consume-the-head loop, including when an unlinked child's
+    cleanup disposes siblings mid-walk; the SELECTIVE child-effect pass
+    rescans from the head after each unlink and still skips (and keeps)
+    non-effect deps; `purgeDeps` and `trigger`'s teardown survive a
+    cleanup that disposes the walk's own subject and recycles the cached
+    link onto a foreign edge; child cleanups run in creation order
     (pinned); the computed double-teardown corruption is covered.
 15. Attach inside a scoped effect for a top-level signal: the record
     joins NO region; disposing the scope leaves the outside consumer
@@ -439,9 +564,10 @@ machine must not loosen every gate at once.
     dependencies; never-watched untracked computeds unchanged.
 20. Hardening 5: one million synchronous trigger() iterations over one
     detachable signal never grow the arena beyond initial capacity
-    (records recycle at exits); growth fires only from the microtask
-    path or growCapacity() — never inside a frame exit (asserted by
-    instrumentation in the test build).
+    (records recycle at quiescent points); growth fires only from the
+    microtask path, growCapacity(), or a creation trampoline's
+    pre-dispatch boundary — never at a frame exit and never inside a
+    host frame (asserted by instrumentation in the test build).
 21. reset() throws inside an open batch; at quiescence it detaches
     attached default callables with their newest accepted value.
 22. Pre-existing bug #4 regression (lands with its fix): a trigger()
@@ -457,7 +583,91 @@ machine must not loosen every gate at once.
 25. Registry identity (pre-existing bug #5 regression): dispose an
     owner-registered id, recycle its record to a live node, drop the
     owner — the orphan callback generation-mismatches and the new
-    occupant is untouched.
+    occupant is untouched. The pair's capture point is pinned: create an
+    owner-registered node while a growth is pending so the allocation
+    forwards mid-call — the captured generation is the NEW arena's; and
+    dispose-and-recycle a registered record between creation and the
+    registration drain — the registration still holds the creation-time
+    pair and mismatches.
+
+## Additional correctness obligations (v6)
+
+26. Split freed hook, disposeEffect side: stop an effect with a cleanup —
+    the cleanup RUNS; stop an effectScope owning raw ids — the region is
+    queued and every member is reclaimed; both also via the unwatched
+    cascade and via reset(). (The a6/b6 FATAL regression.)
+27. Split freed hook, late-store side: an effect that stops itself
+    mid-body and returns a cleanup — the store lands after the free, the
+    sweep's release phase clears it, the closure is collectable (GC leak
+    suite), and recycling the record as a signal inherits no stale
+    column entry.
+28. Sweep quiescence: a computed getter that disposes a node the live
+    dirtiness walk descended through, then creates nodes before the walk
+    unwinds — no record held by the walk is recycled mid-walk; the walk
+    resolves dirtiness correctly; instrumentation asserts the sweep
+    never fires while the traversal stacks are non-empty. Pre-existing
+    bug #6 regression (lands with its fix): freed link records are not
+    reused while a kernel traversal is live.
+29. Bug #4 sites 4a/4b (effectId/effectScopeId): cross the growth
+    threshold, then create a top-level effect — it tracks its reads,
+    re-runs on writes, brackets the live arena, and under a manual frame
+    its parent link lands in the live generation; same for effectScope
+    (nested raw nodes join the live scope's region and die with it).
+30. Guard-before-mutation: save a raw id created in a scope, stop the
+    scope, dispose the id, sweep, recycle the record to a live computed —
+    the region teardown's generation guard rejects the entry BEFORE any
+    host column store; the new occupant's getter survives.
+31. Frame token: getActiveSubFrame/setActiveSubFrame round-trip
+    installs the same subscriber; after free-and-recycle the restore
+    installs 0; the token is a plain number (no allocation per save);
+    packing widths are pinned by test.
+
+## How v7 answers the v6 reviews
+
+- The wholesale hook move (a6 FATAL 1, MAJOR 2; b6 FATAL 1) → the freed
+  dispatch splits: an identity phase (non-live → generation bump →
+  frame-cache clears, at the top of the logical free, before any user
+  code) and the unchanged sweep-time release phase. `disposeEffect`'s
+  post-free column reads survive; late column stores are caught by the
+  sweep's unconditional clear; the re-entrant double-queue trap is
+  closed by non-live-first ordering. The a5-7 invariant is now stated in
+  the body (columns intact from free to sweep, cleared unconditionally
+  at the sweep). Obligations 13 (rewritten), 26, 27.
+- effectId/effectScopeId frameless growth (a6 MAJOR 4; b6 FATAL 2) →
+  bug #4 refiled with four sites; the effect/scope fix hoists the growth
+  boundary into the module trampoline before host-generation dispatch;
+  in-closure allocation never grows; obligation 20 rewritten to match
+  (the v6 self-contradiction with hardening 5 is gone). Obligation 29.
+- Sweep placement (a6 MAJOR 3) → the sweep condition is quiescence
+  (depth zero AND empty traversal state), placed at outermost
+  public-entry returns; detach step 3's safety-envelope sentence now
+  refers to that envelope. Pre-existing bug #6 (mid-walk link-record
+  reuse, reachable today) is filed with its fix: walk-local pending list
+  for links unlinked while a traversal is live. Obligation 28.
+- Selective/partial walks (a6 MAJOR 5; b6 MAJOR 6) → hardening 2 is now
+  a per-walk-shape rule: consume-the-head for the two full teardowns;
+  anchored rescan after every user-code-capable unlink for the
+  child-effect pass, purgeDeps, and trigger's teardown. Obligation 14
+  rewritten.
+- Registry pair capture (a6 MINOR 6; b6 MAJOR 3) → captured atomically
+  at allocation, read back post-forwarding; never at the drain.
+  Obligation 25 extended.
+- Guard-before-mutation (b6 MAJOR 4) → normative rule in hardening 1:
+  deferred consumers validate the pair before any host-side store; the
+  region teardown's pre-guard `fns` erasure moves behind the guard.
+  Obligation 30.
+- Public frame API (a6 MINOR 8; b6 MAJOR 5) → named and specified:
+  getActiveSubFrame/setActiveSubFrame with a packed-f64 token (31-bit
+  id, 22-bit generation, wrap caveat documented); the raw id setter
+  keeps a narrowed live-ids-only contract. Obligation 31.
+- Consistency defects (a6 MINOR 7) → the Double-free defense section
+  rewritten for queue-time bumps; detach step 3 states its identity
+  phase and that the sweep never bumps again; obligation 13 pins
+  bump-first ordering explicitly; the frame-token API lives in the body,
+  not a phantom change list.
+- Confirmed unchanged by both reviews: the queue-time generation bump
+  itself, top-level unscoped signalId/computedId growth forwarding, and
+  the end-to-end detach mechanics (sixth consecutive round).
 
 ## How v6 answers the v5 reviews
 
