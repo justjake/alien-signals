@@ -58,7 +58,13 @@ test('cleanup order on dispose: inner before outer', () => {
 	expect(log).toEqual(['inner:cleanup', 'outer:cleanup']);
 });
 
-test('sibling cleanup order on dispose: reverse creation (LIFO)', () => {
+// PINNED SEMANTIC CHANGE (hardening 2): sibling child effects clean up in
+// CREATION order. Teardown walks consume the dependency-list head — a
+// tail-anchored walk unlinks nothing when the parent frame is mid-run
+// (DepsTail is reset to zero), and a cached pointer can go foreign when a
+// child's cleanup disposes siblings mid-walk. reset() keeps its own
+// newest-first order.
+test('sibling cleanup order on dispose: creation order (head-consume)', () => {
 	const log: string[] = [];
 
 	const dispose = effect(() => {
@@ -75,14 +81,14 @@ test('sibling cleanup order on dispose: reverse creation (LIFO)', () => {
 	});
 	dispose();
 	expect(log).toEqual([
-		'inner3:cleanup',
-		'inner2:cleanup',
 		'inner1:cleanup',
+		'inner2:cleanup',
+		'inner3:cleanup',
 		'outer:cleanup',
 	]);
 });
 
-test('sibling cleanup order on outer re-run: reverse creation (LIFO)', () => {
+test('sibling cleanup order on outer re-run: creation order (head-consume)', () => {
 	const log: string[] = [];
 	const a = signal(0);
 
@@ -103,9 +109,9 @@ test('sibling cleanup order on outer re-run: reverse creation (LIFO)', () => {
 
 	a(1);
 	expect(log.slice(0, 4)).toEqual([
-		'inner3:cleanup',
-		'inner2:cleanup',
 		'inner1:cleanup',
+		'inner2:cleanup',
+		'inner3:cleanup',
 		'outer:cleanup',
 	]);
 });
@@ -130,9 +136,10 @@ test('three-level nested cleanup on dispose: deepest first (depth-first reverse)
 	]);
 });
 
-test('computed unwatched: child effect cleanups run in reverse creation (LIFO)', () => {
-	// When the computed loses its last subscriber and gets unwatched, any
-	// effects it created during its getter must be cleaned up LIFO, not FIFO.
+test('computed unwatched: child effect cleanups run in creation order', () => {
+	// When the computed loses its last subscriber and gets unwatched, the
+	// effects its getter created clean up in creation order (hardening 2's
+	// pinned order — see the sibling-order tests above).
 	const log: string[] = [];
 	const c = computed(() => {
 		effect(() => () => log.push('e1'));
@@ -143,7 +150,7 @@ test('computed unwatched: child effect cleanups run in reverse creation (LIFO)',
 	const dispose = effect(() => { c(); });
 	log.length = 0;
 	dispose();
-	expect(log).toEqual(['e3', 'e2', 'e1']);
+	expect(log).toEqual(['e1', 'e2', 'e3']);
 });
 
 test('effect created inside computed: old inner cleanup runs before new inner setup', () => {

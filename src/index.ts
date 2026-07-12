@@ -683,15 +683,19 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 			activeSub = prevSub;
 			M[id + NodeSlot.Flags] &= Host.Hidden;
 			++globalVersion;
+			// Consume the head, never the unlink's returned next pointer: the
+			// unlink cascades and the propagation waves below run user code
+			// (cleanups, getters) that can dispose links ahead of the walk.
 			let l: LinkId = M[id + NodeSlot.Deps];
 			while (l !== 0) {
 				const dep: SignalId = M[l + LinkSlot.Dep];
-				l = unlink(l, id);
+				unlink(l, id);
 				const subs: LinkId = M[dep + NodeSlot.Subs];
 				if (subs !== 0) {
 					propagate(subs, runDepth !== 0);
 					shallowPropagate(subs);
 				}
+				l = M[id + NodeSlot.Deps];
 			}
 			--M[SysSlot.EnterDepth];
 			if (persistent) {
@@ -783,7 +787,7 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 				// next read (the zeroed snapshot defeats the version gate).
 				M[id + NodeSlot.Flags] = (flags & Host.Hidden) | Flag.Mutable | Flag.Dirty;
 				D[(id >> Arena.VersionShift) + Arena.VersionOffset] = 0;
-				disposeAllDepsInReverse(id);
+				disposeAllDeps(id);
 			}
 		} else if (kind >= Host.Effect) {
 			disposeEffect(id);
@@ -929,32 +933,44 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 	// Unlink the child effects/scopes a re-running parent created last time:
 	// each unlink empties the child's subscriber list, which delivers
 	// unwatched(), which disposes it. Values and computeds in the walk are left
-	// alone.
+	// alone. SELECTIVE walk: after every unlink — which runs the child's
+	// cleanup, and that user code can dispose siblings and recycle link
+	// records — restart the scan from the head; a cached pointer can come
+	// back naming a foreign edge. Children unlink in creation order.
 	function disposeChildEffects(sub: SignalId): void {
-		let l: LinkId = M[sub + NodeSlot.DepsTail];
+		let l: LinkId = M[sub + NodeSlot.Deps];
 		while (l !== 0) {
-			const prev: LinkId = M[l + LinkSlot.PrevDep];
 			if ((M[M[l + LinkSlot.Dep] + NodeSlot.Flags] & Host.KindMask) >= Host.Effect) {
 				unlink(l, sub);
+				l = M[sub + NodeSlot.Deps];
+			} else {
+				l = M[l + LinkSlot.NextDep];
 			}
-			l = prev;
 		}
 	}
-	function disposeAllDepsInReverse(sub: SignalId): void {
-		let l: LinkId = M[sub + NodeSlot.DepsTail];
+	// Consume the head until it names nothing (see the kernel's disposeAllDeps
+	// for why tail-anchored and cached-pointer walks are unsound here).
+	function disposeAllDeps(sub: SignalId): void {
+		let l: LinkId = M[sub + NodeSlot.Deps];
 		while (l !== 0) {
-			const prev: LinkId = M[l + LinkSlot.PrevDep];
 			unlink(l, sub);
-			l = prev;
+			l = M[sub + NodeSlot.Deps];
 		}
 	}
 	// Drop the dependency edges a tracking pass did not re-establish (upstream's
-	// purgeDeps): everything after the pass's depsTail ages out.
+	// purgeDeps): everything after the pass's depsTail ages out. The walk
+	// position is re-derived from the record after every unlink — never a
+	// cached next pointer — because the unwatched cascade an unlink can
+	// trigger runs user cleanups that may dispose links ahead of the walk (or
+	// the sub itself). The DepsTail cursor is safe to re-read: unlink keeps
+	// it live-or-zero.
 	function purgeDeps(sub: SignalId): void {
-		const depsTail: LinkId = M[sub + NodeSlot.DepsTail];
+		let depsTail: LinkId = M[sub + NodeSlot.DepsTail];
 		let l: LinkId = depsTail !== 0 ? M[depsTail + LinkSlot.NextDep] : M[sub + NodeSlot.Deps];
 		while (l !== 0) {
-			l = unlink(l, sub);
+			unlink(l, sub);
+			depsTail = M[sub + NodeSlot.DepsTail];
+			l = depsTail !== 0 ? M[depsTail + LinkSlot.NextDep] : M[sub + NodeSlot.Deps];
 		}
 	}
 	function getSlow(id: SignalId, getter?: NodeFn): unknown {

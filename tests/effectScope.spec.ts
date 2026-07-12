@@ -13,7 +13,9 @@ test('scope dispose runs child effect cleanup', () => {
 	expect(log).toEqual(['inner:cleanup']);
 });
 
-test('scope dispose: sibling effects clean up in reverse creation (LIFO)', () => {
+test('scope dispose: sibling effects clean up in creation order', () => {
+	// Hardening 2's pinned order: teardown consumes the dependency-list
+	// head, so siblings unlink in creation order (see tests/effect.spec.ts).
 	const log: string[] = [];
 	const dispose = effectScope(() => {
 		effect(() => {
@@ -27,7 +29,7 @@ test('scope dispose: sibling effects clean up in reverse creation (LIFO)', () =>
 		});
 	});
 	dispose();
-	expect(log).toEqual(['e3:cleanup', 'e2:cleanup', 'e1:cleanup']);
+	expect(log).toEqual(['e1:cleanup', 'e2:cleanup', 'e3:cleanup']);
 });
 
 test('scope dispose: nested effect cleanup runs depth-first reverse', () => {

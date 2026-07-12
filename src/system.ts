@@ -1206,7 +1206,7 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 				hostUnwatchedNode(id);
 			}
 			M[id + NodeSlot.Flags] = 0;
-			disposeAllDepsInReverse(id);
+			disposeAllDeps(id);
 			let sub = M[id + NodeSlot.Subs];
 			while (sub !== 0) {
 				unlink(sub);
@@ -1389,6 +1389,14 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			const prevSub = M[id + LinkSlot.PrevSub];
 			if (nextDep !== 0) {
 				M[nextDep + LinkSlot.PrevDep] = prevDep;
+				// The sub's DepsTail cursor can name a MIDDLE link (it is the
+				// re-track position, not the chain end); an unwatched cascade
+				// unlinking that very link would leave the cursor naming a
+				// freed record. Keep it live-or-zero: host walks re-derive
+				// their position from it.
+				if (M[sub + NodeSlot.DepsTail] === id) {
+					M[sub + NodeSlot.DepsTail] = prevDep;
+				}
 			} else {
 				M[sub + NodeSlot.DepsTail] = prevDep;
 			}
@@ -1795,18 +1803,25 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		// mirrors disposeInner's re-entrancy guard.
 		function reclaimOrphan(id: number): void {
 			M[id + NodeSlot.Flags] = 0;
-			disposeAllDepsInReverse(id);
+			disposeAllDeps(id);
 			pendingFree[shared.pendingFreeEnd++] = id;
 			shared.boundaryPending = true;
 			shared.scheduleMaintenance();
 		}
 
-		function disposeAllDepsInReverse(sub: number): void {
-			let cur = M[sub + NodeSlot.DepsTail];
+		// Consume the HEAD until it names nothing. A tail-anchored walk fails
+		// two ways: a RUNNING frame has reset DepsTail to zero (disposing a
+		// running subscriber would unlink nothing, leaving its edges alive in
+		// every dependency's subscriber list), and an unlinked child's own
+		// cleanup can dispose siblings and recycle link records mid-walk (a
+		// cached pointer can come back naming a foreign edge). Re-reading the
+		// head slot each iteration survives both. Consequence: child effects
+		// unlink — and their cleanups run — in creation order.
+		function disposeAllDeps(sub: number): void {
+			let cur = M[sub + NodeSlot.Deps];
 			while (cur !== 0) {
-				const prev = M[cur + LinkSlot.PrevDep];
 				unlink(cur, sub);
-				cur = prev;
+				cur = M[sub + NodeSlot.Deps];
 			}
 		}
 
