@@ -58,6 +58,15 @@ const enum Host {
 	 * update exit clears the bit and drops only if still unwatched.
 	 */
 	PendingDrop = 8 << Flag.HostShift,
+	/**
+	 * A default-callable signal record whose lifetime is owned by its
+	 * incoming links: when the last one unlinks, the record DETACHES — the
+	 * newest value moves back into the callable's closure and the record is
+	 * reclaimed (see signal() and detachSignal). The actual dispatch gate is
+	 * the hook column entry's presence; this bit just keeps raw signals off
+	 * the column lookup.
+	 */
+	Detachable = 16 << Flag.HostShift,
 }
 
 /**
@@ -93,6 +102,14 @@ const cleanups: ((() => void) | void)[] = [];
 // scope disposes. Gen-guarded, so a member freed early (and its record
 // reused) cannot be freed out from under the new occupant.
 const owned: (number[] | undefined)[] = [];
+// Detach hooks for attached default-callable signals (see signal()). While
+// attached, the entry is a DELIBERATE strong reference to the callable's
+// closure environment: consumers hold only integer ids, so the environment
+// must outlive the last link. A populated entry is the one proof that an
+// attached, not-yet-detached record is behind this id — its presence gates
+// the detach dispatch, which makes a second dispatch a no-op and keeps
+// masqueraded records out. Detach clears the entry synchronously.
+const hooks: ((() => void) | undefined)[] = [];
 
 // ---- host-owned tracking state (upstream's module lets) ---------------------
 
@@ -118,6 +135,7 @@ const hostDeps: HostDeps = {
 	fns,
 	cleanups,
 	owned,
+	hooks,
 	queued,
 	queuedGens,
 	pendingRegions,
@@ -190,6 +208,7 @@ let hostUnwatchedNode!: (id: SignalId) => void;
 let hostReadSignal!: (id: SignalId) => unknown;
 let hostReadComputed!: (id: SignalId, getter?: NodeFn) => unknown;
 let hostSet!: (id: SignalId, value: unknown) => void;
+let hostAttachSignal!: (value: unknown) => SignalId;
 
 // TODO(seeding): port main's adaptive seeding at library level — synthetic
 // graph warm-up keyed on callback-shape diversity (String(fn) sampled on a
@@ -224,6 +243,7 @@ const system = createReactiveSystem({
 		hostReadSignal = host.readSignal;
 		hostReadComputed = host.readComputed;
 		hostSet = host.set;
+		hostAttachSignal = host.attachSignal;
 		// The side columns are NOT presized to capacity: pointer arrays are
 		// traversed by major GC marking, and capacity-sized columns (2M
 		// slots x 5 arrays) put a ~10 ms Mark-Compact tax on every major
@@ -259,6 +279,7 @@ interface HostDeps {
 	fns: (NodeFn | undefined)[];
 	cleanups: ((() => void) | void)[];
 	owned: (number[] | undefined)[];
+	hooks: ((() => void) | undefined)[];
 	queued: SignalId[];
 	queuedGens: number[];
 	pendingRegions: (number[] | undefined)[];
@@ -290,7 +311,7 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 	const checkDirty = arena.checkDirty;
 	const shallowPropagate = arena.shallowPropagate;
 	const freeNode = arena.freeNode;
-	const { currentVals, pendingVals, fns, cleanups, owned, queued, queuedGens, pendingRegions } = deps;
+	const { currentVals, pendingVals, fns, cleanups, owned, hooks, queued, queuedGens, pendingRegions } = deps;
 	// Side columns must never contain holes. A skipped index (node records
 	// interleave with link records, so column writes stride) leaves a hole,
 	// and JavaScriptCore moves a holey array into its sparse ArrayStorage
@@ -306,6 +327,7 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 			fns.push(undefined);
 			cleanups.push(undefined);
 			owned.push(undefined);
+			hooks.push(undefined);
 		}
 	}
 
@@ -859,6 +881,9 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 		if (idx < owned.length) {
 			owned[idx] = undefined;
 		}
+		if (idx < hooks.length) {
+			hooks[idx] = undefined;
+		}
 	}
 	// Upstream's unwatched, delivered when a node's last subscriber unlinks.
 	function unwatchedNode(id: SignalId): void {
@@ -879,7 +904,75 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 			}
 		} else if (kind >= Host.Effect) {
 			disposeEffect(id);
+		} else if (flags & Host.Detachable) {
+			detachSignal(id);
 		}
+	}
+	// ---- detachable signal records (the default signal() callable) --------
+	// A default signal is born DETACHED: no record, no registry cell — its
+	// value lives in the callable's closure. The record materializes at the
+	// first tracked read (attach) and dissolves when the last incoming link
+	// unlinks (detach): the graph's own last-unlink report replaces the
+	// FinalizationRegistry as the reclaimer for this one creation path.
+
+	// Attach steps 1-3, ordered for exception safety and bracketed so a
+	// pending arena growth cannot migrate the arena between the allocation
+	// and the link insert (growth is deferred while any frame is open).
+	// Returns 0 for an untracked read: only link creation can make anything
+	// depend on the record, so an unwatched read needs no record at all.
+	function attachSignal(value: unknown): SignalId {
+		if (activeSub === 0) {
+			return 0;
+		}
+		++M[SysSlot.EnterDepth];
+		try {
+			// A DEDICATED allocation, not signalId: an attached-by-read
+			// record must never join a scope region (a region frees by id,
+			// and a record owned by its links would be freed out from under
+			// live outside consumers) and takes no registry cell. The kind
+			// tag and Mutable bit stay — without them the update dispatch
+			// would route the record to the computed path.
+			const id = deps.sys.allocNode(Host.Signal | Host.Detachable | Flag.Mutable);
+			const idx = id >> Arena.NodeIndexShift;
+			if (idx >= fns.length) {
+				growColumns(idx);
+			}
+			// Seed BOTH value columns: seeding only one produces a spurious
+			// invalidation on the first equal write after attach.
+			currentVals[idx] = value;
+			pendingVals[idx] = value;
+			try {
+				// The link's first-subscriber arming sets HostStarted, which
+				// is what routes the eventual last-unlink back to
+				// detachSignal. No new kernel calls.
+				link(id, activeSub, cycle);
+			} catch (e) {
+				// Arena exhausted at the link step: free the record and
+				// rethrow. The closure still holds the value, so the signal
+				// remains a working detached signal and nothing is pinned.
+				freeNode(id, M[id + NodeSlot.Gen]);
+				throw e;
+			}
+			return id;
+		} finally {
+			--M[SysSlot.EnterDepth];
+		}
+	}
+	// Detach: the newest accepted value moves back into the closure (the
+	// hook), the record is reclaimed through the standard logical free. The
+	// hook entry's PRESENCE is the dispatch gate: a second dispatch for the
+	// same record — re-entrant stop patterns, the reset walk — finds no hook
+	// and is a no-op, and a record that merely masquerades as a started
+	// signal (the reset-sweep flag misread past cycle 8192) has no entry.
+	function detachSignal(id: SignalId): void {
+		const idx = id >> Arena.NodeIndexShift;
+		const hook = hooks[idx];
+		if (hook === undefined) {
+			return;
+		}
+		hooks[idx] = undefined;
+		hook();
+		freeNode(id, M[id + NodeSlot.Gen]);
 	}
 	// Drop an unwatched computed's dependency graph and force re-evaluation
 	// on the next read (the zeroed snapshot defeats the version gate).
@@ -1189,6 +1282,7 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 		freedNode,
 		freeingNode,
 		unwatchedNode,
+		attachSignal,
 		readSignal,
 		readComputed,
 		getSlow,
@@ -1276,12 +1370,22 @@ export function growCapacity(records: number): void {
  * effects run; version counters keep counting.
  */
 export function reset(): void {
+	if (host.getBatchDepth() !== 0) {
+		// Resetting host counters under a live endBatch() would drive the
+		// batch depth negative and kill flushing for the process.
+		throw new Error('dalien-signals: reset() called inside an open batch');
+	}
+	// The reset walk delivers unwatched before the arena rewinds: an
+	// attached default callable detaches there with its newest value, so
+	// after reset() every default signal callable is a working detached
+	// signal — the one pre-reset handle class that stays valid.
 	system.reset();
 	currentVals.length = 0;
 	pendingVals.length = 0;
 	fns.length = 0;
 	cleanups.length = 0;
 	owned.length = 0;
+	hooks.length = 0;
 	pendingRegions.length = 0;
 	// Scalars, queue, and pending regions reset inside the current host
 	// generation. globalVersion and cycle keep counting: fresh records hold
@@ -1503,14 +1607,41 @@ export type EffectStop = () => void;
 export function signal<T>(): WriteableSignal<T | undefined>;
 export function signal<T>(initialValue: T): WriteableSignal<T>;
 export function signal<T>(initialValue?: T): WriteableSignal<T | undefined> {
-	const oper = (...value: [T?]) => {
-		if (value.length) {
-			hostSet(id, value[0] as T);
-		} else {
+	// Born DETACHED: no arena record, no registry cell — the value lives
+	// here in the closure until the first tracked read allocates a record
+	// (attach; id flips from the 0 sentinel), and moves back when the last
+	// incoming link unlinks (detach; the hook below runs and id flips back).
+	// Exactly one mechanism owns the record at every point: the JS garbage
+	// collector while detached, the incoming links while attached.
+	let id: SignalId = 0;
+	let value = initialValue;
+	const oper = (...next: [T?]) => {
+		if (next.length) {
+			if (id !== 0) {
+				hostSet(id, next[0] as T);
+			} else if (value !== next[0]) {
+				// No version traffic: versions let consumers compare
+				// readings, and link creation is the only way to become a
+				// consumer — which attaches first.
+				value = next[0];
+			}
+		} else if (id !== 0) {
 			return hostReadSignal(id);
+		} else {
+			const attached = hostAttachSignal(value);
+			if (attached !== 0) {
+				// Only after the link exists: install the detach hook (the
+				// pin that keeps this environment alive for the consumers'
+				// integer ids) and take the record's identity.
+				hooks[attached >> Arena.NodeIndexShift] = () => {
+					value = pendingVals[attached >> Arena.NodeIndexShift] as T;
+					id = 0;
+				};
+				id = attached;
+			}
+			return value;
 		}
 	};
-	const id = signalId(initialValue, oper);
 	return oper as WriteableSignal<T | undefined>;
 }
 
