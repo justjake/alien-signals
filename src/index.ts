@@ -271,7 +271,7 @@ interface HostDeps {
 	pendingRegionsEnd: number;
 	regionFlushScheduled: boolean;
 	/** Late-bound: assigned right after createReactiveSystem returns. */
-	sys: { createNode(owner: WeakKey, bits?: number): SignalId; allocNode(bits?: number): SignalId; adoptNode(owner: WeakKey, id: SignalId): void };
+	sys: { createNode(owner: WeakKey, bits?: number): SignalId; allocNode(bits?: number): SignalId; adoptNode(owner: WeakKey, id: SignalId): void; boundary(): void };
 }
 
 // CLOSED FUNCTION (tests/hostCodegen.spec.ts pins this): its only free
@@ -725,58 +725,67 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 	function trigger(fn: () => void): void {
 		// A scratch subscriber records the reads; unlinking it afterwards turns
 		// each recorded dependency into an out-of-band invalidation wave.
-		let id: SignalId;
-		let persistent = false;
-		if (!triggerScratchBusy && triggerScratch !== 0) {
-			id = triggerScratch;
-			persistent = true;
-			M[id + NodeSlot.Flags] = (M[id + NodeSlot.Flags] & Host.Hidden) | Flag.Watching | Flag.RecursedCheck;
-		} else {
-			id = deps.sys.allocNode(Flag.Watching | Flag.RecursedCheck);
-			const tidx = id >> Arena.NodeIndexShift;
-			if (tidx >= fns.length) {
-				growColumns(tidx);
-			}
-			fns[tidx] = noopEffectBody as NodeFn;
-			if (triggerScratch === 0 && !triggerScratchBusy) {
-				triggerScratch = id;
-				persistent = true;
-			}
-		}
-		if (persistent) {
-			triggerScratchBusy = true;
-		}
-		const prevSub = activeSub;
-		const prevSubGen: SignalGen = M[prevSub + NodeSlot.Gen];
-		activeSub = id;
+		// The bracket opens BEFORE the scratch allocation (bug #4): with a
+		// growth pending, an allocation outside the bracket would retire the
+		// arena mid-call and split the scratch from this closure's memory —
+		// inside it, growth stays deferred and both stay one generation.
 		++batchDepth;
 		++M[SysSlot.EnterDepth];
+		let id: SignalId = 0;
+		let persistent = false;
+		const prevSub = activeSub;
+		const prevSubGen: SignalGen = M[prevSub + NodeSlot.Gen];
 		try {
+			if (!triggerScratchBusy && triggerScratch !== 0) {
+				id = triggerScratch;
+				persistent = true;
+				M[id + NodeSlot.Flags] = (M[id + NodeSlot.Flags] & Host.Hidden) | Flag.Watching | Flag.RecursedCheck;
+			} else {
+				id = deps.sys.allocNode(Flag.Watching | Flag.RecursedCheck);
+				const tidx = id >> Arena.NodeIndexShift;
+				if (tidx >= fns.length) {
+					growColumns(tidx);
+				}
+				fns[tidx] = noopEffectBody as NodeFn;
+				if (triggerScratch === 0 && !triggerScratchBusy) {
+					triggerScratch = id;
+					persistent = true;
+				}
+			}
+			if (persistent) {
+				triggerScratchBusy = true;
+			}
+			activeSub = id;
 			fn();
 		} finally {
 			activeSub = frameOr0(prevSub, prevSubGen);
-			M[id + NodeSlot.Flags] &= Host.Hidden;
-			++globalVersion;
-			// Consume the head, never the unlink's returned next pointer: the
-			// unlink cascades and the propagation waves below run user code
-			// (cleanups, getters) that can dispose links ahead of the walk.
-			let l: LinkId = M[id + NodeSlot.Deps];
-			while (l !== 0) {
-				const dep: SignalId = M[l + LinkSlot.Dep];
-				unlink(l, id);
-				const subs: LinkId = M[dep + NodeSlot.Subs];
-				if (subs !== 0) {
-					propagate(subs, runDepth !== 0);
-					shallowPropagate(subs);
+			if (id !== 0) {
+				M[id + NodeSlot.Flags] &= Host.Hidden;
+				++globalVersion;
+				// Consume the head, never the unlink's returned next pointer:
+				// the unlink cascades and the propagation waves below run user
+				// code (cleanups, getters) that can dispose links ahead of the
+				// walk.
+				let l: LinkId = M[id + NodeSlot.Deps];
+				while (l !== 0) {
+					const dep: SignalId = M[l + LinkSlot.Dep];
+					unlink(l, id);
+					const subs: LinkId = M[dep + NodeSlot.Subs];
+					if (subs !== 0) {
+						propagate(subs, runDepth !== 0);
+						shallowPropagate(subs);
+					}
+					l = M[id + NodeSlot.Deps];
 				}
-				l = M[id + NodeSlot.Deps];
 			}
 			--M[SysSlot.EnterDepth];
-			if (persistent) {
-				triggerScratchBusy = false;
-			} else {
-				fns[id >> Arena.NodeIndexShift] = undefined;
-				freeNode(id, M[id + NodeSlot.Gen]);
+			if (id !== 0) {
+				if (persistent) {
+					triggerScratchBusy = false;
+				} else {
+					fns[id >> Arena.NodeIndexShift] = undefined;
+					freeNode(id, M[id + NodeSlot.Gen]);
+				}
 			}
 			if (!--batchDepth && !manualEffects) {
 				flush();
@@ -982,20 +991,28 @@ function createHost(arena: ReactiveArena, deps: HostDeps, boot: HostBoot) {
 		try {
 			drainQueue();
 		} catch (e) {
-			// Abnormal exit (an effect threw): survivors are re-armed — a change
-			// to THEIR dependencies re-notifies them — but the failed flush does
-			// not resume on unrelated writes (upstream parity).
-			while (notifyIndex < queuedLength) {
-				const i = notifyIndex++;
-				const id = queued[i];
-				if (M[id + NodeSlot.Gen] === queuedGens[i] && fns[id >> Arena.NodeIndexShift] !== undefined) {
-					M[id + NodeSlot.Flags] |= Flag.Watching | Flag.Recursed;
-				}
-			}
-			notifyIndex = 0;
-			queuedLength = 0;
+			abortFlush();
 			throw e;
 		}
+		// Quiescent point: the flush's teardown work (freed records, pending
+		// growth) applies here rather than piling up across a synchronous
+		// churn loop until the microtask. Depth-gated inside — a flush
+		// nested in a live frame skips it.
+		deps.sys.boundary();
+	}
+	// Abnormal flush exit (an effect threw): survivors are re-armed — a change
+	// to THEIR dependencies re-notifies them — but the failed flush does not
+	// resume on unrelated writes (upstream parity).
+	function abortFlush(): void {
+		while (notifyIndex < queuedLength) {
+			const i = notifyIndex++;
+			const id = queued[i];
+			if (M[id + NodeSlot.Gen] === queuedGens[i] && fns[id >> Arena.NodeIndexShift] !== undefined) {
+				M[id + NodeSlot.Flags] |= Flag.Watching | Flag.Recursed;
+			}
+		}
+		notifyIndex = 0;
+		queuedLength = 0;
 	}
 	function drainQueue(): void {
 		while (notifyIndex < queuedLength) {
@@ -1326,11 +1343,24 @@ export function computedId<T>(getter: (previousValue?: T) => T, owner?: WeakKey)
 	return host.computedId(getter as NodeFn, owner) as SignalIdOf<T>;
 }
 
+// Effect and scope creation run the growth boundary BEFORE dispatching into
+// the host generation (bug #4): these entries establish frame state (active
+// subscriber, enter-depth bracket, parent link) and keep executing after
+// their allocation, so an in-call growth would retire the arena under the
+// in-flight closure — the effect would track into the dead generation while
+// reads dispatch through the new one. At the trampoline the host stack is
+// genuinely empty, so a pending growth applies here and the dispatch below
+// lands in the current generation. (Top-level signalId/computedId keep
+// in-call forwarding: their post-allocation work touches only shared side
+// columns, and their scoped variants run inside the scope's bracket, where
+// growth is always deferred.)
 export function effectId(fn: () => void | (() => void)): SignalId {
+	system.boundary();
 	return host.effectId(fn);
 }
 
 export function effectScopeId(fn: () => void): SignalId {
+	system.boundary();
 	return host.effectScopeId(fn);
 }
 

@@ -27,13 +27,18 @@ const BUDGETS: Record<string, number> = {
 	linkInsert: 340,
 	unlink: 300,
 	propagate: 420,
-	checkDirty: 420, // wrapper + shallow fast paths + the chainCheck dispatch
+	checkDirty: 120, // the walk bracket (held-link release around the entry)
+	checkDirtyEntry: 420, // shallow fast paths + the chainCheck dispatch
 	chainCheck: 300, // stackless chain walk (not inlined; it loops)
 	checkDirtyLoop: INLINE_LIMIT,
 	updateAndShallow: 100,
 	shallowPropagate: 160,
 	isValidLink: 100,
-	purgeDeps: 100, // the HOST's purge loop (index.ts) — core's died with the kit
+	// The HOST's purge loop (index.ts). 100 -> 120 for hardening 2: the walk
+	// re-derives its position from the record after every unlink instead of
+	// trusting the unlink's returned next pointer (an unwatched cascade can
+	// free links ahead of the walk).
+	purgeDeps: 120,
 	// the kindless seam + userspace verbs on hot paths
 	update: 80, // pure seam trampoline: flags load + hostUpdate dispatch
 	notify: 80, // WATCHING dedup + host handoff

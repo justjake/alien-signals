@@ -380,6 +380,17 @@ export interface ReactiveSystem {
 	 */
 	growCapacity(records: number): void;
 	/**
+	 * Run any pending boundary work NOW if the system is quiescent (no live
+	 * frames): apply a stashed growth and sweep the free-record backlog.
+	 * A no-op mid-operation. Hosts call this at two kinds of sites: before
+	 * dispatching a creation entry that establishes frame state (so a
+	 * pending growth never retires the arena under the in-flight host
+	 * call), and at the return of outermost operations (so synchronous
+	 * churn loops recycle records instead of piling them up until the
+	 * microtask).
+	 */
+	boundary(): void;
+	/**
 	 * Bulk arena teardown for generation-scoped lifecycles (per-request
 	 * graphs, worker pools, benchmark harness cleanup): rewinds the record
 	 * arena, truncates the value/callback tables, and replaces the
@@ -952,6 +963,9 @@ export function createReactiveSystem(options: ReactiveSystemOptions): ReactiveSy
 			}
 			grow();
 		},
+		boundary(): void {
+			shared.inner!.maybeBoundary();
+		},
 		reset(): void {
 			const engine = shared.inner!;
 			engine.resetGuard();
@@ -1085,6 +1099,15 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 	let propSp = 0;
 	let checkStack = new Int32Array(4096);
 	let checkSp = 0;
+	// Live dirtiness-walk depth, and the link records unlinked while one is
+	// running. A walk holds link ids in locals and on checkStack, and the
+	// user getters it updates can unlink those very links — an immediate
+	// free-stack push would let a later in-walk link() rewrite one as a
+	// foreign edge before the unwind reads it (pre-existing bug #6). Held
+	// records join the free stack at the outermost walk exit.
+	let walkDepth = 0;
+	let heldLinkFree = new Int32Array(64);
+	let heldLinkCount = 0;
 
 	// Stack growth is out of line so the walk loops stay under V8's
 	// 460-bytecode inlining budget (enforced by the bytecode budget test).
@@ -1110,6 +1133,12 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 		const bigger = new Int32Array(linkFreeStack.length * 2);
 		bigger.set(linkFreeStack);
 		linkFreeStack = bigger;
+	}
+
+	function growHeldLinkFree(): void {
+		const bigger = new Int32Array(heldLinkFree.length * 2);
+		bigger.set(heldLinkFree);
+		heldLinkFree = bigger;
 	}
 
 	// A retired engine's create/free entry points forward to shared.inner (the
@@ -1208,6 +1237,8 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			nodeFreeCount = 0;
 			linkFreeStack = new Int32Array(1024);
 			linkFreeCount = 0;
+			walkDepth = 0;
+			heldLinkCount = 0;
 			pendingFree.length = 0;
 			shared.pendingFreeEnd = 0;
 			// The host's globalVersion/cycle counters keep counting: fresh
@@ -1377,10 +1408,29 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			if (id === 0) {
 				return; // the burned system record must never reach the free stack
 			}
+			if (walkDepth !== 0) {
+				// A dirtiness walk is live: hold the record until it unwinds
+				// (see the heldLinkFree declaration).
+				if (heldLinkCount === heldLinkFree.length) {
+					growHeldLinkFree();
+				}
+				heldLinkFree[heldLinkCount++] = id;
+				return;
+			}
 			if (linkFreeCount === linkFreeStack.length) {
 				growLinkFreeStack();
 			}
 			linkFreeStack[linkFreeCount++] = id;
+		}
+
+		function releaseHeldLinks(): void {
+			while (heldLinkCount !== 0) {
+				const id = heldLinkFree[--heldLinkCount];
+				if (linkFreeCount === linkFreeStack.length) {
+					growLinkFreeStack();
+				}
+				linkFreeStack[linkFreeCount++] = id;
+			}
 		}
 
 		// ---- graph kernel (upstream system.ts, transliterated) ----------------
@@ -1570,12 +1620,30 @@ function createEngine(records: number, from: Int32Array | undefined, boot: Engin
 			} while (true);
 		}
 
-		// Entry wrapper: owns the scratch-stack base restore (update() runs user
-		// getters, which can throw mid-walk). Kept apart from the loop so the
-		// loop body stays under V8's 460-bytecode inlining budget — try/finally
-		// plumbing plus the loop was 543 bytecodes, which barred checkDirty from
-		// inlining into run()/computedRead() (the bytecode budget test pins this).
+		// Walk bracket: while a dirtiness walk is live, unlinked link records
+		// are held off the free stack (bug #6 — an in-walk link() could
+		// rewrite one as a foreign edge before the unwind reads it). Depth
+		// nests across re-entrant walks; held records release at the
+		// outermost exit. Kept to a thin layer so it inlines into
+		// run()/computedRead() alongside the entry's fast paths.
 		function checkDirty(startLink: number, startSub: number): boolean {
+			++walkDepth;
+			try {
+				return checkDirtyEntry(startLink, startSub);
+			} finally {
+				if (--walkDepth === 0 && heldLinkCount !== 0) {
+					releaseHeldLinks();
+				}
+			}
+		}
+
+		// Entry: shallow fast paths + chain dispatch; owns the scratch-stack
+		// base restore (update() runs user getters, which can throw
+		// mid-walk). Kept apart from the loop so the loop body stays under
+		// V8's 460-bytecode inlining budget — try/finally plumbing plus the
+		// loop was 543 bytecodes, which barred checkDirty from inlining into
+		// run()/computedRead() (the bytecode budget test pins this).
+		function checkDirtyEntry(startLink: number, startSub: number): boolean {
 			// Shallow fast path mirroring checkDirtyLoop's first iteration:
 			// the sub is already dirty, or its first dep is a directly-dirty
 			// mutable — the shape of every effect sitting one link away from
