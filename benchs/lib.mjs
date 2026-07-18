@@ -5,11 +5,23 @@
 
 export const KAIRO = new Set(['avoidablePropagation', 'broadPropagation', 'deepPropagation', 'diamond', 'mux', 'repeatedObservers', 'triangle', 'unstable', 'molBench']);
 
+// The runner emits a second `<name> (pair)` row for frameworks whose effects
+// are natively a (compute, reaction) pair. Only some frameworks have these
+// rows, so totals and completeness checks use the tracked rows every
+// framework shares; pair rows appear as their own panels in the details
+// chart.
+const PAIR_SUFFIX = ' (pair)';
+export const isPairTest = (test) => test.endsWith(PAIR_SUFFIX);
+export const baseTestName = (test) => isPairTest(test) ? test.slice(0, -PAIR_SUFFIX.length) : test;
+
 // sbench test names all share the create*/update* prefixes.
-export const suiteOf = (test) => (test.startsWith('create') || test.startsWith('update')) ? 'sbench'
-	: KAIRO.has(test) ? 'kairo'
-	: test.startsWith('cellx') ? 'cellx'
-	: 'dynamic';
+export const suiteOf = (rawTest) => {
+	const test = baseTestName(rawTest);
+	return (test.startsWith('create') || test.startsWith('update')) ? 'sbench'
+		: KAIRO.has(test) ? 'kairo'
+		: test.startsWith('cellx') ? 'cellx'
+		: 'dynamic';
+};
 
 export const SUITES = ['sbench', 'kairo', 'cellx', 'dynamic'];
 
@@ -38,6 +50,9 @@ export function parseResults(text) {
 export function summarize(rows) {
 	const byFw = new Map();
 	for (const { framework, test, time } of rows) {
+		// Pair rows exist only for pair-native frameworks; including them would
+		// double-bill those frameworks and make everyone else look partial.
+		if (isPairTest(test)) continue;
 		if (!byFw.has(framework)) byFw.set(framework, { tests: 0, sums: { sbench: 0, kairo: 0, cellx: 0, dynamic: 0 } });
 		const e = byFw.get(framework);
 		e.tests++;

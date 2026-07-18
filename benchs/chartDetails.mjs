@@ -8,7 +8,7 @@
 //
 // Usage: node benchs/chartDetails.mjs <results.txt> <out.svg> [TITLE] [SUBTITLE]
 import { readFileSync, writeFileSync } from 'node:fs';
-import { COLOR, GRID, INK, INK2, INK3, SURFACE, SUITES, escXml, parseResults, suiteOf, displayName, isOurs } from './lib.mjs';
+import { COLOR, GRID, INK, INK2, INK3, SURFACE, SUITES, escXml, isPairTest, parseResults, suiteOf, displayName, isOurs } from './lib.mjs';
 
 const SRC = process.argv[2] ?? 'benchs/results/2026-07-05-isolated-node.txt';
 const OUT = process.argv[3] ?? '/tmp/benchmark-details.svg';
@@ -18,13 +18,15 @@ const SUBTITLE = process.argv[5] ?? 'one panel per test, per-panel scale - lower
 const rows = parseResults(readFileSync(SRC, 'utf8'));
 
 // test -> Map(framework -> ms), in first-seen test order (= suite order the
-// harness runs them in); framework totals for the shared row order.
+// harness runs them in); framework totals for the shared row order. Pair
+// rows get their own panels but stay out of the totals: only pair-native
+// frameworks have them, so counting them would skew the shared row order.
 const tests = new Map();
 const totals = new Map();
 for (const { framework: fw, test, time } of rows) {
 	if (!tests.has(test)) tests.set(test, new Map());
 	tests.get(test).set(fw, time);
-	totals.set(fw, (totals.get(fw) ?? 0) + time);
+	if (!isPairTest(test)) totals.set(fw, (totals.get(fw) ?? 0) + time);
 }
 const frameworks = [...totals.entries()].sort((a, b) => a[1] - b[1]).map(([fw]) => fw);
 // Group panels by suite, preserving harness order inside each suite.
